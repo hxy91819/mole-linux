@@ -109,6 +109,15 @@ scan_applications() {
         local app_name
         app_name=$(basename "$app_path" .app)
 
+        # Skip nested apps (e.g. inside Wrapper/ or Frameworks/ of another app)
+        # Check if parent path component ends in .app (e.g. /Foo.app/Bar.app or /Foo.app/Contents/Bar.app)
+        # This prevents false positives like /Old.apps/Target.app
+        local parent_dir
+        parent_dir=$(dirname "$app_path")
+        if [[ "$parent_dir" == *".app" || "$parent_dir" == *".app/"* ]]; then
+             continue
+        fi
+
         # Try to get English name from bundle info, fallback to folder name
         local bundle_id="unknown"
         local display_name="$app_name"
