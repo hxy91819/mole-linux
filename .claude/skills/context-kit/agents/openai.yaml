@@ -1,0 +1,7 @@
+interface:
+  display_name: "Context Kit"
+  short_description: "AI 主审仓库 Context，并在确认后完成三轮建设"
+  default_prompt: "使用 $context-kit 先对本仓库做 Quick 定性评测；需要完整结论时进入 Standard，等我确认后再创建 Goal 完成三轮建设。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "updated": "2026-09-01",
+  "authority": "用户 2026-09-01 逐项判断（仅保留 :8080）；同日更正：:18765 因 lighthouse/helper 依赖恢复并加入白名单",
+  "review_base_command": "ss -tlnp | awk '$4 !~ /127\\.0\\.0\\.1|\\[::1\\]/'",
+  "matching_rule": "端口与身份证据同时匹配才算白名单豁免；仅端口匹配但身份不符（端口被顶替）按未知处理",
+  "entries": [
+    {
+      "port": 80,
+      "service": "dsh-auth caddy",
+      "kind": "system",
+      "identity": {
+        "process": "caddy",
+        "evidence": "uid 63696, /usr/lib/dsh-auth/caddy, HTTP 303 跳登录"
+      },
+      "verify": "ss -tlnp 端口 80 的进程必须是 caddy"
+    },
+    {
+      "port": 8080,
+      "service": "lighttools-frontend-1",
+      "kind": "long_term_container",
+      "identity": {
+        "container": "lighttools-frontend-1",
+        "evidence": "0.0.0.0:8080->8080，「开发者工具集」"
+      },
+      "verify": "docker ps 中 lighttools-frontend-1 运行中且映射 8080"
+    },
+    {
+      "port": 36000,
+      "service": "sshd",
+      "kind": "system",
+      "identity": {
+        "process": "sshd",
+        "evidence": "系统 SSH"
+      },
+      "verify": "systemctl is-active sshd"
+    },
+    {
+      "port": 48369,
+      "service": "TsysProxy",
+      "kind": "system",
+      "identity": {
+        "process": "TsysProxy",
+        "evidence": "/usr/local/TsysAgent/bin/TsysProxy，DevCloud 系统代理"
+      },
+      "verify": "进程路径为 /usr/local/TsysAgent/bin"
+    },
+    {
+      "port": 18765,
+      "service": "kb-vector-service",
+      "kind": "long_term_service",
+      "identity": {
+        "unit": "kb-vector-service.service",
+        "process": "python3 kb_vector_service.py",
+        "evidence": "/data/code/lighthouse/helper 依赖的 KB 检索 API（Bearer 鉴权），绑 9.135.102.192:18765"
+      },
+      "verify": "systemctl is-active kb-vector-service 且 ss :18765 进程为 kb_vector_service.py"
+    }
+  ],
+  "disposed": [
+    {
+      "port": 5173,
+      "object": "schedule h5 vite/uni dev server",
+      "action": "kill",
+      "disposed": "2026-09-01",
+      "note": "uni.js 不转发 --host，声明 127.0.0.1 实际绑全网卡（CVE-2025-30208 面）",
+      "restore": "修复 dev 脚本 host 转发后再启动"
+    },
+    {
+      "port": 5432,
+      "object": "saiens_postgres（弱口令+暴露）",
+      "action": "docker stop",
+      "disposed": "2026-09-01",
+      "restore": "docker start saiens_postgres（数据卷保留）"
+    },
+    {
+      "port": 4311,
+      "object": "python http.server /data/code/designs（目录列表裸奔）",
+      "action": "kill",
+      "disposed": "2026-09-01",
+      "restore": "按需重启，应绑定 127.0.0.1"
+    },
+    {
+      "port": 4399,
+      "object": "python http.server lightcloud/designs（僵死）",
+      "action": "kill",
+      "disposed": "2026-09-01",
+      "restore": "按需重启，应绑定 127.0.0.1"
+    },
+    {
+      "port": 8765,
+      "object": "python http.server story-prototype",
+      "action": "kill",
+      "disposed": "2026-09-01",
+      "restore": "按需重启，应绑定 127.0.0.1"
+    },
+    {
+      "port": 39081,
+      "object": "story07 acceptance nginx（/tmp 配置）",
+      "action": "kill",
+      "disposed": "2026-09-01",
+      "restore": "story07 验收环境按需重启"
+    },
+    {
+      "port": 28080,
+      "object": "kb-agent-access 栈（6 容器）",
+      "action": "docker stop 全栈，数据卷保留",
+      "disposed": "2026-09-01",
+      "note": "取代 2026-08-25「保留 kb-agent-access」的旧决策",
+      "restore": "docker compose -p kb-agent-access start"
+    },
+    {
+      "port": 28081,
+      "object": "kb-platform 栈（6 容器）",
+      "action": "docker stop 全栈，数据卷保留",
+      "disposed": "2026-09-01",
+      "restore": "docker compose -p kb-platform start"
+    },
+    {
+      "port": 18081,
+      "object": "developer-reports 栈（4 容器）",
+      "action": "docker stop 全栈，数据卷保留",
+      "disposed": "2026-09-01",
+      "restore": "docker compose -p developer-reports start"
+    }
+  ],
+  "out_of_scope": [
+    "story06/story07 dsh-s04 systemd 服务仅监听 127.0.0.1，不构成对外暴露"
+  ]
+}
