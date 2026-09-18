@@ -115,10 +115,11 @@ def discover_repos(root: str) -> list[str]:
     return sorted(seen.values())
 
 
-def worktree_entries(repo: str) -> list[dict]:
+def worktree_entries(repo: str) -> tuple[list[dict], bool]:
+    """返回 (entries, scan_ok)；扫描失败不再是“无工作树”，不能淘汰状态账本。"""
     rc, out, _ = run(["git", "-C", repo, "worktree", "list", "--porcelain"], timeout=60)
     if rc != 0:
-        return []
+        return [], False
     entries, cur = [], {}
     for line in [*out.splitlines(), ""]:
         if not line.strip():
@@ -137,7 +138,7 @@ def worktree_entries(repo: str) -> list[dict]:
             cur["branch"] = "(detached)"
         elif k in ("locked", "prunable"):
             cur[k] = v or True
-    return entries
+    return entries, True
 
 
 def git_ignored(path: str, timeout=90):
@@ -516,6 +517,36 @@ def owner_tool_gongfeng_apply(repo: str, out_dir: str, evidence: dict, min_age: 
     return data
 
 
+def evaluate_run_health(
+    prev: dict[str, dict], current: list[dict], now: str
+) -> dict[str, Any]:
+    """异常去重（纯函数）：新异常首次通知，持续静默，恢复通知一次。
+
+    key 是稳定标识（code + entity），中文 detail 仅展示；措辞变更不影响匹配。
+    已恢复项保留 resolved_at 供账本审计。"""
+    current_keys = {e["key"]: e for e in current}
+    health: dict[str, Any] = {"exceptions": {}, "notifiable": [], "recovered": []}
+    for key, exc in current_keys.items():
+        ent = dict(prev.get(key) or {})
+        first = ent.get("first_seen") or now
+        # 首次出现，或恢复后再次出现 → 重新通知
+        newly_notified = not ent.get("notified") or bool(ent.get("resolved_at"))
+        ent.update(exc)
+        ent["first_seen"] = first
+        ent["last_seen"] = now
+        ent["resolved_at"] = None
+        ent["notified"] = True
+        health["exceptions"][key] = ent
+        if newly_notified:
+            health["notifiable"].append(ent)
+    for key, ent in prev.items():
+        if key not in current_keys and not ent.get("resolved_at"):
+            closed = dict(ent, resolved_at=now)
+            health["exceptions"][key] = closed
+            health["recovered"].append(closed)
+    return health
+
+
 # ---------------------------------------------------------------- 状态账本
 
 def load_state(path: str) -> dict:
@@ -600,8 +631,15 @@ def main() -> int:
     # 默认只看"含链接工作树"的仓库：本巡检的处置对象是 worktree，主干本体永久保留，
     # 其可重建产物只是 review-only 背景值。全量扫 168 个仓库会稀释口径并浪费 5 倍时间。
     all_entries = []
+    scan_ok_repos: set[str] = set()
+    scan_failed_repos: list[str] = []
     for repo in repos:
-        for e in worktree_entries(repo):
+        repo_entries, scan_ok = worktree_entries(repo)
+        if not scan_ok:
+            scan_failed_repos.append(repo)
+            continue
+        scan_ok_repos.add(repo)
+        for e in repo_entries:
             e["_repo"] = repo
             all_entries.append(e)
     linked_repos = {e["_repo"] for e in all_entries
@@ -739,7 +777,12 @@ def main() -> int:
                 state_new["worktrees"][obj["path"]] = rec
 
     live_paths = {o["path"] for o in objects}
+    # 扫描失败 ≠ 仓库消失：只在本轮完整覆盖（scan_ok）的仓库范围内淘汰旧记录。
+    scan_ok_abspaths = {os.path.abspath(r) for r in scan_ok_repos}
     for p in list(state_new["worktrees"]):
+        rec_repo = (state_new["worktrees"][p] or {}).get("repo") or ""
+        if os.path.abspath(rec_repo) not in scan_ok_abspaths:
+            continue
         if p not in live_paths:
             state_new["worktrees"].pop(p, None)
             removed_state += 1
@@ -1065,33 +1108,40 @@ def main() -> int:
     # （已随 apply 清扫过的 repo 跳过），避免「最后一个 worktree 消失后仓库
     # 退出分支治理范围」。
     if args.execute:
+        sweep_candidates = []
         for repo in repos:
             if repo in apply_touched_repos:
                 continue
             # 本地预过滤：无「未被认领且非主干」分支的仓库没有清扫候选，
             # 直接跳过，避免对 169 个仓库逐个做远端 fetch。
-            claimed = {e.get("branch", "") for e in worktree_entries(repo)}
+            claimed = {e.get("branch", "") for e in worktree_entries(repo)[0]}
             rc_b, out_b, _ = run(
                 ["git", "-C", repo, "branch", "--format=%(refname:short)"], timeout=60)
             locals_ = [b.strip() for b in (out_b or "").splitlines() if b.strip()]
             if not [b for b in locals_
                     if b not in claimed and b not in ("main", "master")]:
                 continue
+            sweep_candidates.append(repo)
+
+        def run_repo_sweep(repo: str) -> None:
             rc, out, err = run(
                 [sys.executable, WORKTREE_TOOL, "--repo", repo,
                  "--sweep-only", "--apply", "--json"], timeout=300)
             if rc != 0:
                 failed.append({"repo": repo, "error":
                                ("孤儿分支清扫失败: " + (err or out or f"退出 {rc}"))[:200]})
-                continue
+                return
             try:
                 res = json.loads(out)
             except json.JSONDecodeError:
                 failed.append({"repo": repo, "error": "孤儿分支清扫输出非 JSON"})
-                continue
+                return
             for item in (res.get("branch_sweep") or {}).get("branches_removed") or []:
                 orphan_branches_removed.append(
                     {"repo": repo, "branch": item["branch"], "proof": item.get("proof")})
+
+        with cf.ThreadPoolExecutor(max_workers=4) as ex:
+            list(ex.map(run_repo_sweep, sweep_candidates))
     executed_bytes = sum(x["size_bytes"] or 0 for x in executed_this_round)
 
     # 复核：提交仍可达；分支按 owner 2026-09-19 政策默认已删，仍在反而要关注
@@ -1117,19 +1167,7 @@ def main() -> int:
         unreclaimed = [o for o in unreclaimed if o["path"] not in executed_paths]
         unreclaimed_bytes = sum(o["size_bytes"] or 0 for o in unreclaimed)
 
-    state_new["updated_at"] = now_iso()
-    save_state(args.state, state_new)
-    os.makedirs(os.path.dirname(args.state), exist_ok=True)
-    with open(os.path.join(round_dir, "raw", "state_snapshot.json"), "w") as fh:
-        json.dump(state_new, fh, ensure_ascii=False, indent=1)
-
-    # --- 5c. 分支价值信号：相对远端默认分支的 ahead/behind + 独有 diff 规模 ---
-    # 借鉴 gmc wt list --diff-base；只对进入决策表的 ≥7 天对象计算，不作删除授权。
-    for o in unreclaimed:
-        if o.get("branch"):
-            o["standing"] = branch_standing(o["repo"], o["branch"])
-
-    # --- 5d. prunable 注册清理（owner 2026-09-19 授权：--execute 时自动 prune）---
+    # --- 5d. prunable 注册清理（owner 授权：--execute 时自动 prune）---
     # git 已确认 gitdir 指向的目录不存在，prune 只删失效元数据，零数据丢失。
     prunable_pruned: list[dict] = []
     if args.execute and prunable_regs:
@@ -1145,6 +1183,85 @@ def main() -> int:
                 "detail": removed_lines[:10],
                 "error": None if rc == 0 else (err or out or f"git 退出 {rc}")[:200],
             })
+
+    # --- 7. 运行结果协议（异常驱动；采纳 Oracle 二轮 #1）---
+    run_exceptions: list[dict] = []
+    if not bb_query_ok:
+        run_exceptions.append({"key": "bb-query-failed", "code": "bb-query-failed",
+                               "detail": "BB 环境/线程查询失败，本轮候选全部保守保留"})
+    if gf_targets and not gf_token:
+        run_exceptions.append({"key": "gongfeng-credential-missing",
+                               "code": "gongfeng-credential-missing",
+                               "detail": str(gf_source)[:160]})
+    gf_err_n = sum(1 for o in objects if (o.get("gongfeng") or {}).get("state") == "error")
+    if gf_err_n:
+        run_exceptions.append({"key": "gongfeng-mr-error", "code": "gongfeng-mr-error",
+                               "detail": f"{gf_err_n} 项工蜂 MR 查询失败"})
+    ot_err_github: list[str] = []
+    for rep, v in ot_reports.items():
+        if v.get("error"):
+            host = host_by_repo.get(rep) or "unknown"
+            if host != "github.com":
+                # 非 GitHub host 的 gh 失败是设计内路径（5b 工蜂证据接管），非异常
+                continue
+            ot_err_github.append(rep)
+    if ot_err_github:
+        run_exceptions.append({"key": "owner-tool-error:github", "code": "owner-tool-error",
+                               "entity": "github",
+                               "detail": f"{len(ot_err_github)} 个 GitHub 仓库 owner 工具失败: "
+                                         + ", ".join(ot_err_github[:5])})
+    for f in failed:
+        is_sweep = "孤儿分支清扫" in str(f.get("error") or "")
+        ent = f.get("repo") or f.get("path") or ""
+        run_exceptions.append({
+            "key": f"{'sweep-failed' if is_sweep else 'execute-failed'}:{ent}",
+            "code": "sweep-failed" if is_sweep else "execute-failed",
+            "entity": ent, "detail": str(f.get("error") or "")[:160]})
+    for v in verify:
+        if v.get("branch_anomaly"):
+            run_exceptions.append({"key": f"verify-branch-present:{v['path']}",
+                                   "code": "verify-branch-present", "entity": v["path"],
+                                   "detail": "回收后分支仍在（删除失败）"})
+    for repo in scan_failed_repos:
+        run_exceptions.append({"key": f"scan-failed:{repo}", "code": "scan-failed",
+                               "entity": repo,
+                               "detail": "worktree list 失败，本轮不淘汰该仓状态记录"})
+
+    prev_health = state_new.get("run_health") or {}
+    health = evaluate_run_health(prev_health.get("exceptions") or {}, run_exceptions, now_iso())
+    state_new["run_health"] = {"exceptions": health["exceptions"]}
+
+    prune_total = sum(p["removed"] for p in prunable_pruned)
+    run_failed = bool(failed) or bool(scan_failed_repos)
+    run_status = {
+        "schema": "worktree-patrol-run/v1",
+        "run_id": run_id,
+        "finished_at": now_iso(),
+        "duration_s": round(time.time() - started, 1),
+        "mode": "execute" if args.execute else "dry-run",
+        "status": "failed" if run_failed else ("degraded" if run_exceptions else "success"),
+        "coverage": {"repos": len(repos), "entries": len(objects),
+                     "scan_failed_repos": scan_failed_repos,
+                     "owner_tool_errors": sum(1 for v in ot_reports.values() if v.get("error"))},
+        "executed": {"worktrees": len(executed_this_round),
+                     "branches_worktree": sum(1 for x in executed_this_round if x.get("branch_deleted")),
+                     "branches_orphan": len(orphan_branches_removed),
+                     "prunable_pruned": prune_total},
+        "exceptions": run_exceptions,
+        "notifiable": health["notifiable"],
+        "recovered": health["recovered"],
+    }
+    state_new["updated_at"] = now_iso()
+    save_state(args.state, state_new)
+    os.makedirs(os.path.dirname(args.state), exist_ok=True)
+    with open(os.path.join(round_dir, "raw", "state_snapshot.json"), "w") as fh:
+        json.dump(state_new, fh, ensure_ascii=False, indent=1)
+
+    # --- 5c. 分支价值信号：相对远端默认分支的 ahead/behind + 独有 diff 规模 ---
+    # 借鉴 gmc wt list --diff-base；只对进入决策表的 ≥7 天对象计算，不作删除授权。
+    for o in unreclaimed:
+        if o.get("branch"):
+            o["standing"] = branch_standing(o["repo"], o["branch"])
 
     # --- 6. 预聚合输出 ---
     by_reason: dict[str, dict] = {}
@@ -1373,6 +1490,14 @@ def main() -> int:
         print("\n--- 执行失败 ---")
         for f in failed:
             print(f"  {f['path']}: {f['error']}")
+    if args.execute:
+        status_path = os.path.join(STATE_DIR, "run-status.json")
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(run_status, fh, ensure_ascii=False, indent=1)
+        os.replace(status_path + ".tmp", status_path)
+    if run_failed:
+        print("[patrol] 本轮存在执行/扫描失败：见上方失败清单与 run-status.json")
     print(f"\n[patrol] 产物 {round_dir}  用时 {time.time()-started:.1f}s")
     return 0
 
