@@ -252,6 +252,9 @@ main() {
         "status")
             exec "$SCRIPT_DIR/bin/status.sh" "${args[@]:1}"
             ;;
+        "devcloud")
+            exec python3 "$SCRIPT_DIR/bin/devcloud.py" "${args[@]:1}"
+            ;;
         "purge")
             exec "$SCRIPT_DIR/bin/purge.sh" "${args[@]:1}"
             ;;
