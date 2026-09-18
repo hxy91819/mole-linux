@@ -171,7 +171,7 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   突出报告；/tmp 清理只释放数据盘，不能声称达到系统盘降占用目标。
 - `/data/tmp` 和其他测试产物需要结合 owner、持久数据及活动证据逐项审查；
   年龄和无进程引用不足以授权删除；目录叫 `tmp` 不构成可弃证据。
-- **worktree 本体回收（owner 2026-09-17 常设授权；2026-09-19 修订分支政策）**：worktree 生命周期通常
+- **worktree 本体回收（owner 2026-09-17 常设授权；2026-09-18 修订分支政策）**：worktree 生命周期通常
   小于 7 天，超过即视为无价值残留。三条**同时**满足才可整棵回收，满足即自动执行，
   不再逐项等人点头：
   1. age ≥ 7 天（168h，`worktree-cleanup` 的 `.git` mtime 口径）；
@@ -221,7 +221,7 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   MR 链接：`https://git.example.invalid/<ns>/<project>/-/merge_requests/<iid>`（实测 200；不带 `/-/` 为 302）。
   判定同 GitHub 口径：`state=merged` 且 `source_commit` == 本地 HEAD 才算精确 head。
   **执行方式（owner 2026-09-18 决定「补充工具缺口」）**：唯一执行器不变
-  （`cleanup_worktrees.py`：非 `--force`、分支按 2026-09-19 政策默认删除、`.local` 备份、
+  （`cleanup_worktrees.py`：非 `--force`、分支按 2026-09-18 政策默认删除、`.local` 备份、
   apply 前按指纹复验），
   新增 `--remote-evidence <json>`；`patrol_worktrees.py --execute` 把工蜂核验结果按 repo
   写成证据文件，再跑 `--dry-run --write-approval-report` → `--apply --approve-report` 两跳
