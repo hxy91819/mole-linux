@@ -556,13 +556,22 @@ def branch_delete_proof(
 
 
 def delete_local_branch(
-    repo_root: Path, branch: str
+    repo_root: Path, branch: str, *, expect_old_oid: str | None = None
 ) -> tuple[bool, str | None]:
-    result = run_command(
-        ["git", "-C", str(repo_root), "branch", "-D", branch], check=False
-    )
+    """Delete refs/heads/<branch> with compare-and-delete semantics.
+
+    `git update-ref -d <ref> <old>` only deletes when the ref still points at
+    the audited object name, closing the proof-then-delete race: a branch that
+    moved after the audit is kept and reported instead of force-deleted.
+    """
+    ref = f"refs/heads/{branch}"
+    args = ["git", "-C", str(repo_root), "update-ref", "-d", ref]
+    if expect_old_oid:
+        args.append(expect_old_oid)
+    result = run_command(args, check=False)
     if result.returncode != 0:
-        return False, result.stderr.strip() or result.stdout.strip() or f"git exited {result.returncode}"
+        detail = result.stderr.strip() or result.stdout.strip() or f"git exited {result.returncode}"
+        return False, detail
     return True, None
 
 
@@ -594,7 +603,10 @@ def retire_worktree_branch(
         return outcome
     repo_root = Path(summary["common_repo_root"])
     outcome["proof"] = f"worktree-removal-proof:{proof.get('kind')}"
-    deleted, error = delete_local_branch(repo_root, branch)
+    outcome["old_oid"] = candidate.get("head")
+    deleted, error = delete_local_branch(
+        repo_root, branch, expect_old_oid=candidate.get("head")
+    )
     outcome["deleted"] = deleted
     if error:
         outcome["error"] = error
@@ -648,12 +660,19 @@ def sweep_orphan_branches(summary: dict[str, Any], keep_branches: bool) -> None:
         if proof is None:
             sweep["branches_kept"].append({"branch": branch, "reason": keep_reason})
             continue
-        deleted, error = delete_local_branch(repo_root, branch)
+        branch_tip = run_command(
+            ["git", "-C", str(repo_root), "rev-parse", branch], check=False
+        ).stdout.strip()
+        deleted, error = delete_local_branch(
+            repo_root, branch, expect_old_oid=branch_tip or None
+        )
         if deleted:
-            sweep["branches_removed"].append({"branch": branch, "proof": proof})
+            sweep["branches_removed"].append(
+                {"branch": branch, "proof": proof, "old_oid": branch_tip}
+            )
         else:
             sweep["branches_kept"].append(
-                {"branch": branch, "reason": f"git branch -D failed: {error}"}
+                {"branch": branch, "reason": f"git update-ref -d failed: {error}"}
             )
 
 
@@ -1266,6 +1285,13 @@ def apply_candidates(
             entry["action"] = "approved" if entry in candidates else "not-approved"
     summary["approved"] = len(candidates)
     if not candidates:
+        sweep_orphan_branches(summary, keep_branches)
+        summary["branches_removed"] = len(
+            (summary.get("branch_sweep") or {}).get("branches_removed") or []
+        )
+        summary["branches_kept"] = len(
+            (summary.get("branch_sweep") or {}).get("branches_kept") or []
+        )
         return
 
     backup_root = Path(summary["backup_root"]).resolve()
