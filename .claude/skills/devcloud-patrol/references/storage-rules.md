@@ -179,7 +179,7 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
      分支 tip、或 HEAD 含于远端默认分支；
   3. 工作区干净、非 locked/prunable、无活跃进程引用（`who-uses`，须串行探针）、
      无 BB 环境/线程指认。
-  **分支政策（owner 2026-09-19：「只要有证据证明可以安全删除…不要都依赖人工决策」
+  **分支政策（owner 2026-09-18：「只要有证据证明可以安全删除…不要都依赖人工决策」
   「默认删分支是合理的」）**：worktree 回收时其本地分支默认同步删除（删除依据就是
   该次回收的远端证明，squash 合并同样覆盖）；另对无 worktree 认领的本地分支做
   孤儿清扫：tip 并入默认分支谱系（origin/<default> 优先，本地 <default> 兑底）
@@ -204,7 +204,7 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   并逐项列原因与 PR/MR 地址。
   **`--min-no-pr-age-hours` 只约束无 PR 分支**，PR-based 候选必须另行做 age 过滤，
   否则会把 7 天内的在办工作误判为可回收。
-  **prunable 注册（owner 2026-09-19 授权）**：`--execute` 时对含失效注册的 repo 自动
+  **prunable 注册（owner 2026-09-18 授权）**：`--execute` 时对含失效注册的 repo 自动
   `git worktree prune --verbose`（git 已确认目录不存在，零数据丢失），结果入账本；
   dry-run 只报告。每轮报告给 ≥7 天对象附相对远端默认分支的 ahead/behind 与独有
   diff 规模（借鉴 gmc `wt list --diff-base`），仅作价值信号，不作删除授权。
