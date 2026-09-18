@@ -188,6 +188,41 @@ def du_bytes(path: str, timeout=120):
         return None
 
 
+def summarize_dirty(porcelain: str, shortstat: str = ""):
+    """把 `git status --porcelain` 压成可判断的一行摘要，供 owner 快速决策。
+
+    只统计数量与 diffstat，不读文件内容：目的是把「dirty 12 项」从「要逐项读代码」
+    降成「看一眼就知道有多少人工改动」。
+    """
+    lines = [l for l in porcelain.splitlines() if l.strip()]
+    if not lines:
+        return None
+    tracked = sum(1 for l in lines if not l.startswith("??"))
+    untracked = sum(1 for l in lines if l.startswith("??"))
+    m = re.search(r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?"
+                  r"(?:, (\d+) deletions?\(-\))?", shortstat or "")
+    return {
+        "tracked": tracked,
+        "untracked": untracked,
+        "files_changed": int(m.group(1)) if m else None,
+        "insertions": int(m.group(2)) if m and m.group(2) else 0,
+        "deletions": int(m.group(3)) if m and m.group(3) else 0,
+    }
+
+
+def compact_dirty(summary) -> str:
+    if not summary:
+        return ""
+    bits = []
+    if summary.get("files_changed") is not None:
+        bits.append(f"{summary['files_changed']}F +{summary['insertions']}/-{summary['deletions']}")
+    if summary.get("tracked"):
+        bits.append(f"{summary['tracked']} tracked")
+    if summary.get("untracked"):
+        bits.append(f"{summary['untracked']} untracked")
+    return " [" + " ".join(bits) + "]" if bits else ""
+
+
 def du_bytes_last_active(path: str, timeout=180):
     """一次 du 同时取表观字节与「树内最新 mtime」（上次活跃），不额外遍历。
 
@@ -372,6 +407,43 @@ def worktree_has_submodules(path: str) -> bool:
         return False
     rc, out, _ = run(["git", "-C", path, "submodule", "status"], timeout=120)
     return rc == 0 and bool(out.strip())
+
+
+def branch_standing(repo_root: str, branch: str | None):
+    """相对远端默认分支的 ahead/behind + 独有 diff 规模（借鉴 gmc wt list --diff-base）。
+
+    回答「这个残留还有独有提交吗」：0 ahead 即纯残留，有独有提交则值得 owner
+    多看一眼。只作报告信号，不参与删除授权；取不到基线就缺省，不影响判定。
+    """
+    if not branch or branch == "(detached)":
+        return None
+    base = None
+    rc, out, _ = run(["git", "-C", repo_root, "symbolic-ref", "-q", "--short",
+                      "refs/remotes/origin/HEAD"], timeout=30)
+    if rc == 0 and out.strip():
+        base = out.strip()
+    if base is None:
+        for ref in ("origin/main", "origin/master", "main", "master"):
+            rc, _, _ = run(["git", "-C", repo_root, "rev-parse", "--verify", "-q",
+                            ref], timeout=30)
+            if rc == 0:
+                base = ref
+                break
+    if base is None or base == branch:
+        return None
+    rc, out, _ = run(["git", "-C", repo_root, "rev-list", "--left-right", "--count",
+                      f"{branch}...{base}"], timeout=30)
+    if rc != 0:
+        return None
+    parts = (out.split() + ["0", "0"])[:2]
+    rc, dstat, _ = run(["git", "-C", repo_root, "diff", "--shortstat",
+                        f"{base}...{branch}"], timeout=60)
+    try:
+        ahead, behind = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    return {"base": base, "ahead": ahead, "behind": behind,
+            "unique_diff": (dstat or "").strip() or "无差异"}
 
 
 def build_gongfeng_evidence(items):
@@ -583,7 +655,8 @@ def main() -> int:
             "prunable": bool(entry.get("prunable")), "dirty": None,
             "age_hours": None, "size_bytes": None, "artifact_bytes": 0,
             "artifact_hits": [], "size_source": None, "size_measured_at": None,
-            "last_active_at": None, "ignored": None, "fingerprint": None, "who_uses": None,
+            "last_active_at": None, "dirty_summary": None,
+            "ignored": None, "fingerprint": None, "who_uses": None,
             "bb_environment": None, "bb_threads": [],
             "remote_proof": None, "skip_reason": None, "pr": None, "approval_token": None,
         }
@@ -594,6 +667,13 @@ def main() -> int:
         rc2, sout, _ = run(["git", "-C", path, "status", "--porcelain", "-unormal"], timeout=120)
         dirty = None if rc2 != 0 else bool(sout.strip())
         obj["dirty"] = dirty
+        if dirty:
+            shortstat = ""
+            if any(not l.startswith("??") for l in sout.splitlines() if l.strip()):
+                rc3, sstat, _ = run(["git", "-C", path, "diff", "HEAD", "--shortstat"], timeout=120)
+                if rc3 == 0:
+                    shortstat = sstat.strip()
+            obj["dirty_summary"] = summarize_dirty(sout, shortstat)
         obj["ignored"] = {"count": ignored["count"], "sample": ignored["sample"],
                           "digest": ignored["digest"]} if ignored else None
         fp = fingerprint(entry, dirty, ignored) if ignored_err is None else None
@@ -641,7 +721,7 @@ def main() -> int:
             "size_bytes": obj["size_bytes"], "artifact_bytes": obj["artifact_bytes"],
             "artifact_hits": obj["artifact_hits"],
             "size_measured_at": obj["size_measured_at"], "size_source": obj["size_source"],
-            "last_active_at": obj["last_active_at"],
+            "last_active_at": obj["last_active_at"], "dirty_summary": obj["dirty_summary"],
             "who_uses": obj["who_uses"], "last_seen": now_iso(),
             "first_seen": (cached or {}).get("first_seen") or now_iso(),
         })
@@ -838,6 +918,9 @@ def main() -> int:
     unreclaimed_bytes = sum(o["size_bytes"] or 0 for o in unreclaimed)
     held_bytes = sum(o["size_bytes"] or 0 for o in held_under7)
 
+    # 孤儿分支清扫统计（执行器 apply 内建，GitHub 与工蜂两跳都收）
+    orphan_branches_removed: list[dict] = []
+
     # --- 5. 执行（仅在 --execute 且条件齐备时）---
     executed_this_round, failed = [], []
     executable = [e for e in owner_eligible
@@ -875,13 +958,15 @@ def main() -> int:
                         "ignored_sample": (e.get("ignored") or {}).get("sample"),
                         "backup_root": res.get("backup_root"),
                         "last_active_at": o.get("last_active_at"),
+                        "branch_deleted": (ent.get("branch_deletion") or {}).get("deleted"),
                     })
                 else:
                     failed.append({"path": e["path"], "error": ent.get("error") or res.get("error")})
 
     # --- 5b. 工蜂（非 GitHub host）：证据经 owner 工具 --remote-evidence 走同一 sink ---
-    # 唯一执行器不变（`git worktree remove` 非 --force、不删分支、.local 备份、apply 前指纹复验）；
-    # 只是把「远端已有」的证人从 gh API 换成 gongfengcli 核验结果，sink 端仍按完整对象名全等校验。
+    # 唯一执行器不变（`git worktree remove` 非 --force、.local 备份、apply 前指纹复验）；
+    # 分支按 owner 2026-09-19 政策默认删除（远端证明就是删除分支的依据）；
+    # 工蜂场景只是把「远端已有」的证人从 gh API 换成 gongfengcli 核验结果，sink 端仍按完整对象名全等校验。
     verified_remaining = list(verified_reclaimable)
     gongfeng_blocked_items = []
     attemptable = []
@@ -897,6 +982,9 @@ def main() -> int:
         gongfeng_executed_paths: set[str] = set()
         for repo, ev in sorted(build_gongfeng_evidence(attemptable).items()):
             res = owner_tool_gongfeng_apply(repo, ot_dir, ev, args.min_age_hours)
+            for item in (res.get("branch_sweep") or {}).get("branches_removed") or []:
+                orphan_branches_removed.append(
+                    {"repo": repo, "branch": item["branch"], "proof": item.get("proof")})
             entries = res.get("entries") if isinstance(res.get("entries"), list) else []
             for record in ev["entries"]:
                 o = obj_by_path.get(record["path"])
@@ -914,6 +1002,7 @@ def main() -> int:
                         "ignored_sample": (ent.get("ignored") or {}).get("sample"),
                         "backup_root": res.get("backup_root"),
                         "last_active_at": o.get("last_active_at"),
+                        "branch_deleted": (ent.get("branch_deletion") or {}).get("deleted"),
                     })
                 else:
                     failed.append({
@@ -925,13 +1014,16 @@ def main() -> int:
                               if o["path"] not in gongfeng_executed_paths]
     executed_bytes = sum(x["size_bytes"] or 0 for x in executed_this_round)
 
-    # 复核：分支与提交仍可达
+    # 复核：提交仍可达；分支按 owner 2026-09-19 政策默认已删，仍在反而要关注
     verify = []
     for x in executed_this_round:
         rc1, _, _ = run(["git", "-C", x["repo"], "cat-file", "-t", x["head"]], timeout=60)
         rc2, out2, _ = run(["git", "-C", x["repo"], "branch", "--list", x["branch"]], timeout=60)
+        branch_present = bool(out2.strip())
         verify.append({"path": x["path"], "commit_type": "commit" if rc1 == 0 else "missing",
-                       "branch_present": bool(out2.strip())})
+                       "branch_present": branch_present,
+                       "branch_deleted": x.get("branch_deleted"),
+                       "branch_anomaly": branch_present})
 
     if executed_this_round:
         state_new.setdefault("history", []).append({
@@ -950,6 +1042,26 @@ def main() -> int:
     os.makedirs(os.path.dirname(args.state), exist_ok=True)
     with open(os.path.join(round_dir, "raw", "state_snapshot.json"), "w") as fh:
         json.dump(state_new, fh, ensure_ascii=False, indent=1)
+
+    # --- 5c. 分支价值信号：相对远端默认分支的 ahead/behind + 独有 diff 规模 ---
+    # 借鉴 gmc wt list --diff-base；只对进入决策表的 ≥7 天对象计算，不作删除授权。
+    for o in unreclaimed:
+        if o.get("branch"):
+            o["standing"] = branch_standing(o["repo"], o["branch"])
+
+    # --- 5d. prunable 注册清理（owner 2026-09-19 授权：--execute 时自动 prune）---
+    # git 已确认 gitdir 指向的目录不存在，prune 只删失效元数据，零数据丢失。
+    prunable_pruned: list[dict] = []
+    if args.execute and prunable_regs:
+        for repo in sorted({o["repo"] for o in prunable_regs}):
+            rc, out, err = run(["git", "-C", repo, "worktree", "prune", "--verbose"],
+                               timeout=120)
+            removed_lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+            prunable_pruned.append({
+                "repo": repo, "removed": len(removed_lines) if rc == 0 else 0,
+                "detail": removed_lines[:10],
+                "error": None if rc == 0 else (err or out or f"git 退出 {rc}")[:200],
+            })
 
     # --- 6. 预聚合输出 ---
     by_reason: dict[str, dict] = {}
@@ -1001,11 +1113,16 @@ def main() -> int:
             return f"{web or host} · 分支 {o['branch']}（MR 未验证）"
         return "无"
 
-    # HTML/证据渲染读的是对象上的字段，这里一次性补齐，避免只有 stdout 有链接。
+    # evidence 与回复表格读对象上的字段，这里一次性补齐，避免只有 stdout 有链接。
     for o in unreclaimed + verified_reclaimable:
         o["pr_url"] = pr_url(o)
         o["function"] = func_of(o)
         o["next_step"] = o.get("skip_reason") or "保留"
+    # 已执行项进 evidence.json 前补齐功能/链接字段（回复表格直接取用）。
+    for x in executed_this_round:
+        o = obj_by_path.get(x["path"], {})
+        x["function"] = func_of(o)
+        x["pr_url"] = pr_url(o)
 
     gongfeng_executed_items = [o for o in verified_reclaimable
                                if o["path"] not in {x["path"] for x in verified_remaining}]
@@ -1029,6 +1146,10 @@ def main() -> int:
         "cumulative_reclaimed_bytes": cumulative, "cumulative_since": cumulative_since,
         "who_uses_probed": probed,
         "prunable_registrations": len(prunable_regs),
+        "prunable_pruned": prunable_pruned,
+        "orphan_branches_removed": orphan_branches_removed,
+        "orphan_branches_removed_count": len(orphan_branches_removed),
+        "branch_deleted_count": sum(1 for x in executed_this_round if x.get("branch_deleted")),
         "verified_reclaimable_count": len(verified_reclaimable),
         "verified_reclaimable_bytes": sum(o["size_bytes"] or 0 for o in verified_reclaimable),
         "gongfeng_credential_ok": bool(gf_token),
@@ -1046,6 +1167,8 @@ def main() -> int:
                 "unreclaimed": [{"path": o["path"], "repo": o["repo"],
                                  "size_bytes": o["size_bytes"], "age_hours": o["age_hours"],
                                  "last_active_at": o.get("last_active_at"),
+                                 "dirty_summary": o.get("dirty_summary"),
+                                 "standing": o.get("standing"),
                                  "reasons": o["reasons"], "pr": o["pr"],
                                  "pr_url": pr_url(o), "function": func_of(o),
                                  "next_step": o["skip_reason"] or "保留"} for o in unreclaimed],
@@ -1068,20 +1191,12 @@ def main() -> int:
     with open(os.path.join(round_dir, "summary.json"), "w") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=1)
 
-    # 已执行项补齐功能/链接字段，供 HTML 使用
-    for x in executed_this_round:
-        o = obj_by_path.get(x["path"], {})
-        x["function"] = func_of(o)
-        x["pr_url"] = pr_url(o)
     root_pct = df_pct("/") or 0.0
     data_pct = df_pct("/data") or 0.0
     summary["root_used_pct"] = root_pct
     summary["data_used_pct"] = data_pct
     with open(os.path.join(round_dir, "summary.json"), "w") as fh:
         json.dump(summary, fh, ensure_ascii=False, indent=1)
-    render_html(summary, executed_this_round, unreclaimed, by_reason, held_under7, verify,
-                root_pct, data_pct, os.path.join(round_dir, "report.html"),
-                verified=verified_remaining)
 
     # 账本先落盘：stdout 被调用方截断（SIGPIPE）也不能丢产物
     audit = render_audit(summary, executed_this_round, unreclaimed, by_reason, verify, failed)
@@ -1115,11 +1230,17 @@ def main() -> int:
     print("\n--- ≥7 天未清理 · 原因分布 ---")
     for r, v in sorted(by_reason.items(), key=lambda kv: -kv[1]["bytes"]):
         print(f"  {r:22s} {v['count']:3d} 项 / {fmt_bytes(v['bytes'])}")
-    print("\n--- ≥7 天未清理 · 前 30 项（按空间，供统一表格：项目|结果|原因|空间|年龄|上次活跃）---")
+    print("\n--- ≥7 天未清理 · 前 30 项（按空间，供统一表格：项目|结果|原因|空间|年龄|上次活跃|领先/落后）---")
     for o in unreclaimed[:30]:
+        st = o.get("standing") or {}
+        st_txt = f"a{st.get('ahead', '?')}/b{st.get('behind', '?')}" if st else "—"
         print(f"  {fmt_bytes(o['size_bytes']):>10}  {round((o['age_hours'] or 0)/24,1):>5}d  "
               f"{(o.get('last_active_at') or '不可得')[:19]:19s}  "
-              f"{'/'.join(o['reasons'])[:30]:30s} {o['repo']}  {o['path'][:56]}")
+              f"{'/'.join(o['reasons'])[:30]:30s}{compact_dirty(o.get('dirty_summary')):22s} "
+              f"{st_txt:>10}  "
+              f"{o['repo']}  {o['path'][:48]}")
+        if st and st.get("ahead"):
+            print(f"             独有提交 {st['ahead']} 个（vs {st['base']}）：{st['unique_diff'][:90]}")
     mr_rows = [o for o in unreclaimed
                if "非 GitHub host" in o["reasons"] or "工具判 ambiguous" in o["reasons"]]
     print(f"\n--- 需 owner 查 MR/PR 的 {len(mr_rows)} 项（完整）---")
@@ -1152,7 +1273,17 @@ def main() -> int:
         print(f"  docker| {ln}")
     for r in infra["listeners"]:
         print(f"  端口 {r['port']:<6} {r['addr']:<16} {'/'.join(r['procs'])[:34]:<34} {r['whitelist']}")
-    print(f"  prunable 无实体登记项 {len(prunable_regs)}（供 owner 决定是否 git worktree prune）")
+    if prunable_regs:
+        pruned_total = sum(p["removed"] for p in prunable_pruned)
+        print(f"  prunable 无实体登记项 {len(prunable_regs)}："
+              + (f"--execute 已自动 prune {pruned_total} 条" if args.execute
+                 else "本轮 dry-run 未清理，--execute 时自动 prune"))
+        for p in prunable_pruned:
+            if p.get("error"):
+                print(f"    prune 失败 {p['repo']}: {p['error']}")
+    if orphan_branches_removed:
+        print(f"  孤儿分支已删 {len(orphan_branches_removed)} 条："
+              + "；".join(f"{r['repo'].rsplit('/',1)[-1]}:{r['branch']}" for r in orphan_branches_removed[:10]))
     if failed:
         print("\n--- 执行失败 ---")
         for f in failed:
@@ -1161,139 +1292,12 @@ def main() -> int:
     return 0
 
 
-CSS = """
-:root{--bg:#0f1115;--panel:#171a21;--ink:#e8eaf0;--muted:#98a0b3;--line:#262b36;--ok:#3fb950;--warn:#d29922;--bad:#f85149;--acc:#58a6ff}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif}
-header{padding:26px 32px;border-bottom:1px solid var(--line);background:linear-gradient(180deg,#171a21,#0f1115)}
-h1{margin:0 0 6px;font-size:21px}h2{margin:30px 0 10px;font-size:16px;border-left:3px solid var(--acc);padding-left:10px}
-.sub{color:var(--muted)}.wrap{padding:0 32px 60px;max-width:1560px}
-.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(185px,1fr));gap:12px;margin:18px 0}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
-.card .k{color:var(--muted);font-size:12px}.card .v{font-size:21px;font-weight:600;margin-top:4px}
-table{width:100%;border-collapse:collapse;margin:8px 0 4px;font-size:13px}
-th,td{border-bottom:1px solid var(--line);padding:7px 9px;text-align:left;vertical-align:top}
-th{color:var(--muted);font-weight:600;font-size:12px;text-transform:uppercase;letter-spacing:.04em}
-td.num{text-align:right;white-space:nowrap}code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#c9d1d9}
-.muted{color:var(--muted)}.ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
-.note{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px 16px;margin:12px 0}
-footer{color:var(--muted);padding:22px 32px;border-top:1px solid var(--line)}
-pre{white-space:pre-wrap}
-"""
-
-
-def esc(x) -> str:
-    return (str(x if x is not None else "—").replace("&", "&amp;")
-            .replace("<", "&lt;").replace(">", "&gt;"))
-
-
-def render_html(summary, executed, unreclaimed, by_reason, held, verify, root_pct, data_pct,
-                out_path, verified=None):
-    verified = verified or []
-    def link(url):
-        return f"<a href='{esc(url)}'>{esc(url)}</a>" if str(url).startswith("http") else esc(url)
-
-    exec_rows = "".join(
-        f"<tr><td><code>{esc(x['repo'])}</code></td><td><code>{esc(x['path'])}</code></td>"
-        f"<td class='num'>{x['age_days']} d</td>"
-        f"<td>{esc(x.get('last_active_at') or '不可得')}</td>"
-        f"<td>{esc(x.get('function') or x['branch'])}</td>"
-        f"<td class='num'>{fmt_bytes(x['size_bytes'])}</td>"
-        f"<td>{link(x.get('pr_url') or '无')}</td>"
-        f"<td>{esc(x['branch'])} @ {esc(x['head'][:10])}（提交仍可达）</td>"
-        f"<td>{esc(x.get('backup_root') or '—')}</td></tr>" for x in executed)
-    unrec_rows = "".join(
-        f"<tr><td><code>{esc(o['repo'])}</code></td><td><code>{esc(o['path'])}</code></td>"
-        f"<td class='num'>{fmt_bytes(o['size_bytes'])}</td>"
-        f"<td class='num'>{round((o['age_hours'] or 0)/24,1)} d</td>"
-        f"<td>{esc(o.get('last_active_at') or '不可得')}</td>"
-        f"<td>{esc('/'.join(o['reasons']))}</td>"
-        f"<td>{link(o.get('pr_url') or '无')}</td>"
-        f"<td>{esc(o.get('next_step') or '保留')}</td></tr>" for o in unreclaimed[:30])
-    reason_rows = "".join(
-        f"<tr><td>{esc(r)}</td><td class='num'>{v['count']}</td>"
-        f"<td class='num'>{fmt_bytes(v['bytes'])}</td></tr>"
-        for r, v in sorted(by_reason.items(), key=lambda kv: -kv[1]["bytes"]))
-    verify_rows = "".join(
-        f"<tr><td><code>{esc(v['path'])}</code></td><td>{esc(v['commit_type'])}</td>"
-        f"<td>{esc(v['branch_present'])}</td></tr>" for v in verify)
-    root_cls = "bad" if (root_pct or 0) >= 70 else "ok"
-    extra_rows = "".join(
-        f"<tr><td><code>{esc(o['repo'])}</code></td><td><code>{esc(o['path'])}</code></td>"
-        f"<td class='num'>{fmt_bytes(o['size_bytes'])}</td>"
-        f"<td class='num'>{round((o['age_hours'] or 0)/24,1)} d</td>"
-        f"<td>{esc('/'.join(o['reasons']))}</td><td>{link(o.get('pr_url') or '无')}</td></tr>"
-        for o in unreclaimed if ("非 GitHub host" in o["reasons"]
-                                 or "工具判 ambiguous" in o["reasons"]))
-    verified_rows = "".join(
-        f"<tr><td><code>{esc(o['repo'])}</code></td><td><code>{esc(o['path'])}</code></td>"
-        f"<td class='num'>{fmt_bytes(o['size_bytes'])}</td>"
-        f"<td class='num'>{round((o['age_hours'] or 0)/24,1)} d</td>"
-        f"<td>MR!{esc((o.get('gongfeng') or {}).get('iid'))} → "
-        f"{esc((o.get('gongfeng') or {}).get('target_branch'))}</td>"
-        f"<td>{esc(o['branch'])} @ {esc(o['head'][:10])}</td>"
-        f"<td>{link(o.get('pr_url') or '无')}</td>"
-        f"<td>{esc(o.get('gongfeng_blocked') or '已核验，待执行')}</td></tr>"
-        for o in sorted(verified, key=lambda x: -(x["size_bytes"] or 0)))
-    html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Worktree 巡检 · {esc(summary['collected_at'][:10])}</title><style>{CSS}</style></head><body>
-<header><h1>Worktree 巡检与安全清理 · 只读判定 + 常设授权执行</h1>
-<div class="sub">运行 {esc(summary['run_id'])} ｜ 采集 {esc(summary['collected_at'])}（Asia/Shanghai）｜
-规则门槛 age ≥ {summary['min_age_hours']:g}h ｜ 模式 {esc(summary['mode'])} ｜
-目录 <code>{esc(summary['round_dir'])}</code></div></header><div class="wrap">
-<div class="cards">
-<div class="card"><div class="k">系统盘 /</div><div class="v {root_cls}">{root_pct:.1f}%</div><div class="muted">超 70% 标红</div></div>
-<div class="card"><div class="k">数据盘 /data</div><div class="v">{data_pct:.1f}%</div><div class="muted">—</div></div>
-<div class="card"><div class="k">登记工作树</div><div class="v">{summary['registered_entries']}</div><div class="muted">主 {summary['primary_checkouts']} · 链接 {summary['linked_present']}</div></div>
-<div class="card"><div class="k">本轮执行</div><div class="v ok">{summary['executed_count']} 项</div><div class="muted">{fmt_bytes(summary['executed_bytes'])}</div></div>
-<div class="card"><div class="k">≥7 天未清理</div><div class="v warn">{summary['unreclaimed_over_7d_count']} 项</div><div class="muted">{fmt_bytes(summary['unreclaimed_over_7d_bytes'])}</div></div>
-<div class="card"><div class="k">&lt;7 天保留</div><div class="v">{summary['held_under7_count']} 项</div><div class="muted">{fmt_bytes(summary['held_under7_bytes'])}</div></div>
-<div class="card"><div class="k">累计回收</div><div class="v">{fmt_bytes(summary['cumulative_reclaimed_bytes'])}</div><div class="muted">自 {esc(summary['cumulative_since'])}</div></div>
-<div class="card"><div class="k">增量效果</div><div class="v">{summary['reused']}</div><div class="muted">复用缓存 / 重测 {summary['measured']}</div></div>
-</div>
-<h2>一、按项目分组的已清理</h2>
-<table><thead><tr><th>项目</th><th>路径</th><th class="num">年龄</th><th>上次活跃（树内最新 mtime）</th><th>功能（推断）</th>
-<th class="num">释放</th><th>PR/MR</th><th>可恢复性</th><th>备份</th></tr></thead>
-<tbody>{exec_rows or '<tr><td colspan=9>无</td></tr>'}</tbody></table>
-<div class="note">执行器 <code>worktree-cleanup --apply --approve-report</code>（内部 <code>git worktree remove</code>，非 --force；不删分支）。
-复核：{'；'.join(f"{esc(v['path'])} commit={esc(v['commit_type'])} branch={esc(v['branch_present'])}" for v in verify) or '本轮无执行'}。</div>
-<h2>二、≥7 天未清理（{summary['unreclaimed_over_7d_count']} 项 / {fmt_bytes(summary['unreclaimed_over_7d_bytes'])}）</h2>
-<table><thead><tr><th>项目</th><th>路径</th><th class="num">大概空间</th><th class="num">年龄</th>
-<th>上次活跃（树内最新 mtime）</th><th>原因</th><th>PR/MR</th><th>下一步</th></tr></thead>
-<tbody>{unrec_rows or '<tr><td colspan=8>无</td></tr>'}</tbody></table>
-<div class="muted">表仅列前 30 行（按空间降序）；完整清单见 <code>evidence.json</code> 的 <code>unreclaimed[]</code>。</div>
-<h2>三、需 owner 查 MR 的两类（完整列出，不受 30 行限制）</h2>
-<table><thead><tr><th>项目</th><th>路径</th><th class="num">大概空间</th><th class="num">年龄</th>
-<th>原因</th><th>PR/MR</th></tr></thead>
-<tbody>{extra_rows or '<tr><td colspan=6>无</td></tr>'}</tbody></table>
-<h2>三之二、工蜂 MR 已核验且精确 head（未执行 {len(verified)} 项 / {fmt_bytes(sum(o['size_bytes'] or 0 for o in verified))}；本轮执行 {summary.get('gongfeng_executed_count', 0)} 项）</h2>
-<p class="sub">clean / 无活跃引用 / 无 BB 归属，远端已有且 ≥{summary['min_age_hours']:g}h。
-<code>--execute</code> 时经 <code>--remote-evidence</code> 走同一个 owner 执行器（非 --force、不删分支、.local 备份、apply 前指纹复验）。
-下表只列本轮未执行的项。</p>
-<table><thead><tr><th>项目</th><th>路径</th><th class="num">大概空间</th><th class="num">年龄</th>
-<th>MR → 目标分支</th><th>分支 @ HEAD</th><th>MR 链接</th><th>状态</th></tr></thead>
-<tbody>{verified_rows or '<tr><td colspan=8>无</td></tr>'}</tbody></table>
-<h2>四、原因分布</h2>
-<table><thead><tr><th>原因</th><th class="num">项数（可叠加）</th><th class="num">合计空间</th></tr></thead>
-<tbody>{reason_rows}</tbody></table>
-<h2>五、&lt;7 天保留</h2>
-<div class="note">共 {summary['held_under7_count']} 项 / {fmt_bytes(summary['held_under7_bytes'])}（在办工作，不逐项列出）。</div>
-<h2>六、增量与执行器健康</h2>
-<div class="note">本轮测量 {summary['measured']} 项、复用缓存 {summary['reused']} 项（指纹未变则复用上次 du/artifact/who-uses）；
-who-uses 串行探测 {summary['who_uses_probed']} 项。缓存不参与删除授权——owner 工具在 apply 前按指纹复验。</div>
-<div class="note">eligible={summary['eligible_count']}，执行失败 {summary['failed_count']}。clean-tmp 与 Docker 可回收见当轮 Agent 报告。</div>
-<footer>生成于 {esc(summary['collected_at'])} · 规则见 storage-rules.md · 输出契约见 worktree-report-format.md</footer>
-</div></body></html>"""
-    with open(out_path, "w") as fh:
-        fh.write(html)
-
-
 def mirror_round(round_dir: str, mirror_root: str):
     """把本轮产物镜像进仓库（best-effort；仓库不可写不影响本轮结论）。"""
     dst = os.path.join(mirror_root, os.path.basename(round_dir.rstrip("/")))
     try:
         os.makedirs(dst, exist_ok=True)
-        for item in ("report.html", "evidence.json", "summary.json", "audit_section.md"):
+        for item in ("evidence.json", "summary.json", "audit_section.md"):
             src = os.path.join(round_dir, item)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dst, item))
@@ -1402,7 +1406,7 @@ def render_audit(summary, executed, unreclaimed, by_reason, verify, failed) -> s
     L.append(f"- 采集：登记 {summary['registered_entries']}，可访问链接 {summary['linked_present']}，"
              f"测量 {summary['measured']} / 缓存复用 {summary['reused']}，"
              f"who-uses 串行 {summary['who_uses_probed']}。")
-    L.append(f"- 产物：`{summary['round_dir']}/{{report.html,evidence.json,summary.json}}`。\n")
+    L.append(f"- 产物：`{summary['round_dir']}/{{evidence.json,summary.json,audit_section.md}}`（按 owner 决定不产出 HTML）。\n")
     L.append("### 已执行\n")
     if not executed:
         L.append(f"无（eligible={summary['eligible_count']}，失败 {summary['failed_count']}）。")
@@ -1416,7 +1420,8 @@ def render_audit(summary, executed, unreclaimed, by_reason, verify, failed) -> s
             L.append(f"- 其中工蜂（git.example.invalid）{summary['gongfeng_executed_count']} 项经 "
                      f"`--remote-evidence` 走同一 owner 执行器（非 --force、不删分支）。")
         for v in verify:
-            L.append(f"- 复核 {v['path']}：commit={v['commit_type']}，branch_present={v['branch_present']}")
+            L.append(f"- 复核 {v['path']}：commit={v['commit_type']}，"
+                     f"分支{'已删（政策默认）' if not v.get('branch_present') else '未删（需关注）'}")
     if failed:
         L.append("\n失败：" + "; ".join(f"{f['path']}: {f['error']}" for f in failed))
     if summary.get("gongfeng_blocked_count"):

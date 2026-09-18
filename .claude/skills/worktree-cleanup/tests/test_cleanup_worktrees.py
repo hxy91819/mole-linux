@@ -217,7 +217,10 @@ else:
         )
         self.assertFalse((backup_root / "task-123" / ".env").exists())
         branches = self.run_git("branch", "--format=%(refname:short)").stdout.splitlines()
-        self.assertIn("task-123", branches)
+        self.assertNotIn("task-123", branches)
+        entry = next(e for e in applied["entries"] if e["action"] == "removed")
+        self.assertTrue(entry["branch_deletion"]["deleted"])
+        self.assertIn("worktree-removal-proof", entry["branch_deletion"]["proof"])
 
     def test_locked_worktree_is_kept(self) -> None:
         self.run_git("worktree", "lock", "--reason", "active agent", str(self.worktree))
@@ -695,7 +698,74 @@ os.execv("/usr/bin/git", ["git", *args])
         self.assertEqual(applied["rejected_approvals"], [])
         self.assertFalse(self.worktree.exists())
         branches = self.run_git("branch", "--format=%(refname:short)").stdout.splitlines()
+        self.assertNotIn("task-123", branches)
+
+    def test_keep_branches_flag_retains_every_branch(self) -> None:
+        local_file = self.worktree / ".local" / "notes.txt"
+        local_file.parent.mkdir()
+        local_file.write_text("restore me\n", encoding="utf-8")
+        _, report = self.audit()
+        token = self.approval_for(report, self.worktree)
+
+        result = self.run_helper(
+            "--apply", "--approve", token, "--keep-branches", "--json"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["removed"], 1)
+        entry = next(e for e in applied["entries"] if e["action"] == "removed")
+        self.assertFalse(entry["branch_deletion"]["deleted"])
+        self.assertEqual(entry["branch_deletion"]["reason"], "--keep-branches")
+        branches = self.run_git("branch", "--format=%(refname:short)").stdout.splitlines()
         self.assertIn("task-123", branches)
+
+    def test_orphan_sweep_removes_merged_branch_and_keeps_unmerged(self) -> None:
+        self.run_git("checkout", "-q", "-b", "merged-orphan")
+        (self.repo / "orphan.txt").write_text("landed\n", encoding="utf-8")
+        self.run_git("add", "orphan.txt")
+        self.run_git("commit", "-m", "orphan work")
+        self.run_git("checkout", "-q", "main")
+        self.run_git("merge", "--ff-only", "merged-orphan")
+        self.run_git("branch", "merged-live", "main")
+        self.run_git("checkout", "-q", "merged-live")
+        self.run_git("commit", "--allow-empty", "-q", "-m", "unmerged-only-on-branch")
+        self.run_git("checkout", "-q", "main")
+
+        _, report = self.audit()
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        sweep = applied["branch_sweep"]
+        removed = {item["branch"] for item in sweep["branches_removed"]}
+        kept = {item["branch"]: item["reason"] for item in sweep["branches_kept"]}
+        self.assertIn("merged-orphan", removed)
+        self.assertIn("merged-live", kept)
+        self.assertIn("no object-level durability proof", kept["merged-live"])
+        branches = self.run_git("branch", "--format=%(refname:short)").stdout.splitlines()
+        self.assertNotIn("merged-orphan", branches)
+        self.assertIn("merged-live", branches)
+        self.assertNotIn("task-123", branches)  # 随 worktree 回收按策略删除；清扫本身只碰无认领分支
+
+    def test_orphan_sweep_records_fetch_failure_but_still_sweeps_local_lineage(self) -> None:
+        self.run_git("checkout", "-q", "-b", "merged-orphan")
+        (self.repo / "orphan.txt").write_text("landed\n", encoding="utf-8")
+        self.run_git("add", "orphan.txt")
+        self.run_git("commit", "-q", "-m", "orphan work")
+        self.run_git("checkout", "-q", "main")
+        self.run_git("merge", "--ff-only", "merged-orphan")
+
+        _, report = self.audit()
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        sweep = applied["branch_sweep"]
+        self.assertFalse(sweep["fetch_ok"])  # 测试仓无 origin
+        self.assertIn("merged-orphan", [i["branch"] for i in sweep["branches_removed"]])
 
     def test_external_evidence_apply_rejects_a_worktree_changed_after_audit(self) -> None:
         self.age_worktree(self.worktree)

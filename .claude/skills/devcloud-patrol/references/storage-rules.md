@@ -96,7 +96,9 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
 
 - owner 于 2026-09-17 决定：DB 存储巡检**不再产出 HTML 报告**；证据（JSON + 原始采集）
   落 `/data/metrics/ai-storage-maintenance/<round>/`，结论与执行量在回复中简报，
-  并追加本仓 `storage-audit.log`。
+  并追加本仓 `storage-audit.log`。**owner 2026-09-18 扩展到全部自动化**：DB、Worktree、
+  每周系统盘复盘一律不产出 HTML，产物只保留 JSON / Markdown / `raw/`；需要图文材料时
+  由 owner 单独一次性要求，不写回流程默认值。
 - **每轮必须给出“待确认对象的来源项目”**（owner 2026-09-17 追加要求）：卷/镜像/构建缓存逐项标注
   项目 + 证据 + 置信度，不能只写“无主/未确认”。唯一执行器
   `/data/metrics/ai-storage-maintenance/<round>/attribute_sources.py --out raw/attribution.json --table`
@@ -169,7 +171,7 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   突出报告；/tmp 清理只释放数据盘，不能声称达到系统盘降占用目标。
 - `/data/tmp` 和其他测试产物需要结合 owner、持久数据及活动证据逐项审查；
   年龄和无进程引用不足以授权删除；目录叫 `tmp` 不构成可弃证据。
-- **worktree 本体回收（owner 2026-09-17 常设授权）**：worktree 生命周期通常
+- **worktree 本体回收（owner 2026-09-17 常设授权；2026-09-19 修订分支政策）**：worktree 生命周期通常
   小于 7 天，超过即视为无价值残留。三条**同时**满足才可整棵回收，满足即自动执行，
   不再逐项等人点头：
   1. age ≥ 7 天（168h，`worktree-cleanup` 的 `.git` mtime 口径）；
@@ -177,18 +179,30 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
      分支 tip、或 HEAD 含于远端默认分支；
   3. 工作区干净、非 locked/prunable、无活跃进程引用（`who-uses`，须串行探针）、
      无 BB 环境/线程指认。
-  唯一执行器 `/root/.agents/skills/worktree-cleanup/scripts/cleanup_worktrees.py`
+  **分支政策（owner 2026-09-19：「只要有证据证明可以安全删除…不要都依赖人工决策」
+  「默认删分支是合理的」）**：worktree 回收时其本地分支默认同步删除（删除依据就是
+  该次回收的远端证明，squash 合并同样覆盖）；另对无 worktree 认领的本地分支做
+  孤儿清扫：tip 并入默认分支谱系（origin/<default> 优先，本地 <default> 兑底）
+  或 tip == 远端同名分支 tip 者删，其余（如 squash-merged 且远端分支已不存在）
+  保留并报告原因。`--keep-branches` 可整体退出。清扫失败只计数，不回退 worktree 回收。
+  唯一执行器 `/data/code/mole-linux/.claude/skills/worktree-cleanup/scripts/cleanup_worktrees.py`
   的 `--dry-run --min-no-pr-age-hours 168 --write-approval-report …` 后接
   `--apply --approve-report`；它内部执行 `git worktree remove`（**非 `--force`**）、
-  apply 前按 HEAD/lock/dirty/ignored 指纹复验、**不删分支**、`.local/` 备份到
+  apply 前按 HEAD/lock/dirty/ignored 指纹复验、按上述政策删分支、`.local/` 备份到
   `/root/.local/state/worktree-cleanup/<repo>-<hash>/<ts>/`。禁止 `rm -rf`、
-  `git clean`、`--force` 或删分支来绕过它的拒绝。
+  `git clean` 或 `--force` 来绕过它的拒绝；**删除分支必须走执行器**（有证据才删、
+  可审计），不得在执行器外手工删。
   PR 仍 open、脏工作区、远端不可证、prunable、locked、活跃 BB 环境一律保留，
   并逐项列原因与 PR/MR 地址。
   **`--min-no-pr-age-hours` 只约束无 PR 分支**，PR-based 候选必须另行做 age 过滤，
   否则会把 7 天内的在办工作误判为可回收。
+  **prunable 注册（owner 2026-09-19 授权）**：`--execute` 时对含失效注册的 repo 自动
+  `git worktree prune --verbose`（git 已确认目录不存在，零数据丢失），结果入账本；
+  dry-run 只报告。每轮报告给 ≥7 天对象附相对远端默认分支的 ahead/behind 与独有
+  diff 规模（借鉴 gmc `wt list --diff-base`），仅作价值信号，不作删除授权。
   回归检查：同一 repo 在 168h 与 24h 两个门槛下 eligible 差异只出现在无 PR 项；
-  回收后 `git cat-file -t <head>` 仍为 commit 且 `branch --list` 命中同名分支。
+  回收后 `git cat-file -t <head>` 仍为 commit；分支默认已删（`branch --list` 不再命中，
+  仍在则视为删除失败并报告）。
 - **非 GitHub host（git.example.invalid）必须用 `gongfengcli` 核验 MR，不得停在“无法判定”。**
   凭据：优先环境变量 `GONGFENG_PRIVATE_TOKEN`，否则读 owner 维护的
   `/data/code/lighthouse/developer/.env`（要求 root 所有且组/其他不可读，否则记「凭据缺失」，
@@ -199,7 +213,8 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   MR 链接：`https://git.example.invalid/<ns>/<project>/-/merge_requests/<iid>`（实测 200；不带 `/-/` 为 302）。
   判定同 GitHub 口径：`state=merged` 且 `source_commit` == 本地 HEAD 才算精确 head。
   **执行方式（owner 2026-09-18 决定「补充工具缺口」）**：唯一执行器不变
-  （`cleanup_worktrees.py`：非 `--force`、不删分支、`.local` 备份、apply 前按指纹复验），
+  （`cleanup_worktrees.py`：非 `--force`、分支按 2026-09-19 政策默认删除、`.local` 备份、
+  apply 前按指纹复验），
   新增 `--remote-evidence <json>`；`patrol_worktrees.py --execute` 把工蜂核验结果按 repo
   写成证据文件，再跑 `--dry-run --write-approval-report` → `--apply --approve-report` 两跳。
   证据模式硬约束：**完全不调用 `gh`**（非 GitHub host 没有 GitHub API 可查）；只接受文件里

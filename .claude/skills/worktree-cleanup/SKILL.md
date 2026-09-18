@@ -93,8 +93,8 @@ Use `--backup-root <path>` when the user requests another durable location. A fa
 - Never remove the primary checkout or the checkout selected by `--repo`.
 - Keep the backup root outside every cleanup target; the helper rejects unsafe paths before writing.
 - Continue independent candidates after a stale approval, backup failure, state-validation failure, authorization denial, or removal failure.
-- Treat branch deletion as a separate operation outside this skill.
-- Remote proof is point-in-time evidence, not a promise that a remote ref will exist forever. The helper never deletes the local branch, so removing a worktree does not delete its commit reference.
+- Treat branch deletion as part of this skill (owner policy 2026-09-19): after a successful removal the worktree's local branch is deleted by default, using the same remote durability proof as the removal; `--keep-branches` opts out. In apply mode the helper also sweeps unclaimed local branches whose tip is contained in the default branch lineage or equals the current remote branch tip; everything else is kept with a reason. Branch failures never retroactively fail a removal.
+- Remote proof is point-in-time evidence, not a promise that a remote ref will exist forever. Branch deletion removes the last local ref to the worktree's commits; durability on the remote is what makes that acceptable, and `--keep-branches` restores the previous behavior.
 
 ## Output
 

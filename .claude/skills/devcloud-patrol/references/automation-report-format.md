@@ -10,7 +10,9 @@ worktree 的对象级内容契约见 [worktree-report-format.md](worktree-report
 1. **回复整体用表格**：owner 收到的消息以 Markdown 表格为主体，不写长段散文。
 2. **一屏优先**：先给一张汇总表，再给按结论分组的明细表；每项一行。
 3. **结论跟证据走**：每个对象必须能在一行内讲清「谁的、多老、多大、为什么这样处置」。
-4. **机器可读证据另存**：JSON/HTML/raw 落本轮专属目录，回复里只给路径链接，不贴原始输出。
+4. **机器可读证据另存**：JSON/raw 落本轮专属目录，回复里只给路径链接，不贴原始输出。
+   **所有自动化一律不产出 HTML**（owner 2026-09-18）：DB、Worktree、每周复盘都不写
+   `report.html`；需要图文材料时由 owner 单独一次性要求，不写回流程默认值。
 5. **跨轮同口径**：年龄 = now − 创建时间（worktree 用 `.git` mtime）；上次活跃时间 =
    树内最新文件 mtime（卷/worktree）/ `Last used`（构建缓存）/ 镜像「不可得」。
    两者都写绝对时间戳，不写「N 天前」。
@@ -76,7 +78,8 @@ worktree 的对象级内容契约见 [worktree-report-format.md](worktree-report
 ## 落盘与记账
 
 - 本轮目录：`/data/metrics/ai-storage-maintenance/<YYYY-MM-DD>-<task>/`，附采集时间、范围、证据、逐项保留原因。
-- 机器可读：`report.json`（结论）+ `raw/`（原始证据）；HTML 仅在 owner 明确要求时产出。
+- 机器可读：`report.json` / `summary.json` / `evidence.json`（按任务取用）+ `raw/`（原始证据）；
+  **不产出 HTML**。
 - 账本：`/data/code/mole-linux/storage-audit.log` 追加一节，含日期、证据命令、逐项证据与结果、回收字节、遗留项。
 - 回复末尾给出上述路径的 Markdown 链接。
 
