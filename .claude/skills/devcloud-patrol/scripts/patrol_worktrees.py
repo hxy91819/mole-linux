@@ -927,6 +927,14 @@ def main() -> int:
     orphan_branches_removed: list[dict] = []
 
     # --- 5. 执行（仅在 --execute 且条件齐备时）---
+    executed_this_round, failed = [], []
+    executable = [e for e in owner_eligible
+                  if e["age_hours"] is not None and e["age_hours"] >= args.min_age_hours
+                  and e["path"] in obj_by_path
+                  and (obj_by_path[e["path"]].get("who_uses") or {}).get("count") == 0
+                  and not obj_by_path[e["path"]]["bb_environment"]
+                  and not obj_by_path[e["path"]]["bb_threads"]]
+
     # 动态证据在执行前刷新：who-uses 重探，非零或未知即撤出本轮（下轮自动重评）。
     if args.execute and executable:
         refreshed = []
@@ -956,13 +964,7 @@ def main() -> int:
     if args.execute and executable and not bb_query_ok:
         print("[patrol] BB 归属查询失败，本轮全部保守保留（含合格项），下轮自动重评")
         executable = []
-    executed_this_round, failed = [], []
-    executable = [e for e in owner_eligible
-                  if e["age_hours"] is not None and e["age_hours"] >= args.min_age_hours
-                  and e["path"] in obj_by_path
-                  and (obj_by_path[e["path"]].get("who_uses") or {}).get("count") == 0
-                  and not obj_by_path[e["path"]]["bb_environment"]
-                  and not obj_by_path[e["path"]]["bb_threads"]]
+
     if args.execute and executable:
         by_report: dict[str, list] = {}
         for e in executable:
