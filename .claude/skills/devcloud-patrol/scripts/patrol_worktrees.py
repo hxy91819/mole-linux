@@ -618,18 +618,23 @@ def main() -> int:
         by_path.setdefault(e["path"], e)
 
     bb_envs, bb_threads = [], []
+    bb_query_ok = True
     rc, out, _ = run(["bb", "environment", "list", "--json"], timeout=60)
     if rc == 0:
         try:
             bb_envs = json.loads(out)
         except json.JSONDecodeError:
-            pass
+            bb_query_ok = False
+    else:
+        bb_query_ok = False
     rc, out, _ = run(["bb", "thread", "list", "--json"], timeout=90)
     if rc == 0:
         try:
             bb_threads = json.loads(out)
         except json.JSONDecodeError:
-            pass
+            bb_query_ok = False
+    else:
+        bb_query_ok = False
     env_by_path = {e["path"]: e for e in bb_envs if e.get("path")}
     threads_by_path: dict[str, list] = {}
     for t in bb_threads:
@@ -922,11 +927,40 @@ def main() -> int:
     orphan_branches_removed: list[dict] = []
 
     # --- 5. 执行（仅在 --execute 且条件齐备时）---
+    # 动态证据在执行前刷新：who-uses 重探，非零或未知即撤出本轮（下轮自动重评）。
+    if args.execute and executable:
+        refreshed = []
+        for e in executable:
+            probe = e["path"]
+            if probe.startswith("/tmp/"):
+                cand = "/data/system-tmp/" + probe[len("/tmp/"):]
+                if os.path.exists(cand):
+                    probe = cand
+            rc, out, _ = run(["python3", "-B", DEVCLOUD, "who-uses", "--json", probe],
+                             timeout=180)
+            try:
+                res = json.loads(out)
+            except json.JSONDecodeError:
+                res = {}
+            count = res.get("count")
+            obj_by_path[e["path"]]["who_uses"] = {
+                "count": count, "probe_path": probe, "at": now_iso(),
+                "method": "execute-refresh", "error": None if count == 0 else (out or "")[:200],
+            }
+            if count == 0:
+                refreshed.append(e)
+        dropped_refresh = len(executable) - len(refreshed)
+        if dropped_refresh:
+            print(f"[patrol] 执行前刷新：{dropped_refresh} 项 who-uses 非零/未知，撤出本轮保留待重评")
+        executable = refreshed
+    if args.execute and executable and not bb_query_ok:
+        print("[patrol] BB 归属查询失败，本轮全部保守保留（含合格项），下轮自动重评")
+        executable = []
     executed_this_round, failed = [], []
     executable = [e for e in owner_eligible
                   if e["age_hours"] is not None and e["age_hours"] >= args.min_age_hours
                   and e["path"] in obj_by_path
-                  and not (obj_by_path[e["path"]].get("who_uses") or {}).get("count")
+                  and (obj_by_path[e["path"]].get("who_uses") or {}).get("count") == 0
                   and not obj_by_path[e["path"]]["bb_environment"]
                   and not obj_by_path[e["path"]]["bb_threads"]]
     if args.execute and executable:
@@ -936,8 +970,16 @@ def main() -> int:
         for report, items in by_report.items():
             if not report:
                 continue
+            # owner 2026-09-19（采纳 Oracle P0）：只审批筛后集合，不再整报审批——
+            # 同仓被 who-uses/BB/年龄排除的候选不得随报告获批。
+            approve_args: list[str] = []
+            for e in items:
+                if e.get("token"):
+                    approve_args += ["--approve", e["token"]]
+            if not approve_args:
+                continue
             rc, out, err = run([sys.executable, WORKTREE_TOOL, "--repo", items[0]["repo"],
-                                "--apply", "--json", "--approve-report", report], timeout=900)
+                                "--apply", "--json", *approve_args], timeout=900)
             try:
                 res = json.loads(out)
             except json.JSONDecodeError:
@@ -1281,6 +1323,8 @@ def main() -> int:
         for p in prunable_pruned:
             if p.get("error"):
                 print(f"    prune 失败 {p['repo']}: {p['error']}")
+    if not bb_query_ok:
+        print("  [保守] BB 归属查询失败：本轮所有候选保留，下轮自动重评")
     if orphan_branches_removed:
         print(f"  孤儿分支已删 {len(orphan_branches_removed)} 条："
               + "；".join(f"{r['repo'].rsplit('/',1)[-1]}:{r['branch']}" for r in orphan_branches_removed[:10]))

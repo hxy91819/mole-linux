@@ -187,8 +187,12 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   保留并报告原因。`--keep-branches` 可整体退出。清扫失败只计数，不回退 worktree 回收。
   唯一执行器 `/data/code/mole-linux/.claude/skills/worktree-cleanup/scripts/cleanup_worktrees.py`
   的 `--dry-run --min-no-pr-age-hours 168 --write-approval-report …` 后接
-  `--apply --approve-report`；它内部执行 `git worktree remove`（**非 `--force`**）、
-  apply 前按 HEAD/lock/dirty/ignored 指纹复验、按上述政策删分支、`.local/` 备份到
+  `--apply --approve <token>…`（**只传筛后集合的 token，采纳 Oracle P0 不整报审批**：
+  同仓被 who-uses/BB/年龄排除的候选不得随报告获批；who-uses 未知、BB 归属查询
+  失败一律本轮保留下轮重评；执行前重探 who-uses 刷新动态证据）；它内部执行
+  `git worktree remove`（**非 `--force`**）、
+  apply 前按 HEAD/lock/dirty/ignored 指纹复验、按上述政策删分支（`update-ref -d`
+  旧 OID 校验删除，采纳 Oracle P0 关闭证明后删除竞态）、`.local/` 备份到
   `/root/.local/state/worktree-cleanup/<repo>-<hash>/<ts>/`。禁止 `rm -rf`、
   `git clean` 或 `--force` 来绕过它的拒绝；**删除分支必须走执行器**（有证据才删、
   可审计），不得在执行器外手工删。
@@ -216,7 +220,9 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   （`cleanup_worktrees.py`：非 `--force`、分支按 2026-09-19 政策默认删除、`.local` 备份、
   apply 前按指纹复验），
   新增 `--remote-evidence <json>`；`patrol_worktrees.py --execute` 把工蜂核验结果按 repo
-  写成证据文件，再跑 `--dry-run --write-approval-report` → `--apply --approve-report` 两跳。
+  写成证据文件，再跑 `--dry-run --write-approval-report` → `--apply --approve-report` 两跳
+  （证据文件仅含筛后精确 head 项，报告 token 集合天然等于筛后集合；GitHub 路径则
+  必须逐 token 传）。
   证据模式硬约束：**完全不调用 `gh`**（非 GitHub host 没有 GitHub API 可查）；只接受文件里
   `path`/`branch`/`head`/`source_commit` 与本地全等、`state=merged`、age ≥168h 的项；
   `head`/`source_commit` 必须是完整 40 位对象名；`--min-no-pr-age-hours < 168` 直接 usage
