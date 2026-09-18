@@ -1068,6 +1068,15 @@ def main() -> int:
         for repo in repos:
             if repo in apply_touched_repos:
                 continue
+            # 本地预过滤：无「未被认领且非主干」分支的仓库没有清扫候选，
+            # 直接跳过，避免对 169 个仓库逐个做远端 fetch。
+            claimed = {e.get("branch", "") for e in worktree_entries(repo)}
+            rc_b, out_b, _ = run(
+                ["git", "-C", repo, "branch", "--format=%(refname:short)"], timeout=60)
+            locals_ = [b.strip() for b in (out_b or "").splitlines() if b.strip()]
+            if not [b for b in locals_
+                    if b not in claimed and b not in ("main", "master")]:
+                continue
             rc, out, err = run(
                 [sys.executable, WORKTREE_TOOL, "--repo", repo,
                  "--sweep-only", "--apply", "--json"], timeout=300)

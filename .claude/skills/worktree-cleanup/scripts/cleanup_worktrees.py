@@ -101,13 +101,28 @@ def run_command(
     *,
     cwd: Path | None = None,
     check: bool = True,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(
-        args,
-        cwd=str(cwd) if cwd is not None else None,
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            args,
+            cwd=str(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # 网络类操作（fetch/ls-remote）在不可达远端上会无限挂起；超时按失败返回，
+        # 调用方走保守路径（fetch 失败仍可用本地谱系清扫）。
+        out = exc.stdout
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        return subprocess.CompletedProcess(
+            args,
+            returncode=124,
+            stdout=out or "",
+            stderr=f"timed out after {timeout:g}s",
+        )
     if check and result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip()
         raise CommandError(f"{' '.join(args)} failed: {detail or result.returncode}")
@@ -486,6 +501,7 @@ def remote_branch_tips(repo_root: Path) -> dict[str, str]:
     result = run_command(
         ["git", "-C", str(repo_root), "ls-remote", "--heads", "origin"],
         check=False,
+        timeout=60,
     )
     if result.returncode != 0:
         return {}
@@ -639,7 +655,9 @@ def sweep_orphan_branches(
         return
     claimed = worktree_claimed_branches(repo_root)
     fetch = run_command(
-        ["git", "-C", str(repo_root), "fetch", "--prune", "origin"], check=False
+        ["git", "-C", str(repo_root), "fetch", "--prune", "origin"],
+        check=False,
+        timeout=90,
     )
     sweep["fetch_ok"] = fetch.returncode == 0
     tips = remote_branch_tips(repo_root) if sweep["fetch_ok"] else {}
