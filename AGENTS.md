@@ -184,3 +184,28 @@ golangci-lint run ./cmd/...
 ## Release
 
 Tag-driven flow via `release.yml` on capital-`V` tag pushes. The full release runbook (distribution channels, pre-flight checklist, tag/publish commands, curated notes handoff, release-only pitfalls) lives in `.claude/skills/release-flow/SKILL.md`; read it before starting any release-flavored task. Notes formatting stays owned by `.claude/skills/release-notes/SKILL.md`. One rule that always applies: restate which distribution channels a release-flavored run will touch and confirm with the maintainer before acting; channel scope is specified by the maintainer, never inferred.
+
+## Linux DevCloud Audit Ledger
+
+This checkout is only the ledger contract. After every storage investigation, append
+the run details to `storage-audit.log`, a local working ledger that stays git-ignored.
+Per-target rules learned from DevCloud investigations live in
+`.claude/skills/devcloud-patrol/references/storage-rules.md`, the single rule source:
+read it before classifying or cleaning any concrete target on this machine (Docker
+objects, database volumes, package caches, logs, temp dirs, worktrees), and route full
+patrols through `$devcloud-patrol`. Keep `vision.md` for current product/storage
+direction; do not put one-off capacities, timestamps, deleted paths, or command
+transcripts in this file.
+
+A new rule is promotable only when it answers:
+
+1. What exact path, mount, volume, container, or owner produced the bytes?
+2. Is it active, referenced, rebuildable, disposable, or persistent user data?
+3. What is the smallest owner-supported cleanup command, and does it have a dry-run?
+4. What must be excluded, and what evidence proves the exclusion?
+5. How much space was actually reclaimed, and how will recurrence be prevented?
+
+Promote only rules that hold across runs; land each in `storage-rules.md` with a
+regression check, or an explicit reason why only a live read-only probe is possible. The
+analyzer stays read-only by default; preserve the Mole workflow: inspect, classify,
+preview, then execute one owner-approved action.
