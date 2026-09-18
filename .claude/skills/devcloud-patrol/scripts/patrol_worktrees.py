@@ -1136,7 +1136,10 @@ def main() -> int:
         for repo in sorted({o["repo"] for o in prunable_regs}):
             rc, out, err = run(["git", "-C", repo, "worktree", "prune", "--verbose"],
                                timeout=120)
-            removed_lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+            # git 2.43 实测：prune --verbose 的 "Removing…" 行走 stderr
+            merged = ((out or "") + "\n" + (err or "")).splitlines()
+            removed_lines = [l.strip() for l in merged
+                             if l.strip().startswith("Removing ")]
             prunable_pruned.append({
                 "repo": repo, "removed": len(removed_lines) if rc == 0 else 0,
                 "detail": removed_lines[:10],
