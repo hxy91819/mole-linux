@@ -262,5 +262,29 @@ class LastActiveParseTests(unittest.TestCase):
             self.assertEqual(m.du_bytes_last_active('/data/x'), (None, None))
 
 
+class DirtySummaryTests(unittest.TestCase):
+    """dirty 项要能压成一行「多少人工改动」，而不是让 owner 逐项读代码。"""
+
+    def test_tracked_and_untracked_are_counted_with_diffstat(self):
+        porcelain = ' M a.ts\n M b.ts\n?? c.sh\n'
+        summary = m.summarize_dirty(porcelain, ' 2 files changed, 7 insertions(+), 1 deletion(-)')
+        self.assertEqual(summary['tracked'], 2)
+        self.assertEqual(summary['untracked'], 1)
+        self.assertEqual(summary['files_changed'], 2)
+        self.assertEqual(summary['insertions'], 7)
+        self.assertEqual(summary['deletions'], 1)
+        self.assertEqual(m.compact_dirty(summary), ' [2F +7/-1 2 tracked 1 untracked]')
+
+    def test_clean_status_has_no_summary(self):
+        self.assertIsNone(m.summarize_dirty('', ''))
+        self.assertEqual(m.compact_dirty(None), '')
+
+    def test_untracked_only_worktree_has_no_diffstat(self):
+        summary = m.summarize_dirty('?? tools/x.py\n')
+        self.assertIsNone(summary['files_changed'])
+        self.assertEqual(summary['untracked'], 1)
+        self.assertEqual(m.compact_dirty(summary), ' [1 untracked]')
+
+
 if __name__ == '__main__':
     unittest.main()
