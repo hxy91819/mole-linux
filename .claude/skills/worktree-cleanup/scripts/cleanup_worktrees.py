@@ -613,7 +613,9 @@ def retire_worktree_branch(
     return outcome
 
 
-def sweep_orphan_branches(summary: dict[str, Any], keep_branches: bool) -> None:
+def sweep_orphan_branches(
+    summary: dict[str, Any], keep_branches: bool, execute: bool = True
+) -> None:
     """Delete unclaimed local branches whose work is provably durable remotely.
 
     Runs only in apply mode. Two zero-loss proofs are accepted: the branch tip
@@ -663,6 +665,11 @@ def sweep_orphan_branches(summary: dict[str, Any], keep_branches: bool) -> None:
         branch_tip = run_command(
             ["git", "-C", str(repo_root), "rev-parse", branch], check=False
         ).stdout.strip()
+        if not execute:
+            sweep.setdefault("branches_would_remove", []).append(
+                {"branch": branch, "proof": proof, "old_oid": branch_tip}
+            )
+            continue
         deleted, error = delete_local_branch(
             repo_root, branch, expect_old_oid=branch_tip or None
         )
@@ -674,6 +681,81 @@ def sweep_orphan_branches(summary: dict[str, Any], keep_branches: bool) -> None:
             sweep["branches_kept"].append(
                 {"branch": branch, "reason": f"git update-ref -d failed: {error}"}
             )
+
+
+def detect_default_branch(repo_root: Path) -> str:
+    """Host-agnostic default branch detection for the sweep-only entry."""
+    result = run_command(
+        ["git", "-C", str(repo_root), "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        check=False,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        return result.stdout.strip().removeprefix("origin/")
+    for candidate in ("main", "master"):
+        probe = run_command(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet",
+             f"refs/heads/{candidate}"],
+            check=False,
+        )
+        if probe.returncode == 0:
+            return candidate
+    return ""
+
+
+def origin_identity(repo_root: Path) -> tuple[str, str]:
+    """Best-effort (name_with_owner, host) from the origin URL."""
+    result = run_command(
+        ["git", "-C", str(repo_root), "remote", "get-url", "origin"], check=False
+    )
+    url = result.stdout.strip() if result.returncode == 0 else ""
+    slug = re.search(r"(?:@|//)[^/:]+[:/](.+?)(?:\.git)?/?$", url)
+    host = re.search(r"(?:@|//)([^/:]+)[:/]", url)
+    return (
+        slug.group(1) if slug else "",
+        host.group(1) if host else "unknown",
+    )
+
+
+def sweep_only_summary(args: argparse.Namespace) -> dict[str, Any]:
+    """Minimal summary for the branch-governance entry: no worktree audit.
+
+    Exists because orphan-branch governance must reach every repository, not
+    just those that still have removable worktrees: the last worktree's
+    disappearance must not retire the repository from branch hygiene.
+    """
+    selected_repo = Path(args.repo).expanduser().resolve()
+    selected_root = Path(
+        run_git("-C", str(selected_repo), "rev-parse", "--show-toplevel")
+    ).resolve()
+    worktrees = parse_worktree_list(
+        run_git("-C", str(selected_root), "worktree", "list", "--porcelain")
+    )
+    primary_repo_root = worktrees[0].path if worktrees else selected_root
+    name_with_owner, host = origin_identity(selected_root)
+    return {
+        "mode": "apply" if args.apply else "dry-run",
+        "sweep_only": True,
+        "common_repo_root": str(primary_repo_root),
+        "selected_repo_root": str(selected_root),
+        "repository": {
+            "name_with_owner": name_with_owner,
+            "default_branch": detect_default_branch(selected_root),
+            "default_head_oid": "",
+            "host": host or "unknown",
+            "remote_evidence": None,
+        },
+        "backup_root": "",
+        "min_no_pr_age_hours": args.min_no_pr_age_hours,
+        "worktree_count_before": len(worktrees),
+        "worktree_count_after": len(worktrees),
+        "scanned": 0,
+        "eligible": 0,
+        "approved": 0,
+        "removed": 0,
+        "failed": 0,
+        "rejected_approvals": [],
+        "entries": [],
+    }
 
 
 def path_is_relative_to(path: Path, parent: Path) -> bool:
@@ -908,6 +990,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Report worktree status and approval tokens without deleting (default)",
     )
+    parser.add_argument(
+        "--sweep-only",
+        action="store_true",
+        help=(
+            "Branch governance only: run (apply) or preview (dry-run) the "
+            "merged-orphan-branch sweep; no worktree removals, no approvals"
+        ),
+    )
     approval = parser.add_mutually_exclusive_group()
     approval.add_argument(
         "--approve",
@@ -966,7 +1056,12 @@ def parse_args() -> argparse.Namespace:
         help="Emit machine-readable JSON instead of a text summary",
     )
     args = parser.parse_args()
-    if args.apply and not (args.approve or args.approve_report):
+    if args.sweep_only:
+        if args.approve or args.approve_report or args.write_approval_report:
+            parser.error(
+                "--sweep-only needs no approvals; worktree audit flags do not apply"
+            )
+    elif args.apply and not (args.approve or args.approve_report):
         parser.error("--apply requires --approve-report or at least one --approve token")
     if not args.apply and (args.approve or args.approve_report):
         parser.error("--approve and --approve-report are valid only with --apply")
@@ -1502,16 +1597,26 @@ def emit_error(args: argparse.Namespace, error: str) -> None:
 def main() -> int:
     args = parse_args()
     try:
-        summary = discover(args)
-        if args.apply:
-            approved_tokens = (
-                read_approval_report(args.approve_report, summary)
-                if args.approve_report
-                else args.approve
+        if args.sweep_only:
+            summary = sweep_only_summary(args)
+            sweep_orphan_branches(summary, args.keep_branches, execute=args.apply)
+            sweep = summary.get("branch_sweep") or {}
+            summary["branches_removed"] = len(sweep.get("branches_removed") or [])
+            summary["branches_kept"] = len(sweep.get("branches_kept") or [])
+            summary["branches_would_remove"] = len(
+                sweep.get("branches_would_remove") or []
             )
-            apply_candidates(summary, approved_tokens, args.keep_branches)
-        elif args.write_approval_report:
-            write_json(Path(args.write_approval_report).expanduser(), summary)
+        else:
+            summary = discover(args)
+            if args.apply:
+                approved_tokens = (
+                    read_approval_report(args.approve_report, summary)
+                    if args.approve_report
+                    else args.approve
+                )
+                apply_candidates(summary, approved_tokens, args.keep_branches)
+            elif args.write_approval_report:
+                write_json(Path(args.write_approval_report).expanduser(), summary)
     except (CommandError, OSError) as exc:
         emit_error(args, str(exc))
         return 1
