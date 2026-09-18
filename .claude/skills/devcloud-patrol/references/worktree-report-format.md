@@ -10,7 +10,7 @@
 | 产物 | 路径 |
 |---|---|
 | 本轮目录 | `/data/metrics/ai-storage-maintenance/<YYYY-MM-DD>-worktree-patrol/` |
-| 决策报告 | 该目录 `report.html` |
+| 决策报告 | 回复正文 + 该目录 `summary.json`（**不产出 HTML**，owner 2026-09-18 决定） |
 | 原始证据 | 该目录 `evidence.json`（逐对象）、`summary.json`（一屏汇总） |
 | 账本小节 | 该目录 `audit_section.md`（由脚本生成，可整体追加） |
 | 采集原始件 | 该目录 `raw/`（owner 工具 JSON、who-uses、执行回报、state 快照） |
@@ -21,18 +21,21 @@
 `<YYYY-MM-DD>` 用采集当天（Asia/Shanghai）。同名目录已存在时**不要覆盖**：脚本会自动改写到
 `<YYYY-MM-DD>-worktree-patrol-<HHMM>/`，并另起账本小节。
 
+**所有自动化一律不产出 HTML**（owner 2026-09-18）；需要图文材料时由 owner 单独一次性要求，
+不写回流程默认值。
+
 ## 执行入口（脚本优先）
 
-采集、增量比对、判定、预聚合、渲染、记账全部由脚本完成；Agent **不要**自己重写这些步骤：
+采集、增量比对、判定、预聚合、记账全部由脚本完成；Agent **不要**自己重写这些步骤：
 
 ```bash
 python3 -u /data/code/mole-linux/.claude/skills/devcloud-patrol/scripts/patrol_worktrees.py \
     [--execute] [--append-audit]
 ```
 
-脚本产出 `report.html` / `evidence.json` / `summary.json` / `audit_section.md` 与 `raw/`，
+脚本产出 `evidence.json` / `summary.json` / `audit_section.md` 与 `raw/`，
 并把一段**紧凑摘要**打到 stdout（登记数、本轮执行、≥7 天按原因分组、前 30 项（含所属项目/
-上次活跃时间）、需 owner 查 MR 的完整清单、基础设施健康）。**Agent 只读这段 stdout 与
+上次活跃时间/dirty 摘要）、需 owner 查 MR 的完整清单、基础设施健康）。**Agent 只读这段 stdout 与
 `summary.json`**，不要读 `evidence.json` 的对象级明细，除非要追某个具体对象。
 
 - 默认只读；`--execute` 才调用 owner 工具执行满足全部条件的项（常设授权）。
@@ -69,7 +72,8 @@ python3 -u /data/code/mole-linux/.claude/skills/devcloud-patrol/scripts/patrol_w
 ## 固定章节
 
 章节顺序与标题固定，无内容的章节写「无」而不是省略——空章节本身是结论。
-标 **[脚本]** 的由 `patrol_worktrees.py` 直接渲染，Agent 不要重写；标 **[Agent]** 的需要判断。
+标 **[脚本]** 的由 `patrol_worktrees.py` 的 stdout 摘要与账本小节直接渲染（**不产出 HTML**），
+Agent 不要重写；标 **[Agent]** 的需要判断。
 
 1. **[脚本] 一屏汇总**：卡片式。两盘水位（`/` 超 70% 标红）、登记工作树条目、
    本轮释放（项数 + 字节）、累计释放、待决项（项数 + 字节）、增量命中数。
@@ -103,7 +107,8 @@ python3 -u /data/code/mole-linux/.claude/skills/devcloud-patrol/scripts/patrol_w
 | 功能 | 该 worktree 在做什么，**标注「推断」**；规则见下 |
 | 释放 | 表观字节（回收前 `du -sbx`），GiB/MiB 两位 |
 | 远端证明 | PR/MR 链接（merged/closed）或远端分支名；纯文本 URL 也要可点 |
-| 可恢复性 | 保留的分支名 + HEAD 短 SHA；注明提交仍可达 |
+| 分支 | 默认已删（owner 2026-09-19 政策，远端证明为据）；未删写分支名 + 原因（如 `--keep-branches`） |
+| 可恢复性 | HEAD 短 SHA；提交在远端默认分支/远端分支/MR 中可达 |
 | 备份 | 备份根路径（无 `.local` 时写「无 .local」） |
 
 ### 表 B：≥7 天未清理
@@ -118,6 +123,7 @@ python3 -u /data/code/mole-linux/.claude/skills/devcloud-patrol/scripts/patrol_w
 | 年龄 | `xx.x d` |
 | 上次活跃 | 树内最新 mtime（`du -sbx --time` 口径，绝对时间戳）；取不到写「不可得」 |
 | 原因 | 用下面的固定词表，可叠加 |
+| 领先/落后 | 相对远端默认分支的 `a<ahead>/b<behind>`（借鉴 gmc `--diff-base`，仅作价值信号）；`a0` 即无独有提交，纯残留；取不到基线写「—」 |
 | PR/MR | 链接或「无」；非 GitHub host 写 `<host>/<project>!<iid> (未验证)` |
 | 下一步 | owner 可执行的最小动作，或「保留」 |
 
@@ -175,9 +181,12 @@ python3 -u /data/code/mole-linux/.claude/skills/devcloud-patrol/scripts/patrol_w
 
 `evidence.json` 顶层固定：`summary`、`objects[]`、`executed[]`、`unreclaimed[]`。
 `objects[]` 每项至少含：`path`、`repo`、`age_hours`、`size_bytes`、`last_active_at`、`dirty`、
-`locked`、`prunable`、`head`、`branch`、`remote_proof`、`bb_environment`、`who_uses`、
-`decision`、`reason`、`next_step`。`executed[]` / `unreclaimed[]` / `verified_reclaimable[]`
-同样带 `last_active_at`（不可得为 `null`）。
+`dirty_summary`、`locked`、`prunable`、`head`、`branch`、`remote_proof`、`bb_environment`、
+`who_uses`、`decision`、`reason`、`next_step`。`executed[]` / `unreclaimed[]` /
+`verified_reclaimable[]` 同样带 `last_active_at`（不可得为 `null`）。
+`dirty_summary` 是 `{tracked, untracked, files_changed, insertions, deletions}`，只统计数量与
+diffstat、不读内容；表 B 的 dirty 项在「原因」列后附一行 `18F +421/-41 · 1 untracked` 口径的
+摘要，让 owner 不必逐项跑 `git status`。
 
 `summary.json` 至少含：`collected_at`、`scope`、`mode`、`registered_entries`、
 `root_used_pct`、`data_used_pct`、`cleaner_status`、`min_age_hours`、

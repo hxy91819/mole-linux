@@ -459,6 +459,204 @@ def remote_branches_at_head(
         return [], f"invalid branches-where-head data from gh: {exc}"
 
 
+def local_branches(repo_root: Path) -> list[str]:
+    result = run_command(
+        ["git", "-C", str(repo_root), "branch", "--format=%(refname:short)"],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise CommandError(
+            result.stderr.strip() or "git branch --format failed"
+        )
+    return [name for name in result.stdout.splitlines() if name.strip()]
+
+
+def worktree_claimed_branches(repo_root: Path) -> set[str]:
+    claimed: set[str] = set()
+    for worktree in parse_worktree_list(
+        run_git("-C", str(repo_root), "worktree", "list", "--porcelain")
+    ):
+        if worktree.branch_name:
+            claimed.add(worktree.branch_name)
+    return claimed
+
+
+def remote_branch_tips(repo_root: Path) -> dict[str, str]:
+    """Map remote branch name -> tip object name; empty when origin is unreachable."""
+    result = run_command(
+        ["git", "-C", str(repo_root), "ls-remote", "--heads", "origin"],
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    tips: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        ref = ref.strip()
+        if sha and ref.startswith("refs/heads/"):
+            tips[ref[len("refs/heads/") :]] = sha.strip()
+    return tips
+
+
+def resolve_default_branch_ref(repo_root: Path, default_branch: str) -> str | None:
+    """Best local ref that represents the remote default branch lineage."""
+    candidates = []
+    if default_branch and not default_branch.startswith("-"):
+        candidates = [
+            f"refs/remotes/origin/{default_branch}",
+            f"refs/heads/{default_branch}",
+        ]
+    for ref in candidates:
+        result = run_command(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "--quiet", ref],
+            check=False,
+        )
+        if result.returncode == 0:
+            return ref
+    return None
+
+
+def branch_delete_proof(
+    repo_root: Path,
+    branch: str,
+    *,
+    default_branch: str,
+    claimed: set[str],
+    tips: dict[str, str],
+    default_ref: str | None,
+) -> tuple[str | None, str | None]:
+    """Return (proof_kind, proof_detail) when the local branch is safe to delete.
+
+    Zero-loss bar: the branch tip must be reachable from the remote default
+    lineage (origin/<default> preferred, local <default> as fallback) or be the
+    exact tip of a branch that still exists on the remote. A squash-merged
+    branch with no surviving remote branch has no object-level proof here and
+    is kept; its work is landed but the commits are only durably referenced by
+    the host, which this sink does not re-litigate without its own evidence.
+    """
+    if branch == default_branch:
+        return None, "is the default branch"
+    if branch in claimed:
+        return None, "claimed by a worktree"
+    if branch.startswith("-"):
+        return None, "unusual branch name"
+    if default_ref is not None:
+        result = run_command(
+            ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", branch, default_ref],
+            check=False,
+        )
+        if result.returncode == 0:
+            return "merged-into-default", f"{branch} is contained in {default_ref}"
+    branch_tip = run_command(
+        ["git", "-C", str(repo_root), "rev-parse", branch], check=False
+    ).stdout.strip()
+    if branch_tip and tips.get(branch) == branch_tip:
+        return "remote-branch-tip", "tip equals the current tip of the remote branch"
+    return None, "no object-level durability proof (not merged into the default lineage, not a remote tip)"
+
+
+def delete_local_branch(
+    repo_root: Path, branch: str
+) -> tuple[bool, str | None]:
+    result = run_command(
+        ["git", "-C", str(repo_root), "branch", "-D", branch], check=False
+    )
+    if result.returncode != 0:
+        return False, result.stderr.strip() or result.stdout.strip() or f"git exited {result.returncode}"
+    return True, None
+
+
+def retire_worktree_branch(
+    summary: dict[str, Any], candidate: dict[str, Any], keep_branches: bool
+) -> dict[str, Any]:
+    """Delete the removed worktree's local branch under the standing branch policy.
+
+    Owner policy (2026-09-19): branches of removed worktrees are deleted by
+    default. The remote durability proof that authorized the worktree removal
+    is also the deletion warrant for its branch — including squash merges,
+    where the branch tip is not an ancestor of the default branch but the work
+    is landed. Failures are recorded and never retroactively fail the removal.
+    """
+    outcome: dict[str, Any] = {"deleted": False}
+    branch = candidate.get("branch")
+    if keep_branches:
+        outcome["reason"] = "--keep-branches"
+        return outcome
+    if not branch:
+        outcome["reason"] = "detached HEAD; no local branch"
+        return outcome
+    if branch == (summary["repository"].get("default_branch") or ""):
+        outcome["reason"] = "is the default branch"
+        return outcome
+    proof = candidate.get("remote_proof") or {}
+    if not proof:
+        outcome["reason"] = "no remote durability proof recorded"
+        return outcome
+    repo_root = Path(summary["common_repo_root"])
+    outcome["proof"] = f"worktree-removal-proof:{proof.get('kind')}"
+    deleted, error = delete_local_branch(repo_root, branch)
+    outcome["deleted"] = deleted
+    if error:
+        outcome["error"] = error
+    return outcome
+
+
+def sweep_orphan_branches(summary: dict[str, Any], keep_branches: bool) -> None:
+    """Delete unclaimed local branches whose work is provably durable remotely.
+
+    Runs only in apply mode. Two zero-loss proofs are accepted: the branch tip
+    is contained in the default branch lineage, or the branch tip is the exact
+    current tip of a branch that still exists on the remote. Everything else is
+    kept and reported with the reason. Failures never affect the worktree
+    removal outcome; they only land in this section's counters.
+    """
+    repo_root = Path(summary["common_repo_root"])
+    default_branch = str(summary["repository"].get("default_branch") or "")
+    sweep: dict[str, Any] = {
+        "ran": False,
+        "fetch_ok": None,
+        "branches_removed": [],
+        "branches_kept": [],
+        "skipped_reason": None,
+    }
+    summary["branch_sweep"] = sweep
+    if keep_branches:
+        sweep["skipped_reason"] = "--keep-branches"
+        return
+    claimed = worktree_claimed_branches(repo_root)
+    fetch = run_command(
+        ["git", "-C", str(repo_root), "fetch", "--prune", "origin"], check=False
+    )
+    sweep["fetch_ok"] = fetch.returncode == 0
+    tips = remote_branch_tips(repo_root) if sweep["fetch_ok"] else {}
+    default_ref = resolve_default_branch_ref(repo_root, default_branch)
+    sweep["default_ref"] = default_ref
+    if default_ref is None and not tips:
+        sweep["skipped_reason"] = "no default-branch ref and no remote tips available"
+        return
+    for branch in local_branches(repo_root):
+        if branch == default_branch or branch in claimed:
+            continue
+        proof, keep_reason = branch_delete_proof(
+            repo_root,
+            branch,
+            default_branch=default_branch,
+            claimed=claimed,
+            tips=tips,
+            default_ref=default_ref,
+        )
+        if proof is None:
+            sweep["branches_kept"].append({"branch": branch, "reason": keep_reason})
+            continue
+        deleted, error = delete_local_branch(repo_root, branch)
+        if deleted:
+            sweep["branches_removed"].append({"branch": branch, "proof": proof})
+        else:
+            sweep["branches_kept"].append(
+                {"branch": branch, "reason": f"git branch -D failed: {error}"}
+            )
+
+
 def path_is_relative_to(path: Path, parent: Path) -> bool:
     try:
         path.relative_to(parent)
@@ -726,6 +924,14 @@ def parse_args() -> argparse.Namespace:
             "With this flag no GitHub API is called and only worktrees named by "
             "an exact merged-merge-request head are eligible. Requires "
             f"--min-no-pr-age-hours >= {EXTERNAL_EVIDENCE_MIN_AGE_HOURS:g}."
+        ),
+    )
+    parser.add_argument(
+        "--keep-branches",
+        action="store_true",
+        help=(
+            "Opt out of all branch deletion: keep the local branch of every "
+            "removed worktree and skip the merged orphan-branch sweep"
         ),
     )
     parser.add_argument(
@@ -1037,7 +1243,9 @@ def revalidate_local_state(entry: dict[str, Any], repo_root: Path) -> str | None
     return None
 
 
-def apply_candidates(summary: dict[str, Any], approved_tokens: list[str]) -> None:
+def apply_candidates(
+    summary: dict[str, Any], approved_tokens: list[str], keep_branches: bool = False
+) -> None:
     eligible_by_token = {
         entry["approval_token"]: entry
         for entry in summary["entries"]
@@ -1159,9 +1367,20 @@ def apply_candidates(summary: dict[str, Any], approved_tokens: list[str]) -> Non
         else:
             candidate["action"] = "removed"
             summary["removed"] += 1
+            candidate["branch_deletion"] = retire_worktree_branch(
+                summary, candidate, keep_branches
+            )
 
         update_metadata()
         update_manifest()
+
+    sweep_orphan_branches(summary, keep_branches)
+    summary["branches_removed"] = len(
+        (summary.get("branch_sweep") or {}).get("branches_removed") or []
+    )
+    summary["branches_kept"] = len(
+        (summary.get("branch_sweep") or {}).get("branches_kept") or []
+    )
 
     summary["worktree_count_after"] = len(
         parse_worktree_list(
@@ -1191,6 +1410,16 @@ def print_text(summary: dict[str, Any]) -> None:
     print(f"removed: {summary['removed']}")
     print(f"failed: {summary['failed']}")
     print(f"rejected_approvals: {len(summary['rejected_approvals'])}")
+    sweep = summary.get("branch_sweep")
+    if sweep is not None:
+        print(f"branches_removed: {len(sweep.get('branches_removed') or [])}")
+        for item in sweep.get("branches_removed") or []:
+            print(f"  branch-removed: {item['branch']} ({item['proof']})")
+        print(f"branches_kept: {len(sweep.get('branches_kept') or [])}")
+        for item in sweep.get("branches_kept") or []:
+            print(f"  branch-kept: {item['branch']} ({item['reason']})")
+        if sweep.get("skipped_reason"):
+            print(f"  branch-sweep-skipped: {sweep['skipped_reason']}")
     print()
 
     for entry in summary["entries"]:
@@ -1254,7 +1483,7 @@ def main() -> int:
                 if args.approve_report
                 else args.approve
             )
-            apply_candidates(summary, approved_tokens)
+            apply_candidates(summary, approved_tokens, args.keep_branches)
         elif args.write_approval_report:
             write_json(Path(args.write_approval_report).expanduser(), summary)
     except (CommandError, OSError) as exc:
