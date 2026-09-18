@@ -39,6 +39,28 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
 
 ## 数据库卷
 
+- **异常驱动运行契约（owner 采纳 Oracle 二轮 #1，2026-09-18）**：
+  - 每日 04:10 由 **script automation** `Worktree 巡检（静默执行）` 跑
+    `patrol_worktrees.py --execute --append-audit`（timeout 15min 上限；清扫已并行、
+    预过滤 + 网络超时控制耗时）；exit-0 无输出 = 静默跳过，正常轮不打扰 owner。
+  - **run-status.json 契约**（`worktree-state/run-status.json`，每次 execute 轮覆写）：
+    schema worktree-patrol-run/v1；status ∈ success / degraded（依赖退化：BB 查询失败、
+    凭据缺失等，候选照常保守保留）/ failed（本轮有执行或扫描失败）；coverage 含
+    scan_failed_repos（扫描失败 ≠ 仓库消失，只在本轮完整覆盖的仓库内淘汰旧记录）。
+  - 异常用**稳定 code**（bb-query-failed / gongfeng-credential-missing / gongfeng-mr-error /
+    owner-tool-error / sweep-failed / execute-failed / verify-branch-present / scan-failed），
+    按根因聚合（一次认证失败 = 一个 host 事件）；非 GitHub host 的 gh 探测失败是
+    设计内路径，不算异常。去重语义：新增 → 首次通知；持续 → 静默；恢复 → 通知一次；
+    恢复后复现 → 重新通知。状态存 state.json 的 run_health。
+  - 每日 08:30 **晨检 agent**（原巡检 automation 改造）：只读 run-status.json 与
+    patrol-health.log 转述异常，不重跑脚本、不执行清理；正常轮一行完报。
+  - **独立健康检查**：系统 crontab 每日 08:30 跑 `patrol-health-check.py`
+    （读 run-status 陈旧度/终态，>36h 无完成或 failed 即告警到 patrol-health.log），
+    不依赖 BB automation 自身报告；BB 停机时仍能发现漏跑。整机失联属机外哨兵范畴。
+  - 告警清单（只这些才打扰 owner）：漏跑/超时/扫描不完整；清理未完成或恢复材料异常；
+    认证/BB/探针故障持续导致覆盖下降；已满足政策的对象跨轮未推进；容量越线。
+  - 回归：`tests/test_patrol_worktrees.py::RunHealthTests`（新增/持续/恢复/复现、
+    按实体分离）；`patrol-health-check.py` 状态机（缺失/陈旧/失败/正常）。
 - **owner 授权（2026-09-17）：无主匿名 DB 卷按 7 天保留期自动清理。** 唯一执行器
   `/data/metrics/ai-storage-maintenance/<round>/auto_clean.py`（默认 `--preview` 只读，
   `--execute` 执行）；只删同时满足全部条件的精确对象：① 卷名为 64 位十六进制匿名卷
