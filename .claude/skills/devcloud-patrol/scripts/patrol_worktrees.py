@@ -925,6 +925,7 @@ def main() -> int:
 
     # 孤儿分支清扫统计（执行器 apply 内建，GitHub 与工蜂两跳都收）
     orphan_branches_removed: list[dict] = []
+    apply_touched_repos: set[str] = set()
 
     # --- 5. 执行（仅在 --execute 且条件齐备时）---
     executed_this_round, failed = [], []
@@ -972,6 +973,7 @@ def main() -> int:
         for report, items in by_report.items():
             if not report:
                 continue
+            apply_touched_repos.add(items[0]["repo"])
             # owner 2026-09-19（采纳 Oracle P0）：只审批筛后集合，不再整报审批——
             # 同仓被 who-uses/BB/年龄排除的候选不得随报告获批。
             approve_args: list[str] = []
@@ -1025,6 +1027,7 @@ def main() -> int:
     if args.execute and attemptable:
         gongfeng_executed_paths: set[str] = set()
         for repo, ev in sorted(build_gongfeng_evidence(attemptable).items()):
+            apply_touched_repos.add(repo)
             res = owner_tool_gongfeng_apply(repo, ot_dir, ev, args.min_age_hours)
             for item in (res.get("branch_sweep") or {}).get("branches_removed") or []:
                 orphan_branches_removed.append(
@@ -1056,6 +1059,30 @@ def main() -> int:
                     })
         verified_remaining = [o for o in verified_reclaimable
                               if o["path"] not in gongfeng_executed_paths]
+
+    # --- 5c. 全仓孤儿分支清扫（owner 2026-09-19 分支政策的独立入口）---
+    # worktree 消失的仓库不再有 apply 触发点；对全部扫描仓库统一跑 sweep-only
+    # （已随 apply 清扫过的 repo 跳过），避免「最后一个 worktree 消失后仓库
+    # 退出分支治理范围」。
+    if args.execute:
+        for repo in repos:
+            if repo in apply_touched_repos:
+                continue
+            rc, out, err = run(
+                [sys.executable, WORKTREE_TOOL, "--repo", repo,
+                 "--sweep-only", "--apply", "--json"], timeout=300)
+            if rc != 0:
+                failed.append({"repo": repo, "error":
+                               ("孤儿分支清扫失败: " + (err or out or f"退出 {rc}"))[:200]})
+                continue
+            try:
+                res = json.loads(out)
+            except json.JSONDecodeError:
+                failed.append({"repo": repo, "error": "孤儿分支清扫输出非 JSON"})
+                continue
+            for item in (res.get("branch_sweep") or {}).get("branches_removed") or []:
+                orphan_branches_removed.append(
+                    {"repo": repo, "branch": item["branch"], "proof": item.get("proof")})
     executed_bytes = sum(x["size_bytes"] or 0 for x in executed_this_round)
 
     # 复核：提交仍可达；分支按 owner 2026-09-19 政策默认已删，仍在反而要关注

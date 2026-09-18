@@ -679,6 +679,52 @@ os.execv("/usr/bin/git", ["git", *args])
         self.assertEqual(result.returncode, 2)
         self.assertIn("168", result.stderr)
 
+    def test_sweep_only_dry_run_previews_without_deleting(self) -> None:
+        self.run_git("checkout", "-q", "-b", "merged-orphan")
+        (self.repo / "orphan.txt").write_text("landed\n", encoding="utf-8")
+        self.run_git("add", "orphan.txt")
+        self.run_git("commit", "-q", "-m", "orphan work")
+        self.run_git("checkout", "-q", "main")
+        self.run_git("merge", "--ff-only", "merged-orphan")
+
+        result = self.run_helper("--sweep-only", "--dry-run", "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertTrue(summary["sweep_only"])
+        self.assertEqual(summary["branches_removed"], 0)
+        self.assertEqual(
+            [item["branch"] for item in summary["branch_sweep"]["branches_would_remove"]],
+            ["merged-orphan"],
+        )
+        branches = self.run_git("branch", "--format=%(refname:short)").stdout.splitlines()
+        self.assertIn("merged-orphan", branches)
+
+    def test_sweep_only_apply_removes_orphans_without_approval_source(self) -> None:
+        self.run_git("checkout", "-q", "-b", "merged-orphan")
+        (self.repo / "orphan.txt").write_text("landed\n", encoding="utf-8")
+        self.run_git("add", "orphan.txt")
+        self.run_git("commit", "-q", "-m", "orphan work")
+        self.run_git("checkout", "-q", "main")
+        self.run_git("merge", "--ff-only", "merged-orphan")
+
+        result = self.run_helper("--sweep-only", "--apply", "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = json.loads(result.stdout)
+        self.assertEqual(summary["branches_removed"], 1)
+        self.assertEqual(summary["removed"], 0)  # 无 worktree 移除
+        self.assertNotIn(
+            "merged-orphan",
+            self.run_git("branch", "--format=%(refname:short)").stdout.splitlines(),
+        )
+
+    def test_sweep_only_rejects_worktree_audit_flags(self) -> None:
+        result = self.run_helper("--sweep-only", "--apply", "--approve", "x" * 64, "--json")
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("needs no approvals", result.stderr)
+
     def test_external_evidence_apply_removes_clean_target_and_keeps_branch(self) -> None:
         self.age_worktree(self.worktree)
         evidence = self.write_evidence()

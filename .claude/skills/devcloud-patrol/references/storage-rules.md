@@ -185,6 +185,10 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   孤儿清扫：tip 并入默认分支谱系（origin/<default> 优先，本地 <default> 兑底）
   或 tip == 远端同名分支 tip 者删，其余（如 squash-merged 且远端分支已不存在）
   保留并报告原因。`--keep-branches` 可整体退出。清扫失败只计数，不回退 worktree 回收。
+  **分支治理独立入口（采纳 Oracle 二轮）**：执行器 `--sweep-only` 模式
+  （apply 执行 / dry-run 预览，无需审批来源，host 无关地探测默认分支）；
+  patrol `--execute` 时对**全部扫描仓库**跑 sweep-only（已随 apply 清扫的
+  repo 跳过）——最后一个 worktree 消失的仓库不退出分支治理范围。
   唯一执行器 `/data/code/mole-linux/.claude/skills/worktree-cleanup/scripts/cleanup_worktrees.py`
   的 `--dry-run --min-no-pr-age-hours 168 --write-approval-report …` 后接
   `--apply --approve <token>…`（**只传筛后集合的 token，采纳 Oracle P0 不整报审批**：
