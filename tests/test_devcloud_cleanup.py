@@ -28,7 +28,7 @@ SPEC.loader.exec_module(m)
 @unittest.skipUnless(sys.platform.startswith('linux'), 'Linux /proc and renameat2 contract')
 class CleanupTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix='mole-devcloud-test-')
+        self.temp = tempfile.TemporaryDirectory(prefix='mole-devcloud-test-', dir='/var/tmp')
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.root = self.base / 'tmp'
@@ -172,6 +172,64 @@ class CleanupTests(unittest.TestCase):
         with mock.patch.object(Path, 'read_text', denied), self.assertRaises(m.Refused):
             self.probe()
 
+    def test_exiting_process_is_rechecked_before_refusal(self):
+        for outcome in ('gone', 'zombie', 'reused'):
+            with self.subTest(outcome=outcome):
+                proc = self.fake_process(pid=900010 + len(list(self.proc.iterdir())))
+                original = Path.read_text
+
+                def missing_maps(path, *args, **kwargs):
+                    if path == proc / 'maps':
+                        raise FileNotFoundError('exiting process')
+                    return original(path, *args, **kwargs)
+
+                def exits(_seconds):
+                    info = proc / 'stat'
+                    if outcome == 'gone':
+                        info.unlink()
+                    elif outcome == 'zombie':
+                        info.write_text(original(info).replace('(fixture) S', '(fixture) Z'))
+                    else:
+                        info.write_text(original(info).replace('12345', '12346'))
+
+                with mock.patch.object(Path, 'read_text', missing_maps), \
+                        mock.patch.object(m.time, 'sleep', side_effect=exits):
+                    self.assertEqual(self.probe()['processes'], [])
+
+    def test_live_process_with_persistently_missing_evidence_is_refused(self):
+        proc = self.fake_process()
+        original = Path.read_text
+
+        def missing_maps(path, *args, **kwargs):
+            if path == proc / 'maps':
+                raise FileNotFoundError('still alive but unreadable')
+            return original(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'read_text', missing_maps), \
+                mock.patch.object(m.time, 'sleep') as pause:
+            with self.assertRaisesRegex(m.Refused, 'incomplete evidence for live PID 900001'):
+                self.probe()
+        self.assertEqual(pause.call_args_list, [mock.call(0.1)] * 3)
+
+    def test_retry_rechecks_all_evidence_and_preserves_live_reference(self):
+        proc = self.fake_process()
+        original = Path.read_text
+        failures = [True]
+
+        def transient_missing(path, *args, **kwargs):
+            if path == proc / 'maps' and failures[0]:
+                failures[0] = False
+                raise FileNotFoundError('transient disappearance')
+            return original(path, *args, **kwargs)
+
+        def new_reference(_seconds):
+            (proc / 'cwd').unlink()
+            os.symlink(self.root / 'now-active', proc / 'cwd')
+
+        with mock.patch.object(Path, 'read_text', transient_missing), \
+                mock.patch.object(m.time, 'sleep', side_effect=new_reference):
+            self.assertIn('now-active', self.probe()['reserved'])
+
     def test_socket_symlink_repository_and_backup_are_retained(self):
         self.old('repository/.git')
         self.old('backup.bak')
@@ -275,6 +333,66 @@ class CleanupTests(unittest.TestCase):
             code, output = self.run_cli(args)
             self.assertEqual(code, 2)
             self.assertEqual(output['deleted'], 0)
+
+    def test_three_days_is_default_and_minimum(self):
+        for args in ([], ['--age-days', '3']):
+            code, output = self.run_cli(args, validate_root=lambda _: self.root,
+                                        build_plan=lambda *args: ([], {}))
+            self.assertEqual(code, 0)
+            self.assertEqual(output['age_days'], 3)
+        scan = mock.Mock()
+        code, _ = self.run_cli(['--age-days', '2.999'], build_plan=scan)
+        self.assertEqual(code, 2)
+        scan.assert_not_called()
+
+    def test_final_guard_enforces_three_day_receipt_floor(self):
+        candidate = self.candidate()
+        stage = self.state / 'item-fixture'
+        stage.mkdir()
+        receipt = stage / 'receipt.json'
+        for days, accepted in ((3.01, True), (2.999, False)):
+            receipt.write_text(json.dumps({**candidate, 'cutoff': time.time() - days * 86400,
+                                           'source': str(self.root / candidate['name'])}))
+            with mock.patch.object(m, 'trusted'), mock.patch.object(m, 'validate_root'), \
+                    mock.patch.object(m, 'process_snapshot', return_value=self.live), \
+                    mock.patch.object(m, 'tree_snapshot', return_value=candidate):
+                if accepted:
+                    m.final_guard(receipt)
+                else:
+                    with self.assertRaises(m.Refused):
+                        m.final_guard(receipt)
+
+    def test_all_candidates_are_previewed_and_executed_without_fifty_item_cap(self):
+        plan = [{'name': f'item-{index}', 'bytes': 75 - index} for index in range(75)]
+        sink = mock.Mock()
+        for args in ([], ['--execute']):
+            code, output = self.run_cli(args, validate_root=lambda _: self.root,
+                                        trusted=lambda _: None,
+                                        build_plan=lambda *args: (plan, {}), execute_item=sink)
+            self.assertEqual(code, 0)
+            self.assertEqual(output['candidates'], 75)
+            self.assertEqual(output['deferred'], 0)
+            self.assertEqual(output['candidate_bytes'], sum(row['bytes'] for row in plan))
+        self.assertEqual([call.args[1] for call in sink.call_args_list], plan)
+        self.assertEqual(output['deleted'], 75)
+
+    def test_execution_budget_defers_remaining_candidates_without_failure(self):
+        plan = [{'name': f'item-{index}', 'bytes': 1} for index in range(75)]
+        clock = [1000.0]
+
+        def execute(*args):
+            clock[0] += 60
+
+        with mock.patch.object(m.time, 'monotonic', side_effect=lambda: clock[0]), \
+                mock.patch.object(m, 'RUN_SECONDS', 250):
+            code, output = self.run_cli(['--execute'], validate_root=lambda _: self.root,
+                                        trusted=lambda _: None,
+                                        build_plan=lambda *args: (plan, {}), execute_item=execute)
+        self.assertEqual(code, 0)
+        self.assertEqual(output['deleted'], 3)
+        self.assertEqual(output['failed'], 0)
+        self.assertEqual(output['deferred'], 72)
+        self.assertEqual(output['deferred_reason'], 'execution budget')
 
     def test_timeout_discards_plan_instead_of_deleting_prefix(self):
         self.old('first.log')
