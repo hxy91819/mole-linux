@@ -2,7 +2,7 @@
 
 ## 当前任务（2026-11-04）
 
-定时任务现状以 `bb automation list` / `bb automation show` 为准，下表为撰写时快照。两个脚本任务运行
+定时任务现状以 `bb automation list` / `bb automation show` 为准，下表为撰写时快照。三个脚本任务运行
 `/data/tools/devcloud-storage-upkeep/releases/<16 位快照哈希>/` 下的不可变副本，文档不写死版本号；
 /tmp 清理使用独立快照 `df3e2b353d8e1c72`。
 
@@ -10,6 +10,8 @@
 | --- | --- | --- | --- | --- |
 | 存储：Docker 残留（每小时） | 每小时第 7 分钟 | BB 脚本任务：`docker_leftovers.py --execute --quiet`（storage-upkeep 快照） | 满 1 小时的匿名测试 DB 卷、满 24 小时的悬空镜像、满 72 小时的 BuildKit 缓存；持 fork-maintenance run.lock 非阻塞 flock，拿不到即跳过，删卷前排除 retained_volumes | 启用 |
 | 存储：worktree 清理（每天） | 每天 06:30 | BB 脚本任务：`worktree_sweep.py --execute --quiet --budget-minutes 12`（storage-upkeep 快照） | 无人用且闲置满 24 小时的附加 worktree：已在远端直接删，否则归档核验后删 | 启用 |
+| 存储：Go 缓存修剪（每小时） | 每小时第 37 分钟 | BB 脚本任务：`go_cache_trim.py --execute --quiet`（storage-upkeep 快照） | go-build 里 2 小时以上没用过的条目；Go 只在条目 mtime 超过 1 小时时才刷新它，所以正在跑的构建用不到被删的条目。npm、pnpm 不自动清 | 启用 |
+| 存储：每日 DSH 检查 | 每天 07:30 | BB agent 任务 `auto_5gacevqssoe`（acp-dsh，DeepSeek V4.1 Flash），只读 | 核对三个脚本任务的定时运行、Go 缓存修剪、03:30 的 /tmp 清理、systemd-tmpfiles 和 /data 可用 ≥150 GiB；全部符合不出声，不符合时合成一条消息发给协调线程 thr_tikzbd34dg。协调线程换了要同步改这个任务的 prompt | 启用 |
 | /tmp 清理 | 每天 03:30 | crontab `# devcloud-clean-tmp`：`clean-tmp --execute --age-days 3 --json`（外层 timeout 1790 秒） | /tmp 满 3 天候选：扫描预算 240 秒、单树 5 秒、不限数量按大小排序、执行预算 1740 秒用完为止 | 启用 |
 | 每周系统盘容量复盘 | 周日 04:00 | BB agent 任务：读 /tmp 清理 summary，比较容量并解释增长 | 只读复盘，必要时预览同一执行器 | 启用 |
 | 每周 DB 存储巡检与安全清理 | 周日 04:40 | BB agent 任务：以 storage-rules 为唯一规则源 | Docker 镜像/卷等逐类巡检；规则更新后自动按新规则执行 | 启用 |
