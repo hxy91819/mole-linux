@@ -672,15 +672,23 @@ def reason_key(reason: str):
     return reason.split(":", 1)[0].strip()[:80]
 
 
-def repo_summary(repo, items, measure):
-    counts, size = {}, 0
+def repo_summary(repo, items, measured):
+    counts = {}
     for i in items:
         outcome = i.get("result") or i["action"]
         if outcome in ("keep", "kept", "failed"):
             outcome = f"{outcome}: {reason_key(i['reason'])}"
         counts[outcome] = counts.get(outcome, 0) + 1
-        size += i.get("bytes") or 0
-    sized = f" [{size / 2**30:.1f} GiB]" if measure else ""
+    sized = ""
+    if measured:
+        # du 失败的项 bytes 为 None：不算 0 GiB，只计入 unmeasured。
+        total = sum(i.get("bytes") for i in items if i.get("bytes") is not None)
+        to_free = sum(i.get("bytes") for i in items
+                      if i.get("bytes") is not None and i["action"] != "keep")
+        unmeasured = sum(1 for i in items if i.get("bytes") is None)
+        sized = f" [{total / 2**30:.1f} GiB, {to_free / 2**30:.1f} GiB to free]"
+        if unmeasured:
+            sized += f", {unmeasured} unmeasured"
     detail = ", ".join(f"{k} ×{v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
     return f"{os.path.basename(repo.main)}{sized}: {detail}"
 
@@ -694,7 +702,7 @@ def main(argv=None):
                     help="remote namespaces that are yours (default: hxy91819, masonxhuang, opencraft-app)")
     ap.add_argument("--state-dir", default=os.path.expanduser("~/.local/state/devcloud-storage-upkeep"))
     ap.add_argument("--no-bb", action="store_true", help="skip the BB thread check (isolated tests only)")
-    ap.add_argument("--measure", action="store_true", help="du each candidate before acting")
+    ap.add_argument("--measure", action="store_true", help="du every linked worktree before acting")
     ap.add_argument("--execute", action="store_true", help="archive and remove; default is a dry run")
     ap.add_argument("--budget-minutes", type=float, default=0,
                     help="stop starting archives and deletions after this many minutes (0 means no limit)")
@@ -745,7 +753,7 @@ def main(argv=None):
 
     todo = {c: [i for i in items if i["action"] != "keep"] for c, items in plan.items()}
     if args.measure:
-        measure([i for items in todo.values() for i in items])
+        measure([i for items in plan.values() for i in items])
     os.makedirs(args.state_dir, exist_ok=True)
     state_log = os.path.join(args.state_dir, f"worktree-sweep-{stamp}.jsonl")
     if args.execute:
