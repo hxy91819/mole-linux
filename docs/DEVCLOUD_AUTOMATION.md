@@ -1,10 +1,38 @@
 # 本机存储维护落地方案
 
-采用两部分：**一次性确定写入位置并验收；日常复用已有每日清理、每周复盘。** 迁移不进定时任务。本文替代此前的小时巡检、增长预测与通用策略框架方案。
+## 当前任务（2026-11-04）
 
-状态：迁移与 20 项实际写入验收已完成；清理器安全修复、固定版本部署、每日 cron、日志轮转和每周 BB 提示词已上线。2026-09-12 已按 cron 环境手动验收：109 秒成功处理 50 项，候选块大小共 21.7 MiB，零失败、无隔离遗留。首次定时触发为 2026-09-13，真实触发结果仍需由后续日志确认。
+定时任务现状以 `bb automation list` / `bb automation show` 为准，下表为撰写时快照。两个脚本任务运行
+`/data/tools/devcloud-storage-upkeep/releases/<16 位快照哈希>/` 下的不可变副本，文档不写死版本号；
+/tmp 清理使用独立快照 `df3e2b353d8e1c72`。
 
-2026-09-17 修复：09-14～09-17 连续四天 `status=failed, scan=incomplete, deleted=0`。根因是策略阶段逐候选串行调用 `validate_path_for_deletion`（约 25 ms/次）与 `should_protect_path`（约 17 ms/次），`/data/system-tmp` 增长到 6.7k 条目后单进程撞上硬编码的 30 秒子进程上限，整轮 fail-closed。修法是把同一策略脚本**分片并行**（16 片，逐项语义不变、候选集不预截断），并把子进程预算改为 `POLICY_SECONDS`；新快照 `84ffa318d2107e59` 实测 preview 14 s、`--execute` 150 s 处理 50 项 / 3.17 GB、零失败。
+| 任务 | 时间 | 入口 | 范围 | 状态 |
+| --- | --- | --- | --- | --- |
+| 存储：Docker 残留（每小时） | 每小时第 7 分钟 | BB 脚本任务：`docker_leftovers.py --execute --quiet`（storage-upkeep 快照） | 满 1 小时的匿名测试 DB 卷、满 24 小时的悬空镜像、满 72 小时的 BuildKit 缓存；持 fork-maintenance run.lock 非阻塞 flock，拿不到即跳过，删卷前排除 retained_volumes | 启用 |
+| 存储：worktree 清理（每天） | 每天 06:30 | BB 脚本任务：`worktree_sweep.py --execute --quiet --budget-minutes 12`（storage-upkeep 快照） | 无人用且闲置满 24 小时的附加 worktree：已在远端直接删，否则归档核验后删 | 启用 |
+| /tmp 清理 | 每天 03:30 | crontab `# devcloud-clean-tmp`：`clean-tmp --execute --age-days 3 --json`（外层 timeout 1790 秒） | /tmp 满 3 天候选：扫描预算 240 秒、单树 5 秒、不限数量按大小排序、执行预算 1740 秒用完为止 | 启用 |
+| 每周系统盘容量复盘 | 周日 04:00 | BB agent 任务：读 /tmp 清理 summary，比较容量并解释增长 | 只读复盘，必要时预览同一执行器 | 启用 |
+| 每周 DB 存储巡检与安全清理 | 周日 04:40 | BB agent 任务：以 storage-rules 为唯一规则源 | Docker 镜像/卷等逐类巡检；规则更新后自动按新规则执行 | 启用 |
+| 闲置工作区归档与依赖清理 | 每天 09:00 | BB 脚本任务（项目 proj_bdg8tywu4a）：`fork-maintenance/scheduled.py idle-cleanup` | 附加 worktree 旧执行端，仍按 3 天门槛运行 | 启用（更慢的旧入口） |
+
+systemd-tmpfiles 自 2026-11-04 起不再清理 `/tmp`（`/etc/tmpfiles.d/tmp.conf` 为 `q /tmp 0700 root root -`）：
+原来的按年龄删除曾删掉闲置 worktree 里已跟踪的文件，遇到孤立 FIFO 还会卡死。阈值与授权的规则源：
+[storage-rules](../.claude/skills/devcloud-patrol/references/storage-rules.md)；手工入口：
+[快速释放空间手册](DEVCLOUD_SPACE_RECOVERY.md)。
+
+**历史**：2026-09 的设计采用两部分：**一次性确定写入位置并验收；日常复用已有每日清理、每周复盘。** 迁移不进定时任务。本文替代此前的小时巡检、增长预测与通用策略框架方案。
+
+手工处理空间告急时，先读 [当前服务器快速释放空间手册](DEVCLOUD_SPACE_RECOVERY.md)：包含现有入口、保护范围、3 天闲置检查、worktree 归档恢复、Docker/工具缓存命令和失败处理。它不增加自动删除权限，也不把历史候选清单当成新的执行清单。
+
+**历史**：2026-11-03 最新监督配置见 [本会话的空间清理监督与干预](WORKTREE_CLEANUP_REVIEW.md)：沿用原复盘任务并绑定当前会话 `thr_rd3ahpzrae`，按使用率≤70%且普通可用空间至少30%验收；程序或最多一个复用DSH执行，当前会话独立检查；每轮必须复盘和自我迭代；未达标每2小时主动干预，达标且稳定后才降频，每轮报告补齐的规则、测试、部署和效果。此配置取代下文11-02复盘任务的初始频率与另开会话方式，原09:00清理仍独立运行。
+
+**历史**：2026-11-02 新增 [worktree 清理效果复盘](WORKTREE_CLEANUP_REVIEW.md)：每日 10:15 核查 09:00 清理的真实终态、覆盖及回收，按有效性逐步降到每周三次、每周一次，退化恢复每日。现役清理入口已被安全维护流程替换为 `/data/code/fork-maintenance/scheduled.py idle-cleanup`（11-01 曾改为附加 worktree 30 天；owner 11-02 明确要求恢复连续闲置 3 天/72 小时，现役扫描与执行复查统一采用 3 天），下文 10-29 的工具入口仍是历史状态。复盘保存逐轮证据并跟进差异，不新建第二个删除器。
+
+**历史**：2026-10-29 复查：独立 worktree 自动化实际使用 `--days 3`；通用 tmp 工具仍要求至少 7 天，默认策略阶段仍可能超时。本轮一次性延长检查预算后完成预览和 50 项执行，并非新的定时版本已经上线。下文保留原部署历史和边界，不能据“2026-09-17 修复”推断今天一定能跑完。
+
+**历史**：状态：迁移与 20 项实际写入验收已完成；清理器安全修复、固定版本部署、每日 cron、日志轮转和每周 BB 提示词已上线。2026-09-12 已按 cron 环境手动验收：109 秒成功处理 50 项，候选块大小共 21.7 MiB，零失败、无隔离遗留。首次定时触发为 2026-09-13，真实触发结果仍需由后续日志确认。
+
+**历史**：2026-09-17 修复：09-14～09-17 连续四天 `status=failed, scan=incomplete, deleted=0`。根因是策略阶段逐候选串行调用 `validate_path_for_deletion`（约 25 ms/次）与 `should_protect_path`（约 17 ms/次），`/data/system-tmp` 增长到 6.7k 条目后单进程撞上硬编码的 30 秒子进程上限，整轮 fail-closed。修法是把同一策略脚本**分片并行**（16 片，逐项语义不变、候选集不预截断），并把子进程预算改为 `POLICY_SECONDS`；新快照 `84ffa318d2107e59` 实测 preview 14 s、`--execute` 150 s 处理 50 项 / 3.17 GB、零失败。
 
 ## 1. 写入位置一次性做好
 
@@ -23,7 +51,7 @@
 
 本机验收、保留项与映射记录在 `storage-audit.log`、`/data/metrics/root-space-20260912/write-routing-validation.json` 和 `/data/root-storage-20260912/manifest.json`。数据盘目标是正式存储，备份要覆盖目标内容，不能按日期目录清理。
 
-## 2. 日常只保留两个已有任务
+## 2. 历史：2026-09 设计时的两个日常任务（现行任务见文首表格）
 
 | 任务 | 固定职责 | 不承担的动作 |
 |---|---|---|
@@ -34,6 +62,8 @@
 
 /tmp 实际位于数据盘，清理它不能给系统盘腾空间。系统盘增长若来自必须保留的数据，周任务应指出具体原因及一次性维护建议，而非扩大自动删除范围。Docker 数据库继续由单独的维护工作负责。
 
+**历史**：Worktree 由另一个已有任务负责：每日 09:00，入口 `/data/code/worktree-cleanup`，状态在 `/data/code/.worktree-cleanup/state/`。截至 2026-10-29，已保存的执行脚本明确传入 `--days 3`；通用 CLI/README 的默认 7 天不能代替这台机器的实际调度参数。具体 scan/apply 范围和远端核验见快速手册；本段不新建或修改定时任务。
+
 ## 3. 已部署的清理器
 
 `bin/devcloud.py clean-tmp` 路由到内部 `bin/devcloud_tmp.py`。参数与原入口兼容，默认只预览；执行边界为：
@@ -42,14 +72,14 @@
 - 检查 cwd/exe/fd/maps、绝对路径参数、各进程挂载命名空间和 inotify；进程证据不可读时拒绝整个扫描，挂载、监听和 socket 保留。
 - 父目录旧但内部有新文件时保留；不完整或超时的扫描不产生可执行候选。
 - 预览与执行都检查 Mole 保护名单和用户 whitelist，覆盖原路径及 `/tmp` 别名。保留仓库、凭据、数据库、备份、符号链接、特殊文件、共享硬链接和可被其他用户修改的树。
-- 每次完整扫描最多 120 秒，单树最多 5 秒；按大小最多选 50 个顶层候选，剩余项递延。保留期至少 7 天，整轮执行预算 300 秒，cron 外层 330 秒兜底。
+- 每次完整扫描最多 240 秒，单树最多 5 秒；不设候选数量上限，按大小排序处理，整轮执行预算 1740 秒用完为止，剩余项递延到下一轮，每项开始前预留 120 秒。保留期 3 天，cron 外层 timeout 1790 秒兜底。读取 /proc 证据时进程正好退出的，对同一 PID 最多重查 3 次，证据仍不全才拒绝。
 - 单实例锁覆盖扫描和删除。候选先移到数据盘私有隔离区，再检查实际对象的引用和完整树指纹，通过 Mole dry-run 及最终删除边界复查后交给 `mole_delete`。失败尝试恢复原名；原名被占用时保留隔离原件并报告位置，后续任务停止等待检查。
 - 退出 0 表示完整成功/预览，1 表示部分执行失败，2 表示拒绝或证据未知；执行只写一条最终 summary，保留独立 intent/deleted 事件及 Mole 操作日志。
 
-本次部署：`/data/tools/devcloud-maintenance/releases/84ffa318d2107e59/`（2026-09-17 策略分片修复版；上一版 `cf2bbbefdbdee7af` 保留作回滚），包含两份 Python 文件及配套 Mole `lib/`，43 个文件均有 SHA-256 清单；快照目录名即清单内容的 sha256 前 16 位，可由 `manifest.json` 复算。cron 与每周 BB 任务直接引用该版本和系统 `/usr/bin/python3 -B`，不执行共享工作区或可变 current 链接。后续升级需新建快照、验证后更新既有任务中的版本路径；不自动拉取源码。
+本次部署：`/data/tools/devcloud-maintenance/releases/df3e2b353d8e1c72/`（2026-11-04 起每日使用；上一版 `f1e330c325c73fd0` 与 `1c2d71d3ab21cc79` 保留作回滚），包含执行器及配套 Mole `lib/`，全部文件均有 SHA-256 清单；快照目录名即清单内容的 sha256 前 16 位，可由 `manifest.json` 复算。cron 与每周 BB 任务直接引用该版本和系统 `/usr/bin/python3 -B`，不执行共享工作区或可变 current 链接。后续升级需新建快照、验证后更新既有任务中的版本路径；不自动拉取源码。
 
 ```bash
-/usr/bin/python3 -B /data/tools/devcloud-maintenance/releases/84ffa318d2107e59/bin/devcloud.py clean-tmp --age-days 7 --json
+/usr/bin/python3 -B /data/tools/devcloud-maintenance/releases/df3e2b353d8e1c72/bin/devcloud.py clean-tmp --age-days 3 --json
 # 已授权的手工执行：同一命令增加 --execute
 /usr/bin/python3 -B -m unittest discover -s tests -p test_devcloud_cleanup.py -v
 ```
