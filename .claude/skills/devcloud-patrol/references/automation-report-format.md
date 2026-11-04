@@ -1,9 +1,16 @@
 # 自动化回复统一格式（表格）
 
-本文件是 `devcloud-patrol` 下**所有 BB 自动化**（DB 存储巡检、Worktree 巡检、每周系统盘复盘等）
+本文件是 `devcloud-patrol` 下保留的 BB 自动化（DB 存储巡检、每周系统盘复盘）
 面向 owner 的**回复格式唯一契约**。规则来源见 [storage-rules.md](storage-rules.md)；
 worktree 的对象级内容契约见 [worktree-report-format.md](worktree-report-format.md)。
 本文件只定义「发出去的那段回复长什么样」，不重复判定规则。
+
+## Worktree 报告的简化布局
+
+owner 2026-09-20 要求减少重复：Worktree 使用 [worktree-report-format.md](worktree-report-format.md)
+的“一段汇总 + 一张项目明细表 + 证据链接”，不套用下方的多表结构。
+需决策及下一步并入对象行，正常健康和安全边界不另列表。
+以下标准结构继续用于其他任务。
 
 ## 原则
 
@@ -11,7 +18,7 @@ worktree 的对象级内容契约见 [worktree-report-format.md](worktree-report
 2. **一屏优先**：先给一张汇总表，再给按结论分组的明细表；每项一行。
 3. **结论跟证据走**：每个对象必须能在一行内讲清「谁的、多老、多大、为什么这样处置」。
 4. **机器可读证据另存**：JSON/raw 落本轮专属目录，回复里只给路径链接，不贴原始输出。
-   **所有自动化一律不产出 HTML**（owner 2026-09-18）：DB、Worktree、每周复盘都不写
+   **所有自动化一律不产出 HTML**（owner 2026-09-18）：DB、每周复盘都不写
    `report.html`；需要图文材料时由 owner 单独一次性要求，不写回流程默认值。
 5. **跨轮同口径**：年龄 = now − 创建时间（worktree 用 `.git` mtime）；上次活跃时间 =
    树内最新文件 mtime（卷/worktree）/ `Last used`（构建缓存）/ 镜像「不可得」。
