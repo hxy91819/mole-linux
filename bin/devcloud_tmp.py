@@ -2,7 +2,7 @@
 """Bounded cleanup of this host's approved temporary root; preview by default.
 
 Used by devcloud.py clean-tmp. Parameters: --path /data/system-tmp (or its
-/tmp bind alias), --age-days >= 7, --execute, --json, --du, --limit.
+/tmp bind alias), --age-days >= 3, --execute, --json, --du, --limit.
 Outputs: one summary, including filesystem capacity; execute also writes a
 JSONL intent/result log. Exit 0 = completed/preview, 1 = partial/failed,
 2 = refused/unknown. No databases, migrations, or package-manager operations.
@@ -36,17 +36,20 @@ PROC_ROOT = Path('/proc')
 STATE = Path('/data/metrics/devcloud-maintenance')
 LOG = Path('/data/metrics/devcloud-clean-tmp.log')
 REPO = Path(__file__).resolve().parent.parent
-SCAN_SECONDS = 120
-RUN_SECONDS = 300
+# Host measurements: complete scans ~66-90s; guarded items ~2.4-6s each.
+# Keep the entire run below the cron TERM/KILL envelope of 1790s + 10s.
+SCAN_SECONDS = 240
+RUN_SECONDS = 1740
+# Leave time for the existing per-item probes, Mole calls and restoration.
+ITEM_RUN_RESERVE_SECONDS = 120
 ITEM_SECONDS = 5
-MAX_ITEMS = 50
 # Mole 策略阶段逐个候选调用 validate_path_for_deletion（约 25ms）与
 # should_protect_path（约 17ms），单项约 50ms。单进程顺序跑 ~6.7k 候选会撞上原先
 # 硬编码的 30s 上限，整轮 fail-closed——这正是 /tmp 清理连续 4 天 deleted=0 的根因。
 # 修法：同一脚本分片并行，逐项语义完全一致、候选集绝不预截断（绝大多数候选会被
 # 策略拒绝，按大小取前缀会让允许项永远排不进来），只是把墙钟时间除以分片数。
-POLICY_SHARDS = 16
-POLICY_SECONDS = 90
+POLICY_SHARDS = 32
+POLICY_SECONDS = 180
 PROTECTED_PREFIXES = ('dsh-s04-', 'cc-daemon', 'playwright_', 'node-addon-')
 PROTECTED_NAMES = {'.X11-unix', '.ICE-unix', '.XIM-unix', '.font-unix', '.Test-unix', 'receipt.json'}
 PERSISTENT_NAMES = {'.git', '.env', '.ssh', '.aws', '.gnupg', 'credentials.json', 'auth.json'}
@@ -91,10 +94,27 @@ def capacity():
     for path in (Path('/'), DATA_ROOT):
         s = path.stat().st_dev
         v = os.statvfs(path)
-        used = (v.f_blocks - v.f_bfree) * v.f_frsize
-        free = v.f_bavail * v.f_frsize
-        rows[str(path)] = {'device': s, 'used_bytes': used, 'available_bytes': free,
-                           'used_percent': 100 * used / (used + free)}
+        if v.f_blocks <= 0 or v.f_frsize <= 0:
+            raise Refused('inconsistent filesystem capacity')
+        total = v.f_blocks * v.f_frsize
+        free = v.f_bfree * v.f_frsize
+        available = v.f_bavail * v.f_frsize
+        used = total - free
+        reserved = free - available
+        if (total <= 0 or free < 0 or available < 0 or used < 0 or reserved < 0
+                or available > free or used > total):
+            raise Refused('inconsistent filesystem capacity')
+        rows[str(path)] = {
+            'device': s,
+            'total_bytes': total,
+            'free_bytes': free,
+            'used_bytes': used,
+            'available_bytes': available,
+            'reserved_bytes': reserved,
+            'physical_used_percent': 100 * used / total,
+            'unavailable_percent': 100 * (total - available) / total,
+            'used_percent': 100 * used / total,
+        }
     return rows
 
 
@@ -176,60 +196,75 @@ def process_snapshot(root, deadline):
         checkpoint(deadline)
         if not proc.name.isdigit() or int(proc.name) == os.getpid():
             continue
-        try:
-            before = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
-            if before[0] == 'Z' or int(before[6]) & 0x200000:
-                continue
-            namespace = os.readlink(proc / 'ns/mnt')
-            if namespace not in namespaces:
-                namespaces[namespace] = mount_aliases(root, parse_mounts((proc / 'mountinfo').read_text()))
-            aliases, mounts = namespaces[namespace]
-            reserved.update(mounts)
-            paths = [(part, os.readlink(proc / part)) for part in ('cwd', 'exe')]
-            for fd in (proc / 'fd').iterdir():
-                checkpoint(deadline)
-                try:
-                    value = os.readlink(fd)
-                    paths.append(('fd', value))
-                    if value == 'anon_inode:inotify':
-                        for line in (proc / 'fdinfo' / fd.name).read_text().splitlines():
-                            checkpoint(deadline)
-                            if line.startswith('inotify '):
-                                fields = dict(word.split(':', 1) for word in line.split()[1:])
-                                watches.add((int(fields['sdev'], 16), int(fields['ino'], 16)))
-                except FileNotFoundError:
-                    continue  # A descriptor closed while enumerating, not an unreadable process.
-            for line in (proc / 'maps').read_text().splitlines():
-                checkpoint(deadline)
-                parts = line.split(None, 5)
-                if len(parts) == 6:
-                    paths.append(('maps', parts[5]))
-            if int(proc.name) not in ancestors:
-                for arg in (proc / 'cmdline').read_bytes().decode(errors='replace').split('\0'):
-                    value = arg.split('=', 1)[-1] if arg.startswith('--') else arg
-                    if value.startswith('/'):
-                        paths.append(('argv', value))
-            via = set()
-            for kind, value in paths:
-                for alias, prefix in aliases:
-                    if beneath(value, alias):
-                        relative = '/'.join(filter(None, (prefix, value[len(alias):].lstrip('/'))))
-                        reserved.add(relative.split('/')[0] if relative else '.')
-                        via.add(kind)
-            after = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
-            if before[19] != after[19]:
-                raise Refused('process identity changed during scan')
-            if via:
-                processes.append({'pid': int(proc.name), 'via': sorted(via),
-                                  'cmdline': (proc / 'comm').read_text().strip()})
-        except (FileNotFoundError, ProcessLookupError):
+        original_start = None
+        for attempt in range(4):  # Initial probe plus at most three 100ms retries.
+            checkpoint(deadline)
             try:
-                if (proc / 'stat').read_text().rsplit(')', 1)[1].split()[0] != 'Z':
-                    raise Refused(f'incomplete evidence for live PID {proc.name}')
+                before = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                if before[0] == 'Z' or int(before[6]) & 0x200000:
+                    break
+                if original_start is not None and before[19] != original_start:
+                    break  # The original process exited and this PID was reused.
+                original_start = before[19]
+                namespace = os.readlink(proc / 'ns/mnt')
+                if namespace not in namespaces:
+                    namespaces[namespace] = mount_aliases(root, parse_mounts((proc / 'mountinfo').read_text()))
+                aliases, mounts = namespaces[namespace]
+                reserved.update(mounts)
+                paths = [(part, os.readlink(proc / part)) for part in ('cwd', 'exe')]
+                for fd in (proc / 'fd').iterdir():
+                    checkpoint(deadline)
+                    try:
+                        value = os.readlink(fd)
+                        paths.append(('fd', value))
+                        if value == 'anon_inode:inotify':
+                            for line in (proc / 'fdinfo' / fd.name).read_text().splitlines():
+                                checkpoint(deadline)
+                                if line.startswith('inotify '):
+                                    fields = dict(word.split(':', 1) for word in line.split()[1:])
+                                    watches.add((int(fields['sdev'], 16), int(fields['ino'], 16)))
+                    except FileNotFoundError:
+                        continue  # A descriptor closed while enumerating, not an unreadable process.
+                for line in (proc / 'maps').read_text().splitlines():
+                    checkpoint(deadline)
+                    parts = line.split(None, 5)
+                    if len(parts) == 6:
+                        paths.append(('maps', parts[5]))
+                if int(proc.name) not in ancestors:
+                    for arg in (proc / 'cmdline').read_bytes().decode(errors='replace').split('\0'):
+                        value = arg.split('=', 1)[-1] if arg.startswith('--') else arg
+                        if value.startswith('/'):
+                            paths.append(('argv', value))
+                via = set()
+                for kind, value in paths:
+                    for alias, prefix in aliases:
+                        if beneath(value, alias):
+                            relative = '/'.join(filter(None, (prefix, value[len(alias):].lstrip('/'))))
+                            reserved.add(relative.split('/')[0] if relative else '.')
+                            via.add(kind)
+                after = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                if before[19] != after[19]:
+                    break  # The original process no longer holds references.
+                if via:
+                    processes.append({'pid': int(proc.name), 'via': sorted(via),
+                                      'cmdline': (proc / 'comm').read_text().strip()})
+                break
             except (FileNotFoundError, ProcessLookupError):
-                pass
-        except (OSError, ValueError, KeyError, IndexError) as error:
-            raise Refused(f'cannot inspect PID {proc.name}: {type(error).__name__}') from error
+                try:
+                    current = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                    if current[0] == 'Z' or (original_start is not None and current[19] != original_start):
+                        break
+                    if attempt == 3:
+                        raise Refused(f'incomplete evidence for live PID {proc.name}')
+                except (FileNotFoundError, ProcessLookupError):
+                    break
+                # Exiting processes can lose /proc evidence before becoming zombies.
+                # Retry the complete probe, bounded by both count and scan deadline.
+                checkpoint(deadline)
+                time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                checkpoint(deadline)
+            except (OSError, ValueError, KeyError, IndexError) as error:
+                raise Refused(f'cannot inspect PID {proc.name}: {type(error).__name__}') from error
     return {'reserved': reserved, 'watches': watches, 'processes': processes}
 
 
@@ -383,7 +418,7 @@ def final_guard(receipt):
     if record['name'] in ('', '.', '..', 'receipt.json') or Path(record['name']).name != record['name']:
         raise Refused('invalid staged name')
     if (record.get('source') != str(TMP_ROOT / record['name'])
-            or not math.isfinite(record['cutoff']) or record['cutoff'] > time.time() - 7 * 86400):
+            or not math.isfinite(record['cutoff']) or record['cutoff'] > time.time() - 3 * 86400):
         raise Refused('receipt is outside the approved path or retention policy')
     validate_root(TMP_ROOT)
     item = receipt.parent / record['name']
@@ -493,7 +528,7 @@ def _main(argv=None):
             return 2
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--path', type=Path, default=TMP_ROOT)
-    parser.add_argument('--age-days', type=float, default=7)
+    parser.add_argument('--age-days', type=float, default=3, help='minimum idle age in days (>= 3; default: 3)')
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--du', action='store_true', help='show measured candidate bytes (already included in JSON)')
@@ -509,8 +544,8 @@ def _main(argv=None):
     started = time.monotonic()
     try:
         summary['mounts_before'] = capacity()
-        if not math.isfinite(options.age_days) or options.age_days < 7 or options.limit < 0:
-            raise Refused('age must be finite and >= 7 days; display limit must be nonnegative')
+        if not math.isfinite(options.age_days) or options.age_days < 3 or options.limit < 0:
+            raise Refused('age must be finite and >= 3 days; display limit must be nonnegative')
         root = validate_root(options.path)
         if options.execute:
             trusted(STATE.parent)
@@ -530,13 +565,16 @@ def _main(argv=None):
                 raise Refused(f'unresolved staging receipt; review before continuing: {pending[0]}')
         cutoff = time.time() - options.age_days * 86400
         plan, skipped = build_plan(root, cutoff, started + SCAN_SECONDS)
-        selected = plan[:MAX_ITEMS]
+        selected = plan
         summary.update(scan='complete', candidates=len(selected), eligible=len(plan),
                        deferred=len(plan) - len(selected), skipped=skipped,
                        candidate_bytes=sum(row['bytes'] for row in selected),
                        sample=[row['name'] for row in selected[:options.limit]])
         if options.execute:
-            for candidate in selected:
+            for index, candidate in enumerate(selected):
+                if started + RUN_SECONDS - time.monotonic() < ITEM_RUN_RESERVE_SECONDS:
+                    summary.update(deferred=len(selected) - index, deferred_reason='execution budget')
+                    break
                 try:
                     execute_item(root, candidate, cutoff, started + RUN_SECONDS)
                     summary['deleted'] += 1
@@ -544,6 +582,7 @@ def _main(argv=None):
                                 'path': str(root / candidate['name']), 'bytes': candidate['bytes']})
                 except Exception as error:
                     summary['failed'] += 1
+                    summary['deferred'] = len(selected) - index - 1
                     summary['error'] = str(error)
                     code = 1
                     break
@@ -571,7 +610,9 @@ def _main(argv=None):
         print(f"clean-tmp {summary['mode']}: {summary['status']}; "
               f"candidates={summary.get('candidates', 'unknown')} deleted={summary['deleted']} failed={summary['failed']}")
         for path, row in summary.get('mounts_after', {}).items():
-            print(f"  {path}: {row['used_percent']:.2f}% used, {row['available_bytes'] / 1024**3:.2f} GiB available")
+            print(f"  {path}: {row['physical_used_percent']:.2f}% physical used; "
+                  f"{row['unavailable_percent']:.2f}% unavailable; "
+                  f"{row['available_bytes'] / 1024**3:.2f} GiB ordinary available")
         for name in summary.get('sample', []):
             print(f'  {name}')
         if 'error' in summary:
