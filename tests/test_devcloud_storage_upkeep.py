@@ -509,6 +509,18 @@ class WorktreeSweepTests(unittest.TestCase):
         self.assertTrue(local.exists(), out)
         self.assertIn('failed', out)
 
+    def test_measure_reports_total_size_for_a_repo_with_only_kept_worktrees(self):
+        kept = self.add_worktree('kept')
+        (kept / 'blob.bin').write_bytes(b'\0' * (100 * 1024 * 1024))
+        rc, out = self.sweep('--idle-hours', '1', '--measure')
+        self.assertEqual(rc, 0, out)
+        line = next(row for row in out.splitlines() if row.startswith('proj ['))
+        seg = line.split('[', 1)[1].split(']', 1)[0]
+        self.assertIn('GiB to free', seg)
+        self.assertGreater(float(seg.split(' GiB, ', 1)[0]), 0.0, out)
+        self.assertNotIn('unmeasured', seg)
+        self.assertTrue(kept.exists(), out)
+
 
 def _load_docker_leftovers():
     spec = importlib.util.spec_from_file_location(

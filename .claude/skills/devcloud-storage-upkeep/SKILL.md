@@ -46,7 +46,7 @@ description: 本机（Linux DevCloud）数据盘的长期存储维护：查清�
 ```bash
 python3 -I <本技能根>/scripts/docker_leftovers.py            # 预演；确认后加 --execute
 python3 -I <本技能根>/scripts/go_cache_trim.py               # 预演；确认后加 --execute
-python3 -I <本技能根>/scripts/worktree_sweep.py --measure    # 预演并统计每个项目的大小
+python3 -I <本技能根>/scripts/worktree_sweep.py --measure    # 预演，并统计每个项目全部 worktree 及其中候选的大小
 python3 -I <本技能根>/scripts/worktree_sweep.py --execute
 ```
 
