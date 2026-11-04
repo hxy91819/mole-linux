@@ -2,20 +2,14 @@
 """Worktree 巡检的确定性执行器：采集 → 增量指纹 → 判定 → （可选）执行 → 预聚合输出。
 
 设计目标：把可脚本化的部分全部脚本化，让调用它的 Agent 只读一段紧凑输出并写判断，
-不再每天重复测量没变过的对象。
+将证据与分类留在结构化产物中，报告轮无需重复调查。
 
-三层数据：
-  1. 每轮必查（便宜、权威）：`git worktree list --porcelain`（增删/HEAD/branch/locked/prunable）、
-     age 与 168h 门槛、owner 工具的远端核对（PR merged / 远端分支 tip / 含于主干）。
-  2. 指纹缓存：HEAD/branch/locked/prunable/dirty/ignored 根集合/.local 指纹不变时，
-     复用上次的 du 体积与「上次活跃」时间（一次 `du -sbx --time` 同时取两者）、artifact
-     体积与 who-uses 引用；报告里标注"上次测得"。
-  3. 不做目录内容 hash：对几十 GiB 的树做 sha256 比 du 贵一个数量级，且决策信号已被指纹覆盖。
-
-缓存绝不参与删除授权：`--execute` 时仍由 owner 工具按指纹在 sink 前复验。
+每轮重新核对登记项、年龄、远端持久证明、目录体积和进程引用。
+状态账本只保留身份、历史回收与异常去重；Git 状态不能证明 ignored 内容未变，
+不复用旧体积冒充本轮测量。`--execute` 时由 owner 工具在 sink 前复验指纹。
 
 只读是默认；`--execute` 才调用 owner 工具的 `--apply --approve-report`。
-禁止 --force / rm -rf / git clean / 删分支 —— 本脚本不提供这些路径。
+禁止 --force / rm -rf / git clean；分支删除仅由 owner 执行器按远端证明处理。
 """
 from __future__ import annotations
 
@@ -26,16 +20,17 @@ import json
 import os
 import re
 import shutil
-import statistics
 import subprocess
 import sys
 import time
+from typing import Any
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------- 常量
 
 DEVCLOUD = "/data/tools/devcloud-maintenance/releases/cf2bbbefdbdee7af/bin/devcloud.py"
-WORKTREE_TOOL = "/root/.agents/skills/worktree-cleanup/scripts/cleanup_worktrees.py"
+WORKTREE_TOOL = None
 LEDGER = "/data/code/mole-linux/storage-audit.log"
 METRICS_ROOT = "/data/metrics/ai-storage-maintenance"
 STATE_DIR = os.path.join(METRICS_ROOT, "worktree-state")
@@ -94,7 +89,7 @@ def discover_repos(root: str) -> list[str]:
     """有 .git 的 checkout，按 git-common-dir 去重（排除 submodule 与嵌套根）。"""
     rc, out, _ = run(["find", root, "-maxdepth", "4", "-name", ".git"], timeout=180)
     if rc != 0:
-        return []
+        raise RuntimeError(f"仓库发现失败，退出 {rc}")
     seen: dict[str, str] = {}
     for line in out.splitlines():
         checkout = os.path.dirname(line)
@@ -195,11 +190,11 @@ def summarize_dirty(porcelain: str, shortstat: str = ""):
     只统计数量与 diffstat，不读文件内容：目的是把「dirty 12 项」从「要逐项读代码」
     降成「看一眼就知道有多少人工改动」。
     """
-    lines = [l for l in porcelain.splitlines() if l.strip()]
+    lines = [line for line in porcelain.splitlines() if line.strip()]
     if not lines:
         return None
-    tracked = sum(1 for l in lines if not l.startswith("??"))
-    untracked = sum(1 for l in lines if l.startswith("??"))
+    tracked = sum(1 for line in lines if not line.startswith("??"))
+    untracked = sum(1 for line in lines if line.startswith("??"))
     m = re.search(r"(\d+) files? changed(?:, (\d+) insertions?\(\+\))?"
                   r"(?:, (\d+) deletions?\(-\))?", shortstat or "")
     return {
@@ -298,13 +293,16 @@ def remote_slug(repo: str):
     if rc != 0 or not out.strip():
         return None, None
     url = out.strip()
-    m = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?$", url)
-    if m:
-        return f"{m.group(1)}/{m.group(2)}", "github.com"
-    m2 = re.search(r"(?:@|//)([^/:]+)[:/](.+?)(?:\.git)?$", url)
-    if m2:
-        return m2.group(2), m2.group(1)
-    return None, "unknown"
+    if "://" in url:
+        parsed = urlsplit(url)
+        host, path = parsed.hostname, parsed.path.lstrip("/")
+    else:
+        match = re.fullmatch(r"(?:[^@/:]+@)?([^/:]+):(.+)", url)
+        if not match:
+            return None, "unknown"
+        host, path = match.groups()
+    path = path.rstrip("/").removesuffix(".git")
+    return (path or None), (host.lower() if host else "unknown")
 
 
 def gongfeng_bin():
@@ -340,8 +338,8 @@ def gongfeng_token():
     return None, f"凭据文件中没有 GONGFENG_PRIVATE_TOKEN：{path}"
 
 
-def gongfeng_lookup(project, branch, token, timeout=60):
-    """按源分支查工蜂 MR：merged → opened → closed。
+def gongfeng_lookup(project, branch, token, timeout=60, head=None):
+    """按源分支查工蜂 MR：opened 优先；merged 中优先精确 HEAD，查询全部分页。
 
     注意 `--state all` 在 0.1.0 上恒返回 0 条（实测），必须逐状态查询。
     """
@@ -350,9 +348,9 @@ def gongfeng_lookup(project, branch, token, timeout=60):
     env = os.environ.copy()
     env["GONGFENG_PRIVATE_TOKEN"] = token
     binary = gongfeng_bin()
-    for state in ("merged", "opened", "closed"):
+    for state in ("opened", "merged", "closed"):
         rc, out, err = run([binary, "mr", "list", project, "--state", state,
-                            "--source-branch", branch, "--per-page", "20", "--json"],
+                            "--source-branch", branch, "--per-page", "100", "--all", "--json"],
                            timeout=timeout, env=env)
         if rc != 0:
             return {"state": "error", "reason": f"gongfengcli 退出 {rc}"}
@@ -360,12 +358,16 @@ def gongfeng_lookup(project, branch, token, timeout=60):
             payload = json.loads(out)
         except json.JSONDecodeError:
             return {"state": "error", "reason": "gongfengcli 输出不是 JSON"}
-        if payload.get("ok") is False:
-            message = str((payload.get("error") or {}).get("message") or "")[:160]
-            return {"state": "error", "reason": f"工蜂接口拒绝：{message}"}
-        for mr in payload.get("result") or []:
-            if mr.get("source_branch") != branch:
-                continue
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            return {"state": "error", "reason": "工蜂接口拒绝或响应结构无效"}
+        rows = payload.get("result")
+        if not isinstance(rows, list) or any(not isinstance(mr, dict) for mr in rows):
+            return {"state": "error", "reason": "工蜂 MR 列表结构无效"}
+        matches = [mr for mr in rows if mr.get("source_branch") == branch
+                   and mr.get("state", state) == state]
+        matches.sort(key=lambda mr: (bool(head and mr.get("source_commit") == head),
+                                     str(mr.get("updated_at") or "")), reverse=True)
+        for mr in matches:
             return {
                 "state": str(mr.get("state") or state),
                 "iid": mr.get("iid"),
@@ -393,7 +395,9 @@ def owner_tool_dry_run(repo: str, out_dir: str, min_age: float):
         fh.write(out)
     try:
         data = json.loads(out)
-    except json.JSONDecodeError:
+        if not isinstance(data, dict):
+            raise ValueError("expected object")
+    except (json.JSONDecodeError, ValueError):
         data = {"error": (err or out or "no output")[:400]}
     return repo, slug, rc, data, (apath if os.path.exists(apath) else None)
 
@@ -447,6 +451,167 @@ def branch_standing(repo_root: str, branch: str | None):
             "unique_diff": (dstat or "").strip() or "无差异"}
 
 
+
+def owner_object_index(objects):
+    """登记路径可以含符号链接；关联仍要求同仓、同实体路径、同完整 HEAD。"""
+    return {(os.path.realpath(o["repo"]), os.path.realpath(o["path"]), o.get("head")): o
+            for o in objects}
+
+
+def exact_head(source, head):
+    return isinstance(head, str) and bool(re.fullmatch(r"[0-9a-f]{40}", head)) and source == head
+
+
+def local_blockers(o, bb_query_ok=True):
+    reasons = []
+    if o.get("dirty") is None:
+        reasons.append("工作区状态未知")
+    elif o["dirty"]:
+        reasons.append("dirty(未提交)")
+    if "ignored" in o and o["ignored"] is None:
+        reasons.append("ignored 清单未知")
+    if o.get("locked"):
+        reasons.append("locked")
+    if o.get("prunable"):
+        reasons.append("prunable")
+    if not bb_query_ok:
+        reasons.append("BB 归属查询失败")
+    if o.get("bb_environment") or o.get("bb_threads"):
+        reasons.append("活跃 BB 环境")
+    count = (o.get("who_uses") or {}).get("count")
+    if type(count) is not int or count < 0:
+        reasons.append("进程引用未知")
+    elif count:
+        reasons.append("其他(活跃进程引用)")
+    return reasons
+
+
+def probe_usage(path, method="serial"):
+    probe = path
+    if path.startswith("/tmp/"):
+        candidate = "/data/system-tmp/" + path[len("/tmp/"):]
+        if os.path.exists(candidate):
+            probe = candidate
+    rc, out, _ = run([sys.executable, "-B", DEVCLOUD, "who-uses", "--json", probe], timeout=180)
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError:
+        result = None
+    count = result.get("count") if isinstance(result, dict) and rc == 0 else None
+    if type(count) is not int or count < 0 or (isinstance(result, dict) and result.get("error")):
+        count = None
+    return {"count": count, "probe_path": probe, "at": now_iso(), "method": method,
+            "error": "进程引用探测失败" if count is None else None}
+
+
+def classify_retained(o, bb_query_ok=True, execute=False):
+    """保留原因只含阻塞项；平台与 PR/MR 事实单独展示。所有输出共用此判定。"""
+    reasons = local_blockers(o, bb_query_ok)
+    host = o.get("remote_host")
+    gf = o.get("gongfeng") or {}
+    state = gf.get("state")
+    skip = str(o.get("skip_reason") or "")
+    remote_status = "远端不可证"
+    if host == "git.woa.com":
+        if state == "merged":
+            if exact_head(gf.get("source_commit"), o.get("head")):
+                remote_status = "MR merged(工蜂核验·精确 head)"
+            else:
+                remote_status = "MR merged(工蜂核验·非精确 head)"
+                reasons.append("MR HEAD 不匹配")
+        else:
+            label = {"opened": "MR-open", "closed": "MR closed(未合并)",
+                     "none": "未找到 MR", "unknown": "detached HEAD，MR 无法按分支查询",
+                     "error": "MR 查询失败", "no-credential": "凭据缺失"}.get(state, "MR 未核验")
+            remote_status = label
+            reasons.append(label)
+    elif host == "github.com":
+        if str((o.get("pr") or {}).get("state", "")).upper() == "OPEN":
+            reasons.append("PR-open")
+            remote_status = "PR-open"
+        elif o.get("owner_error"):
+            reasons.append("执行器查询失败")
+        elif "ambiguous" in skip:
+            reasons.append("工具判 ambiguous")
+            remote_status = "PR 关联存在歧义"
+        elif "is not contained in the PR remote head" in skip:
+            reasons.append("关联证据(非精确 head)")
+            remote_status = "本地 HEAD 不在 PR 远端提交谱系中"
+        elif o.get("remote_proof"):
+            remote_status = (o["remote_proof"].get("description") or "远端已核验")
+        elif not o.get("owner_eligible"):
+            if skip == "owner 工具未评估":
+                reasons.append("执行器未评估")
+                remote_status = "执行器未返回该对象的结论"
+            elif any(text in skip for text in ("lookup failed", "durability check failed", "no completed PR")):
+                reasons.append("远端不可证")
+            elif reasons:
+                remote_status = "未核验（本地条件未通过）"
+            elif skip:
+                reasons.append("执行器保留：" + skip)
+            else:
+                reasons.append("远端不可证")
+        if skip and not reasons:
+            reasons.append("执行器保留：" + skip)
+    else:
+        reasons.append("未配置 origin" if host is None else "不支持的远端 host")
+    if o.get("submodule_blocked") or o.get("gongfeng_blocked"):
+        reasons.append("含 submodule")
+    if o.get("execution_error"):
+        reasons.append("执行失败")
+    if o.get("age_hours") is None:
+        reasons.append("年龄不可得")
+    if not reasons:
+        reasons.append("本轮未执行" if execute else "仅预览，未执行")
+    o["remote_status"] = remote_status
+    o["reasons"] = list(dict.fromkeys(reasons))
+    o["reason"] = ";".join(o["reasons"])
+    # 未找到 MR、查询失败、在办工作均按现有规则保留；只有策略需人选择才进决策队列。
+    o["needs_decision"] = any(r in reasons for r in ("工具判 ambiguous", "含 submodule"))
+    o["decision"] = "需决策" if o["needs_decision"] else "不清理"
+    actions = {
+        "dirty(未提交)": "保留；提交或妥善保存改动后自动重评",
+        "活跃 BB 环境": "保留；环境/线程结束后自动重评",
+        "其他(活跃进程引用)": "保留；进程释放引用后自动重评",
+        "MR-open": "保留；MR 合并后自动重评", "PR-open": "保留；PR 结束后自动重评",
+        "MR HEAD 不匹配": "保留；核对当前 HEAD 与已合并 MR 的差异",
+        "未找到 MR": "保留；当前分支未查到 MR，不能据此断定提交未推送",
+        "detached HEAD，MR 无法按分支查询": "保留；按当前 HEAD 核对远端提交归属",
+        "含 submodule": "由 owner 决定继续保留或处理子模块；巡检不强制删除",
+        "工具判 ambiguous": "由 owner 核对关联 PR，明确应使用的远端证据",
+        "仅预览，未执行": "满足巡检条件；下次执行轮由 owner 工具复验",
+        "本轮未执行": "保留；核对本轮执行器回报",
+        "执行器未评估": "保留；核对 raw/owner_tool 中该仓库登记路径与执行器输出",
+    }
+    priority = next((r for r in ("含 submodule", "工具判 ambiguous", "执行失败") if r in reasons), reasons[0])
+    o["next_step"] = actions.get(priority, "保留；" + (o.get("execution_error") or priority) + "，下轮重新核验")
+    return o
+
+
+def project_totals(unreclaimed, executed):
+    rows = {}
+    for o in unreclaimed + executed:
+        rows.setdefault(o["repo"], {"repo": o["repo"], "executed_count": 0,
+                                  "unreclaimed_count": 0, "unreclaimed_bytes": 0,
+                                  "unknown_size_count": 0, "needs_decision_count": 0, "reasons": {}})
+    for o in executed:
+        rows[o["repo"]]["executed_count"] += 1
+    for o in unreclaimed:
+        row = rows[o["repo"]]
+        row["unreclaimed_count"] += 1
+        row["unreclaimed_bytes"] += o.get("size_bytes") or 0
+        row["unknown_size_count"] += o.get("size_bytes") is None
+        row["needs_decision_count"] += bool(o.get("needs_decision"))
+        for reason in o["reasons"]:
+            item = row["reasons"].setdefault(reason, {"count": 0, "bytes": 0})
+            item["count"] += 1
+            item["bytes"] += o.get("size_bytes") or 0
+    for row in rows.values():
+        row["main_reasons"] = sorted(row["reasons"], key=lambda r: (
+            -row["reasons"][r]["count"], -row["reasons"][r]["bytes"], r))[:2]
+    return [rows[k] for k in sorted(rows)]
+
+
 def build_gongfeng_evidence(items):
     """把工蜂精确 head 项按 repo 组装成 owner 工具的 `--remote-evidence` 内容。
 
@@ -459,12 +624,13 @@ def build_gongfeng_evidence(items):
         gf = o.get("gongfeng") or {}
         head = o.get("head") or ""
         source = gf.get("source_commit") or ""
-        if gf.get("state") != "merged" or not head or head != source:
+        if gf.get("state") != "merged" or not exact_head(source, head):
             continue
-        if o.get("dirty") or o.get("locked") or o.get("bb_environment") \
-                or (o.get("who_uses") or {}).get("count"):
+        if local_blockers(o):
             continue
         project, host = remote_slug(o["repo"])
+        if host != "git.woa.com":
+            continue
         record = {
             "path": o["path"], "branch": o.get("branch") or "", "head": head,
             "source_commit": source, "state": "merged",
@@ -487,7 +653,7 @@ def build_gongfeng_evidence(items):
 def owner_tool_gongfeng_apply(repo: str, out_dir: str, evidence: dict, min_age: float):
     """对单个 repo 走 owner 工具的 dry-run → apply，两跳都只带该 repo 的证据文件。
 
-    执行器仍是唯一 sink（内部 `git worktree remove` 非 --force、不删分支、`.local`
+    执行器仍是唯一 sink（内部 `git worktree remove` 非 --force、分支按远端证明删除、`.local`
     备份、apply 前按指纹复验）；这里只是把「远端已有」的证人换成工蜂核验结果。
     """
     slug = repo.strip("/").replace("/", "__")
@@ -509,9 +675,13 @@ def owner_tool_gongfeng_apply(repo: str, out_dir: str, evidence: dict, min_age: 
         fh.write(out)
     try:
         data = json.loads(out)
-    except json.JSONDecodeError:
+        if not isinstance(data, dict):
+            raise ValueError("expected object")
+    except (json.JSONDecodeError, ValueError):
         data = {"error": (err or out or "no output")[:400], "removed": 0,
                 "entries": [], "failed": len(evidence.get("entries") or [])}
+    if rc != 0:
+        data["error"] = data.get("error") or f"执行器退出 {rc}"
     data["evidence"] = epath
     data["dry_run_exit"] = dry_rc
     return data
@@ -588,13 +758,15 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=6)
     ap.add_argument("--all-repos", action="store_true",
                     help="扫描全部仓库（默认只扫含链接工作树的仓库）")
-    ap.add_argument("--worktree-tool", default=WORKTREE_TOOL,
+    ap.add_argument("--worktree-tool", required=True,
                     help="owner 工具路径（测试时可换 stub）")
     ap.add_argument("--devcloud", default=DEVCLOUD, help="devcloud.py 路径（测试时可换 stub）")
     ap.add_argument("--mirror-root", default="/data/code/mole-linux/ai-storage-maintenance",
                     help="仓库镜像根（默认按 AGENTS.md 约定）")
     ap.add_argument("--no-mirror", action="store_true", help="不写仓库镜像（隔离测试时用）")
     args = ap.parse_args()
+    if args.min_age_hours < MIN_AGE_HOURS or args.jobs < 1:
+        ap.error("min-age-hours 必须至少 168，jobs 必须为正数")
     WORKTREE_TOOL, DEVCLOUD = args.worktree_tool, args.devcloud
     if args.round_dir and args.round_dir.rstrip("/").startswith(
             ("/root/.local/state/patrol-test", "/tmp/patrol-test")):
@@ -611,7 +783,7 @@ def main() -> int:
         base = os.path.join(METRICS_ROOT, f"{date}-worktree-patrol")
         round_dir = base
         if os.path.exists(os.path.join(base, "summary.json")):
-            round_dir = f"{base}-{datetime.now().strftime('%H%M')}"
+            round_dir = f"{base}-{datetime.now().strftime('%H%M%S-%f')}"
     os.makedirs(os.path.join(round_dir, "raw", "owner_tool"), exist_ok=True)
 
     state = load_state(args.state)
@@ -623,8 +795,13 @@ def main() -> int:
 
     roots = [r for r in args.roots.split(",") if r]
     repos = []
+    discovery_errors = []
     for r in roots:
-        repos.extend(discover_repos(r))
+        try:
+            repos.extend(discover_repos(r))
+        except RuntimeError as exc:
+            discovery_errors.append({"root": r, "error": str(exc)})
+    repos = sorted(set(repos))
     print(f"[patrol] repos={len(repos)}")
 
     # --- 1. 便宜必查：登记项 + 指纹 ---
@@ -661,6 +838,8 @@ def main() -> int:
     if rc == 0:
         try:
             bb_envs = json.loads(out)
+            if not isinstance(bb_envs, list) or any(not isinstance(e, dict) for e in bb_envs):
+                bb_envs, bb_query_ok = [], False
         except json.JSONDecodeError:
             bb_query_ok = False
     else:
@@ -669,16 +848,18 @@ def main() -> int:
     if rc == 0:
         try:
             bb_threads = json.loads(out)
+            if not isinstance(bb_threads, list) or any(not isinstance(t, dict) for t in bb_threads):
+                bb_threads, bb_query_ok = [], False
         except json.JSONDecodeError:
             bb_query_ok = False
     else:
         bb_query_ok = False
-    env_by_path = {e["path"]: e for e in bb_envs if e.get("path")}
+    env_by_path = {os.path.realpath(e["path"]): e for e in bb_envs if e.get("path")}
     threads_by_path: dict[str, list] = {}
     for t in bb_threads:
         p = t.get("environmentPath")
-        if p and t.get("status") != "archived":
-            threads_by_path.setdefault(p, []).append({"id": t["id"], "status": t["status"]})
+        if p and not t.get("archivedAt") and not t.get("deletedAt"):
+            threads_by_path.setdefault(os.path.realpath(p), []).append({"id": t["id"], "status": t["status"]})
 
     objects = []
     state_new = dict(state)
@@ -712,7 +893,7 @@ def main() -> int:
         obj["dirty"] = dirty
         if dirty:
             shortstat = ""
-            if any(not l.startswith("??") for l in sout.splitlines() if l.strip()):
+            if any(not line.startswith("??") for line in sout.splitlines() if line.strip()):
                 rc3, sstat, _ = run(["git", "-C", path, "diff", "HEAD", "--shortstat"], timeout=120)
                 if rc3 == 0:
                     shortstat = sstat.strip()
@@ -722,39 +903,16 @@ def main() -> int:
         fp = fingerprint(entry, dirty, ignored) if ignored_err is None else None
         obj["fingerprint"] = fp
         cached = state["worktrees"].get(path)
-        same = (cached and fp and cached.get("fingerprint") == fp
-                and cached.get("size_bytes") is not None)
-        if same:
-            obj["size_bytes"] = cached["size_bytes"]
-            obj["artifact_bytes"] = cached.get("artifact_bytes") or 0
-            obj["artifact_hits"] = cached.get("artifact_hits") or []
-            obj["size_source"] = "cached"
-            obj["size_measured_at"] = cached.get("size_measured_at")
-            obj["last_active_at"] = cached.get("last_active_at")
-            obj["who_uses"] = cached.get("who_uses")
-            reused += 1
-            if not obj["last_active_at"]:
-                # 旧状态没有 last_active_at：一次性回填（同一次 du 顺带刷新体积），
-                # 之后该字段照常进缓存，不再每轮重测。
-                b, last_active = du_bytes_last_active(path, timeout=180)
-                if b is not None:
-                    obj["size_bytes"] = b
-                    obj["size_source"] = "measured"
-                    obj["size_measured_at"] = now_iso()
-                obj["last_active_at"] = last_active
-        else:
-            b, last_active = du_bytes_last_active(path, timeout=180)
-            ab, hits = artifact_bytes(path)
-            obj["size_bytes"] = b
-            obj["last_active_at"] = last_active
-            obj["artifact_bytes"] = ab
-            obj["artifact_hits"] = sorted(hits, key=lambda x: -x["kb"])[:20]
-            obj["size_source"] = "measured"
-            obj["size_measured_at"] = now_iso()
-            measured += 1
-        env = env_by_path.get(path)
+        # Git 状态与 ignored 根集合不能证明目录内容/体积未变；每轮重新测量。
+        b, last_active = du_bytes_last_active(path, timeout=180)
+        ab, hits = artifact_bytes(path)
+        obj.update(size_bytes=b, last_active_at=last_active, artifact_bytes=ab,
+                   artifact_hits=sorted(hits, key=lambda x: -x["kb"])[:20],
+                   size_source="measured", size_measured_at=now_iso())
+        measured += 1
+        env = env_by_path.get(os.path.realpath(path))
         obj["bb_environment"] = env["id"] if env else None
-        obj["bb_threads"] = threads_by_path.get(path, [])
+        obj["bb_threads"] = threads_by_path.get(os.path.realpath(path), [])
         rec = dict(cached or {})
         rec.update({
             "repo": entry["_repo"], "fingerprint": fp, "head": obj["head"],
@@ -792,10 +950,13 @@ def main() -> int:
     # --- 2. owner 工具远端核对（决定量，必须每轮做）---
     repos_with_linked = sorted({e["_repo"] for e in raw_entries})
     ot_dir = os.path.join(round_dir, "raw", "owner_tool")
+    host_by_repo = {r: remote_slug(r)[1] for r in repos_with_linked}
+    for o in objects:
+        o["remote_host"] = host_by_repo.get(o["repo"])
     ot_reports, owner_eligible = {}, []
     with cf.ThreadPoolExecutor(max_workers=5) as ex:
         futs = [ex.submit(owner_tool_dry_run, r, ot_dir, args.min_age_hours)
-                for r in repos_with_linked]
+                for r in repos_with_linked if host_by_repo[r] == "github.com"]
         for fut in futs:
             repo, slug, rc, data, apath = fut.result()
             _, host = remote_slug(repo)
@@ -803,17 +964,24 @@ def main() -> int:
                                 "error": data.get("error"), "eligible": data.get("eligible"),
                                 "entries": data.get("entries") or [], "approval_report": apath}
     obj_by_path = {o["path"]: o for o in objects}
+    owner_objects = owner_object_index(objects)
     for slug, rep in ot_reports.items():
         for e in rep["entries"]:
-            o = obj_by_path.get(e.get("path"))
+            if not e.get("path"):
+                continue
+            o = owner_objects.get((os.path.realpath(rep["repo"]),
+                                   os.path.realpath(e["path"]), e.get("head")))
             if not o:
                 continue
+            o["owner_path"] = e["path"]
+            o["owner_eligible"] = e.get("action") == "would-remove"
             o["skip_reason"] = e.get("skip_reason")
             o["pr"] = e.get("pr")
             o["remote_proof"] = e.get("remote_proof")
             o["approval_token"] = e.get("approval_token")
             if e.get("action") == "would-remove":
                 owner_eligible.append({"path": o["path"], "repo": rep["repo"],
+                                       "owner_path": e["path"],
                                        "token": e.get("approval_token"),
                                        "approval_report": rep["approval_report"],
                                        "age_hours": e.get("age_hours"),
@@ -824,14 +992,15 @@ def main() -> int:
         if o["primary"] or not o["exists_now"]:
             continue
         if o["skip_reason"] is None and not any(x["path"] == o["path"] for x in owner_eligible):
-            o["skip_reason"] = "owner 工具未评估（repo 非 GitHub host 或查询失败）"
+            if o["remote_host"] == "github.com":
+                o["skip_reason"] = "owner 工具未评估"
 
     # --- 2b. 非 GitHub host：用 gongfengcli 核验 MR ---
     # token 只在本进程内解析并经 env 传给子进程；不进 argv、不进任何产物。
     host_by_repo = {r: remote_slug(r)[1] for r in repos_with_linked}
     gf_targets = [o for o in objects
                   if not o["primary"] and o["exists_now"]
-                  and host_by_repo.get(o["repo"]) not in (None, "github.com")
+                  and host_by_repo.get(o["repo"]) == "git.woa.com"
                   and (o["age_hours"] or 0) >= args.min_age_hours]
     gf_token, gf_source = gongfeng_token()
     gf_meta = {"credential_source": gf_source if gf_token else None,
@@ -843,10 +1012,10 @@ def main() -> int:
     elif gf_targets:
         cache: dict[tuple, dict] = {}
         for o in gf_targets:
-            key = (o["repo"], o["branch"])
+            key = (o["repo"], o["branch"], o["head"])
             if key not in cache:
                 project = remote_slug(o["repo"])[0]
-                cache[key] = gongfeng_lookup(project, o["branch"], gf_token)
+                cache[key] = gongfeng_lookup(project, o["branch"], gf_token, head=o["head"])
                 gf_meta["lookups"] += 1
             else:
                 gf_meta["cached"] += 1
@@ -866,18 +1035,7 @@ def main() -> int:
             need_who.append(o)
     probed = 0
     for o in need_who:
-        probe = o["path"]
-        if probe.startswith("/tmp/"):
-            cand = "/data/system-tmp/" + probe[len("/tmp/"):]
-            if os.path.exists(cand):
-                probe = cand
-        rc, out, _ = run(["python3", "-B", DEVCLOUD, "who-uses", "--json", probe], timeout=180)
-        try:
-            res = json.loads(out)
-        except json.JSONDecodeError:
-            res = {"count": None, "error": (out or "")[:200]}
-        o["who_uses"] = {"count": res.get("count"), "probe_path": probe,
-                         "at": now_iso(), "method": "serial"}
+        o["who_uses"] = probe_usage(o.get("owner_path") or o["path"])
         if o["path"] in state_new["worktrees"]:
             state_new["worktrees"][o["path"]]["who_uses"] = o["who_uses"]
         probed += 1
@@ -890,63 +1048,24 @@ def main() -> int:
         executed_prev[0]["date"] if executed_prev else date)
 
     unreclaimed, held_under7, prunable_regs, verified_reclaimable = [], [], [], []
-    ot_error_repos = {rep["repo"] for rep in ot_reports.values() if rep.get("error")}
-
-    def head_matches(source_commit: str, head: str) -> bool:
-        if not source_commit or not head:
-            return False
-        return source_commit.startswith(head[:12]) or head.startswith(source_commit[:12])
-
-    def reasons_for(o) -> list[str]:
-        rs = []
-        if o["dirty"]:
-            rs.append("dirty(未提交)")
-        if o["locked"]:
-            rs.append("locked")
-        if o["bb_environment"] or o["bb_threads"]:
-            rs.append("活跃 BB 环境")
-        if (o["who_uses"] or {}).get("count"):
-            rs.append("其他(活跃进程引用)")
-        if o["pr"] and str(o["pr"].get("state", "")).upper() == "OPEN":
-            rs.append("PR-open")
-        gf = o.get("gongfeng") or {}
-        if host_by_repo.get(o["repo"]) not in (None, "github.com"):
-            rs.append("非 GitHub host")
-            gs = gf.get("state")
-            if gs == "merged":
-                exact = head_matches(gf.get("source_commit"), o["head"])
-                rs.append("MR merged(工蜂核验·精确 head)" if exact
-                          else "MR merged(工蜂核验·非精确 head)")
-                if exact and not o["dirty"] and not o["locked"] and not o["bb_environment"] \
-                        and not (o["who_uses"] or {}).get("count"):
+    owner_errors = {rep["repo"]: rep.get("error") or f"退出 {rep['exit']}"
+                    for rep in ot_reports.values() if rep.get("error") or rep.get("exit")}
+    for o in objects:
+        o["owner_error"] = owner_errors.get(o["repo"])
+        if o.get("primary") or not o.get("exists_now"):
+            continue
+        if (o.get("age_hours") or 0) >= args.min_age_hours:
+            gf = o.get("gongfeng") or {}
+            remote_ok = (o.get("owner_eligible") and not o.get("owner_error")) or (
+                o.get("remote_host") == "git.woa.com" and gf.get("state") == "merged"
+                and exact_head(gf.get("source_commit"), o.get("head")))
+            if remote_ok and not local_blockers(o, bb_query_ok):
+                o["submodule_blocked"] = worktree_has_submodules(o["path"])
+                if gf.get("state") == "merged":
                     verified_reclaimable.append(o)
-            elif gs == "opened":
-                rs.append("MR-open")
-            elif gs == "closed":
-                rs.append("MR closed(未合并)")
-            elif gs == "none":
-                rs.append("非 GitHub host(无 MR)")
-            elif gs == "error":
-                rs.append("MR 查询失败")
-            elif gs == "no-credential":
-                rs.append("凭据缺失")
-        elif o["repo"] in ot_error_repos:
-            rs.append("非 GitHub host")
-        skip = str(o["skip_reason"] or "")
-        if "ambiguous" in skip:
-            rs.append("工具判 ambiguous")
-        elif "is not contained in the PR remote head" in skip and "durability" not in skip:
-            rs.append("关联证据(非精确 head)")
-        elif any(k in skip for k in ("durability check failed", "remote branch lookup failed",
-                                     "PR lookup failed", "no completed PR, remote branch tip",
-                                     "no associated PR and worktree is younger")):
-            rs.append("远端不可证")
-        elif not skip and not o["remote_proof"]:
-            rs.append("远端不可证")
-        if not rs:
-            rs.append("其他(本轮未执行)")
-        return list(dict.fromkeys(rs))
-
+            o["eligible"] = bool(remote_ok and not local_blockers(o, bb_query_ok)
+                                 and not o.get("submodule_blocked"))
+    eligible_paths = {o["path"] for o in objects if o.get("eligible")}
     for o in objects:
         if o["primary"]:
             continue
@@ -954,14 +1073,15 @@ def main() -> int:
             if o["prunable"]:
                 prunable_regs.append(o)
             continue
-        if (o["age_hours"] or 0) < args.min_age_hours:
+        if o["age_hours"] is not None and o["age_hours"] < args.min_age_hours:
             held_under7.append(o)
             o["decision"], o["reason"], o["reasons"] = "保留(<7天)", "age<7d", ["age<7d"]
             continue
-        o["reasons"] = reasons_for(o)
-        o["decision"], o["reason"] = "保留(≥7天)", ";".join(o["reasons"])
+        classify_retained(o, bb_query_ok, args.execute)
         unreclaimed.append(o)
 
+    age_unknown = [o for o in unreclaimed if o["age_hours"] is None]
+    unreclaimed = [o for o in unreclaimed if o["age_hours"] is not None]
     unreclaimed.sort(key=lambda x: -(x["size_bytes"] or 0))
     unreclaimed_bytes = sum(o["size_bytes"] or 0 for o in unreclaimed)
     held_bytes = sum(o["size_bytes"] or 0 for o in held_under7)
@@ -972,42 +1092,17 @@ def main() -> int:
 
     # --- 5. 执行（仅在 --execute 且条件齐备时）---
     executed_this_round, failed = [], []
-    executable = [e for e in owner_eligible
-                  if e["age_hours"] is not None and e["age_hours"] >= args.min_age_hours
-                  and e["path"] in obj_by_path
-                  and (obj_by_path[e["path"]].get("who_uses") or {}).get("count") == 0
-                  and not obj_by_path[e["path"]]["bb_environment"]
-                  and not obj_by_path[e["path"]]["bb_threads"]]
+    executable = [e for e in owner_eligible if e["path"] in eligible_paths]
 
-    # 动态证据在执行前刷新：who-uses 重探，非零或未知即撤出本轮（下轮自动重评）。
-    if args.execute and executable:
-        refreshed = []
-        for e in executable:
-            probe = e["path"]
-            if probe.startswith("/tmp/"):
-                cand = "/data/system-tmp/" + probe[len("/tmp/"):]
-                if os.path.exists(cand):
-                    probe = cand
-            rc, out, _ = run(["python3", "-B", DEVCLOUD, "who-uses", "--json", probe],
-                             timeout=180)
-            try:
-                res = json.loads(out)
-            except json.JSONDecodeError:
-                res = {}
-            count = res.get("count")
-            obj_by_path[e["path"]]["who_uses"] = {
-                "count": count, "probe_path": probe, "at": now_iso(),
-                "method": "execute-refresh", "error": None if count == 0 else (out or "")[:200],
-            }
-            if count == 0:
-                refreshed.append(e)
-        dropped_refresh = len(executable) - len(refreshed)
-        if dropped_refresh:
-            print(f"[patrol] 执行前刷新：{dropped_refresh} 项 who-uses 非零/未知，撤出本轮保留待重评")
-        executable = refreshed
-    if args.execute and executable and not bb_query_ok:
-        print("[patrol] BB 归属查询失败，本轮全部保守保留（含合格项），下轮自动重评")
-        executable = []
+    # 两种 host 共用动态引用复验，未知状态不会变成“没有引用”。
+    if args.execute:
+        for o in objects:
+            if o.get("eligible"):
+                o["who_uses"] = probe_usage(o.get("owner_path") or o["path"], "execute-refresh")
+                if local_blockers(o, bb_query_ok):
+                    o["eligible"] = False
+                    eligible_paths.discard(o["path"])
+        executable = [e for e in executable if e["path"] in eligible_paths]
 
     if args.execute and executable:
         by_report: dict[str, list] = {}
@@ -1034,8 +1129,13 @@ def main() -> int:
             with open(os.path.join(ot_dir, os.path.basename(report).replace(
                     ".approval.json", ".apply.json")), "w") as fh:
                 fh.write(out)
+            for item in (res.get("branch_sweep") or {}).get("branches_removed") or []:
+                orphan_branches_removed.append(
+                    {"repo": items[0]["repo"], "branch": item["branch"], "proof": item.get("proof")})
+            if rc != 0:
+                failed.append({"repo": items[0]["repo"], "error": res.get("error") or f"执行器退出 {rc}"})
             for e in items:
-                ent = next((x for x in res.get("entries", []) if x.get("path") == e["path"]), {})
+                ent = next((x for x in res.get("entries", []) if x.get("path") == e["owner_path"]), {})
                 if ent.get("action") == "removed":
                     o = obj_by_path[e["path"]]
                     executed_this_round.append({
@@ -1050,7 +1150,7 @@ def main() -> int:
                         "branch_deleted": (ent.get("branch_deletion") or {}).get("deleted"),
                     })
                 else:
-                    failed.append({"path": e["path"], "error": ent.get("error") or res.get("error")})
+                    failed.append({"path": e["path"], "error": ent.get("error") or ent.get("skip_reason") or res.get("error") or "执行器未执行"})
 
     # --- 5b. 工蜂（非 GitHub host）：证据经 owner 工具 --remote-evidence 走同一 sink ---
     # 唯一执行器不变（`git worktree remove` 非 --force、.local 备份、apply 前指纹复验）；
@@ -1060,18 +1160,20 @@ def main() -> int:
     gongfeng_blocked_items = []
     attemptable = []
     for o in verified_reclaimable:
-        if worktree_has_submodules(o["path"]):
+        if o.get("submodule_blocked"):
             # git worktree remove（非 --force）拒绝含 submodule 的工作树；提前判定，
             # 不每轮重复撞同一个拒绝，也不绕过它。
             o["gongfeng_blocked"] = "含 submodule：git 拒绝非 --force 移除（需 owner 决定）"
             gongfeng_blocked_items.append(o)
-        else:
+        elif o["path"] in eligible_paths:
             attemptable.append(o)
     if args.execute and attemptable:
         gongfeng_executed_paths: set[str] = set()
         for repo, ev in sorted(build_gongfeng_evidence(attemptable).items()):
             apply_touched_repos.add(repo)
             res = owner_tool_gongfeng_apply(repo, ot_dir, ev, args.min_age_hours)
+            if res.get("error"):
+                failed.append({"repo": repo, "error": res["error"]})
             for item in (res.get("branch_sweep") or {}).get("branches_removed") or []:
                 orphan_branches_removed.append(
                     {"repo": repo, "branch": item["branch"], "proof": item.get("proof")})
@@ -1176,8 +1278,8 @@ def main() -> int:
                                timeout=120)
             # git 2.43 实测：prune --verbose 的 "Removing…" 行走 stderr
             merged = ((out or "") + "\n" + (err or "")).splitlines()
-            removed_lines = [l.strip() for l in merged
-                             if l.strip().startswith("Removing ")]
+            removed_lines = [line.strip() for line in merged
+                             if line.strip().startswith("Removing ")]
             prunable_pruned.append({
                 "repo": repo, "removed": len(removed_lines) if rc == 0 else 0,
                 "detail": removed_lines[:10],
@@ -1199,8 +1301,8 @@ def main() -> int:
                                "detail": f"{gf_err_n} 项工蜂 MR 查询失败"})
     ot_err_github: list[str] = []
     for rep, v in ot_reports.items():
-        if v.get("error"):
-            host = host_by_repo.get(rep) or "unknown"
+        if v.get("error") or v.get("exit"):
+            host = v.get("host") or "unknown"
             if host != "github.com":
                 # 非 GitHub host 的 gh 失败是设计内路径（5b 工蜂证据接管），非异常
                 continue
@@ -1218,10 +1320,25 @@ def main() -> int:
             "code": "sweep-failed" if is_sweep else "execute-failed",
             "entity": ent, "detail": str(f.get("error") or "")[:160]})
     for v in verify:
+        if v.get("commit_type") == "missing":
+            run_exceptions.append({"key": f"verify-commit-missing:{v['path']}",
+                                   "code": "verify-commit-missing", "entity": v["path"],
+                                   "detail": "回收后无法读取提交对象，需核对执行器回报"})
         if v.get("branch_anomaly"):
             run_exceptions.append({"key": f"verify-branch-present:{v['path']}",
                                    "code": "verify-branch-present", "entity": v["path"],
                                    "detail": "回收后分支仍在（删除失败）"})
+    for o in need_who:
+        if (o.get("who_uses") or {}).get("count") is None:
+            run_exceptions.append({"key": f"who-uses-failed:{o['path']}", "code": "who-uses-failed",
+                                   "entity": o["path"], "detail": "进程引用未知，本轮保留"})
+    for pruned in prunable_pruned:
+        if pruned.get("error"):
+            run_exceptions.append({"key": f"prune-failed:{pruned['repo']}", "code": "prune-failed",
+                                   "entity": pruned["repo"], "detail": pruned["error"]})
+    for item in discovery_errors:
+        run_exceptions.append({"key": f"discovery-failed:{item['root']}", "code": "discovery-failed",
+                               "entity": item["root"], "detail": item["error"]})
     for repo in scan_failed_repos:
         run_exceptions.append({"key": f"scan-failed:{repo}", "code": "scan-failed",
                                "entity": repo,
@@ -1232,7 +1349,7 @@ def main() -> int:
     state_new["run_health"] = {"exceptions": health["exceptions"]}
 
     prune_total = sum(p["removed"] for p in prunable_pruned)
-    run_failed = bool(failed) or bool(scan_failed_repos)
+    run_failed = bool(failed) or bool(scan_failed_repos) or bool(discovery_errors) or any(p.get("error") for p in prunable_pruned)
     run_status = {
         "schema": "worktree-patrol-run/v1",
         "run_id": run_id,
@@ -1241,7 +1358,7 @@ def main() -> int:
         "mode": "execute" if args.execute else "dry-run",
         "status": "failed" if run_failed else ("degraded" if run_exceptions else "success"),
         "coverage": {"repos": len(repos), "entries": len(objects),
-                     "scan_failed_repos": scan_failed_repos,
+                     "scan_failed_repos": scan_failed_repos, "discovery_errors": discovery_errors,
                      "owner_tool_errors": sum(1 for v in ot_reports.values() if v.get("error"))},
         "executed": {"worktrees": len(executed_this_round),
                      "branches_worktree": sum(1 for x in executed_this_round if x.get("branch_deleted")),
@@ -1252,16 +1369,23 @@ def main() -> int:
         "recovered": health["recovered"],
     }
     state_new["updated_at"] = now_iso()
-    save_state(args.state, state_new)
-    os.makedirs(os.path.dirname(args.state), exist_ok=True)
-    with open(os.path.join(round_dir, "raw", "state_snapshot.json"), "w") as fh:
-        json.dump(state_new, fh, ensure_ascii=False, indent=1)
 
     # --- 5c. 分支价值信号：相对远端默认分支的 ahead/behind + 独有 diff 规模 ---
     # 借鉴 gmc wt list --diff-base；只对进入决策表的 ≥7 天对象计算，不作删除授权。
     for o in unreclaimed:
         if o.get("branch"):
             o["standing"] = branch_standing(o["repo"], o["branch"])
+
+    for f in failed:
+        if f.get("path") in obj_by_path:
+            obj_by_path[f["path"]]["execution_error"] = f.get("error") or "执行器未返回成功"
+    for o in unreclaimed:
+        classify_retained(o, bb_query_ok, args.execute)
+    for x in executed_this_round:
+        o = obj_by_path[x["path"]]
+        o.update(decision="已清理", reasons=[], reason="已清理", needs_decision=False,
+                 exists_now=False, next_step="已完成")
+        state_new["worktrees"].pop(x["path"], None)
 
     # --- 6. 预聚合输出 ---
     by_reason: dict[str, dict] = {}
@@ -1278,6 +1402,7 @@ def main() -> int:
 
     def func_of(o):
         pr = o.get("pr") or {}
+        pr = pr or o.get("gongfeng") or {}
         if pr.get("title"):
             return f"{pr['title']}（推断）"
         return f"{o['branch']}（推断）" if o["branch"] else "无描述"
@@ -1287,12 +1412,8 @@ def main() -> int:
     def remote_web(repo: str):
         if repo in _web_cache:
             return _web_cache[repo] or None
-        rc, out, _ = run(["git", "-C", repo, "remote", "get-url", "origin"], timeout=30)
-        url = out.strip() if rc == 0 else ""
-        web = ""
-        m = re.search(r"^(?:ssh://)?(?:[^@/]+@)?([^:/]+)[:/](.+?)(?:\.git)?/?$", url)
-        if m:
-            web = f"{m.group(1)}/{m.group(2)}"
+        project, host = remote_slug(repo)
+        web = f"{host}/{project}" if host and project else ""
         _web_cache[repo] = web
         return web or None
 
@@ -1314,10 +1435,10 @@ def main() -> int:
         return "无"
 
     # evidence 与回复表格读对象上的字段，这里一次性补齐，避免只有 stdout 有链接。
-    for o in unreclaimed + verified_reclaimable:
+    for o in unreclaimed + verified_reclaimable + age_unknown:
         o["pr_url"] = pr_url(o)
         o["function"] = func_of(o)
-        o["next_step"] = o.get("skip_reason") or "保留"
+        o.setdefault("next_step", "保留")
     # 已执行项进 evidence.json 前补齐功能/链接字段（回复表格直接取用）。
     for x in executed_this_round:
         o = obj_by_path.get(x["path"], {})
@@ -1336,12 +1457,18 @@ def main() -> int:
         "primary_checkouts": sum(1 for o in objects if o["primary"]),
         "linked_present": sum(1 for o in objects if o["exists_now"] and not o["primary"]),
         "measured": measured, "reused": reused,
-        "eligible_count": len(owner_eligible) + len(verified_reclaimable),
+        "eligible_count": len(eligible_paths),
+        "owner_eligible_count": len(owner_eligible),
         "executed_count": len(executed_this_round), "executed_bytes": executed_bytes,
         "failed_count": len(failed),
         "unreclaimed_over_7d_count": len(unreclaimed),
         "unreclaimed_over_7d_bytes": unreclaimed_bytes,
         "unreclaimed_by_reason": by_reason,
+        "needs_decision_count": sum(o["needs_decision"] for o in unreclaimed),
+        "retained_count": sum(not o["needs_decision"] for o in unreclaimed),
+        "unreclaimed_unknown_size_count": sum(o["size_bytes"] is None for o in unreclaimed),
+        "age_unknown_count": sum(o["age_hours"] is None for o in objects if not o["primary"] and o["exists_now"]),
+        "projects": project_totals(unreclaimed, executed_this_round),
         "held_under7_count": len(held_under7), "held_under7_bytes": held_bytes,
         "cumulative_reclaimed_bytes": cumulative, "cumulative_since": cumulative_since,
         "who_uses_probed": probed,
@@ -1355,7 +1482,7 @@ def main() -> int:
         "gongfeng_credential_ok": bool(gf_token),
         "gongfeng_credential_source": gf_meta["credential_source"],
         "gongfeng_lookups": gf_meta["lookups"],
-        "gongfeng_eligible_count": len(verified_reclaimable),
+        "gongfeng_eligible_count": sum(o["path"] in eligible_paths for o in verified_reclaimable),
         "gongfeng_executed_count": len(gongfeng_executed_items),
         "gongfeng_executed_bytes": gongfeng_executed_bytes,
         "gongfeng_blocked_count": len(gongfeng_blocked_items),
@@ -1364,14 +1491,10 @@ def main() -> int:
         "listeners_unknown": sum(1 for r in infra["listeners"] if r["whitelist"] != "白名单命中"),
     }
     evidence = {"summary": summary, "objects": objects, "executed": executed_this_round,
-                "unreclaimed": [{"path": o["path"], "repo": o["repo"],
-                                 "size_bytes": o["size_bytes"], "age_hours": o["age_hours"],
-                                 "last_active_at": o.get("last_active_at"),
-                                 "dirty_summary": o.get("dirty_summary"),
-                                 "standing": o.get("standing"),
-                                 "reasons": o["reasons"], "pr": o["pr"],
-                                 "pr_url": pr_url(o), "function": func_of(o),
-                                 "next_step": o["skip_reason"] or "保留"} for o in unreclaimed],
+                "unreclaimed": unreclaimed,
+                "run_status": run_status, "exceptions": run_exceptions,
+                "age_unknown": age_unknown,
+                "needs_decision": [o for o in unreclaimed if o["needs_decision"]],
                 "held_under_7d_paths": [o["path"] for o in held_under7],
                 "prunable_registrations": [o["path"] for o in prunable_regs],
                 "verified_reclaimable": [
@@ -1386,29 +1509,43 @@ def main() -> int:
                 "owner_tool": {k: {kk: vv for kk, vv in v.items() if kk != "entries"}
                                for k, v in ot_reports.items()},
                 "verify": verify}
-    with open(os.path.join(round_dir, "evidence.json"), "w") as fh:
-        json.dump(evidence, fh, ensure_ascii=False, indent=1)
-    with open(os.path.join(round_dir, "summary.json"), "w") as fh:
-        json.dump(summary, fh, ensure_ascii=False, indent=1)
-
-    root_pct = df_pct("/") or 0.0
-    data_pct = df_pct("/data") or 0.0
-    summary["root_used_pct"] = root_pct
-    summary["data_used_pct"] = data_pct
-    with open(os.path.join(round_dir, "summary.json"), "w") as fh:
-        json.dump(summary, fh, ensure_ascii=False, indent=1)
-
-    # 账本先落盘：stdout 被调用方截断（SIGPIPE）也不能丢产物
+    summary["root_used_pct"] = df_pct("/")
+    summary["data_used_pct"] = df_pct("/data")
+    summary["scope"] = roots
+    summary["cleaner_status"] = infra["cleaner"]["last"].get("status")
+    summary["mirror_dir"] = (None if args.no_mirror else
+                             os.path.join(args.mirror_root, os.path.basename(round_dir)))
+    run_status["round_dir"] = round_dir
+    run_status["finished_at"] = now_iso()
+    run_status["duration_s"] = round(time.time() - started, 1)
     audit = render_audit(summary, executed_this_round, unreclaimed, by_reason, verify, failed)
     with open(os.path.join(round_dir, "audit_section.md"), "w") as fh:
         fh.write(audit)
-    mirror_path = None if args.no_mirror else mirror_round(round_dir, args.mirror_root)
-    summary["mirror_dir"] = mirror_path
-    with open(os.path.join(round_dir, "summary.json"), "w") as fh:
-        json.dump(summary, fh, ensure_ascii=False, indent=1)
+    for name, data in (("evidence.json", evidence), ("summary.json", summary),
+                       ("run-status.json", run_status)):
+        with open(os.path.join(round_dir, name), "w") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=1)
+    with open(os.path.join(round_dir, "report.md"), "w") as fh:
+        fh.write(render_report(evidence))
+    for o in objects:
+        if o["path"] in state_new["worktrees"]:
+            state_new["worktrees"][o["path"]]["who_uses"] = o.get("who_uses")
+    with open(os.path.join(round_dir, "raw", "state_snapshot.json"), "w") as fh:
+        json.dump(state_new, fh, ensure_ascii=False, indent=1)
+    if args.execute:
+        save_state(args.state, state_new)
+    if not args.no_mirror:
+        mirror_round(round_dir, args.mirror_root)
     if args.append_audit:
         with open(LEDGER, "a") as fh:
             fh.write("\n" + audit)
+
+    if args.execute:
+        status_path = os.path.join(STATE_DIR, "run-status.json")
+        os.makedirs(os.path.dirname(status_path), exist_ok=True)
+        with open(status_path + ".tmp", "w", encoding="utf-8") as fh:
+            json.dump(run_status, fh, ensure_ascii=False, indent=1)
+        os.replace(status_path + ".tmp", status_path)
 
     # 紧凑的 Agent 输出：只给需要判断的部分
     print("\n===== 本轮汇总 =====")
@@ -1430,8 +1567,8 @@ def main() -> int:
     print("\n--- ≥7 天未清理 · 原因分布 ---")
     for r, v in sorted(by_reason.items(), key=lambda kv: -kv[1]["bytes"]):
         print(f"  {r:22s} {v['count']:3d} 项 / {fmt_bytes(v['bytes'])}")
-    print("\n--- ≥7 天未清理 · 前 30 项（按空间，供统一表格：项目|结果|原因|空间|年龄|上次活跃|领先/落后）---")
-    for o in unreclaimed[:30]:
+    print("\n--- ≥7 天未清理 · 前 30 项（按项目分组、组内空间降序，供统一表格：项目|结果|原因|空间|年龄|上次活跃|领先/落后）---")
+    for o in sorted(unreclaimed, key=lambda o: (o["repo"], -(o["size_bytes"] or 0), o["path"]))[:30]:
         st = o.get("standing") or {}
         st_txt = f"a{st.get('ahead', '?')}/b{st.get('behind', '?')}" if st else "—"
         print(f"  {fmt_bytes(o['size_bytes']):>10}  {round((o['age_hours'] or 0)/24,1):>5}d  "
@@ -1442,11 +1579,11 @@ def main() -> int:
         if st and st.get("ahead"):
             print(f"             独有提交 {st['ahead']} 个（vs {st['base']}）：{st['unique_diff'][:90]}")
     mr_rows = [o for o in unreclaimed
-               if "非 GitHub host" in o["reasons"] or "工具判 ambiguous" in o["reasons"]]
-    print(f"\n--- 需 owner 查 MR/PR 的 {len(mr_rows)} 项（完整）---")
+               if o.get("needs_decision")]
+    print(f"\n--- 需 owner 决定的 {len(mr_rows)} 项（完整）---")
     for o in mr_rows:
         print(f"  {fmt_bytes(o['size_bytes']):>10}  {o['repo']}  {o['branch']}  "
-              f"{o.get('pr_url') or pr_url(o)}")
+              f"{o.get('pr_url') or pr_url(o)}  {o['reason']}  {o['next_step']}")
     if verified_reclaimable:
         print(f"\n--- 工蜂 MR 已核验且精确 head {len(verified_reclaimable)} 项"
               f"（{fmt_bytes(sum(o['size_bytes'] or 0 for o in verified_reclaimable))}；"
@@ -1464,7 +1601,7 @@ def main() -> int:
     if not gf_meta["credential_ok"] and gf_targets:
         print(f"\n[patrol] 工蜂凭据不可用：{gf_meta['reason']}"
               f"（对象已保留并标注「凭据缺失」，未尝试猜测）")
-    print(f"\n--- 基础设施 ---")
+    print("\n--- 基础设施 ---")
     c = infra["cleaner"]
     print(f"  clean-tmp 连续失败 {c['consecutive_failures']} 天；最近 {c['last'].get('ts')} "
           f"status={c['last'].get('status')} scan={c['last'].get('scan')} "
@@ -1489,17 +1626,92 @@ def main() -> int:
     if failed:
         print("\n--- 执行失败 ---")
         for f in failed:
-            print(f"  {f['path']}: {f['error']}")
-    if args.execute:
-        status_path = os.path.join(STATE_DIR, "run-status.json")
-        os.makedirs(os.path.dirname(status_path), exist_ok=True)
-        with open(status_path + ".tmp", "w", encoding="utf-8") as fh:
-            json.dump(run_status, fh, ensure_ascii=False, indent=1)
-        os.replace(status_path + ".tmp", status_path)
+            print(f"  {f.get('path') or f.get('repo')}: {f['error']}")
     if run_failed:
         print("[patrol] 本轮存在执行/扫描失败：见上方失败清单与 run-status.json")
     print(f"\n[patrol] 产物 {round_dir}  用时 {time.time()-started:.1f}s")
-    return 0
+    return 1 if run_failed else 0
+
+
+def render_report(evidence):
+    """一段汇总、一张项目明细；每个对象与待办只出现一次。"""
+    s = evidence["summary"]
+    status = evidence["run_status"]
+    mode = "只读预览，未执行清理" if s["mode"] == "dry-run" else "执行轮"
+    lines = ["# Worktree 巡检报告", "",
+             f"{status['finished_at']} · {mode} · `{s['run_id']}`", "",
+             f"**已清理 {s['executed_count']} · 不清理 {s['retained_count']} · 需决策 {s['needs_decision_count']}**"
+             f"（≥7 天口径；未清理 {s['unreclaimed_over_7d_count']} 项 / {fmt_bytes(s['unreclaimed_over_7d_bytes'])}）。"
+             f"另有 <7 天保留 {s['held_under7_count']} 项 / {fmt_bytes(s['held_under7_bytes'])}。", ""]
+    if s.get("executed_count"):
+        lines += [f"本轮回收 {fmt_bytes(s['executed_bytes'])}。", ""]
+    if s.get("age_unknown_count") or s.get("unreclaimed_unknown_size_count"):
+        lines += [f"数据缺口：年龄不可得 {s.get('age_unknown_count', 0)} 项；"
+                  f"大小不可得 {s.get('unreclaimed_unknown_size_count', 0)} 项。", ""]
+    for item in status.get("exceptions") or []:
+        lines.append(f"- 异常 `{item['code']}`：{item['detail']}")
+    if status.get("exceptions"):
+        lines.append("")
+
+    def order(o):
+        return o["repo"], -(o.get("size_bytes") or 0), o["path"]
+
+    retained = sorted(evidence["unreclaimed"], key=order)
+    selected = retained[:30]
+    seen = {o["path"] for o in selected}
+    selected += [o for o in retained if o.get("needs_decision") and o["path"] not in seen]
+    shown_retained = len(selected)
+    selected += [dict(o, decision="已清理") for o in evidence.get("executed", [])]
+    selected += evidence.get("age_unknown", [])
+    selected = sorted({o["path"]: o for o in selected}.values(), key=order)
+
+    def cell(value):
+        return str(value if value is not None else "不可得").replace("|", "\\|").replace("\n", " ")
+
+    if selected:
+        lines += ["| 项目 | 工作树 | 结果 | 空间 | 年龄 | 依据 / 待办 |",
+                  "|---|---|---|---|---|---|"]
+        previous_repo = None
+        for o in selected:
+            repo = o["repo"]
+            project = repo.removeprefix("/data/code/") if repo != previous_repo else "↳"
+            previous_repo = repo
+            label = os.path.relpath(o["path"], repo)
+            if label.startswith("../"):
+                label = os.path.basename(o["path"])
+            path = f"[{label}](<{o['path']}>)"
+            reasons = o.get("reasons") or []
+            facts = list(reasons)
+            remote = o.get("remote_status") or o.get("remote_proof")
+            if isinstance(remote, dict):
+                remote = remote.get("description")
+            if remote and remote not in facts and remote != "未核验（本地条件未通过）":
+                facts.append(remote)
+            url = o.get("pr_url") or ""
+            if url.startswith("https://"):
+                gf = o.get("gongfeng") or {}
+                pr = o.get("pr") or {}
+                number = gf.get("iid") or (pr.get("number") if isinstance(pr, dict) else pr)
+                name = (f"MR!{number}" if gf or urlsplit(url).hostname == "git.woa.com"
+                        else f"PR#{number}" if number else "远端证据")
+                facts.append(f"[{name}]({url})")
+            if o.get("needs_decision") or o.get("execution_error"):
+                facts.append("待办：" + o["next_step"])
+            if o.get("decision") == "已清理":
+                facts.append("分支已删" if o.get("branch_deleted") else "分支保留")
+                if o.get("backup_root"):
+                    facts.append(f"备份：{o['backup_root']}")
+            age = (f"{o['age_hours']/24:.1f}d" if o.get("age_hours") is not None
+                   else f"{o['age_days']:.1f}d" if o.get("age_days") is not None else "不可得")
+            values = [project, path, o.get("decision", "不清理"), fmt_bytes(o.get("size_bytes")),
+                      age, "；".join(facts) or "已完成"]
+            lines.append("| " + " | ".join(cell(v) for v in values) + " |")
+        lines.append("")
+    if shown_retained < len(retained):
+        lines += [f"≥7 天未清理展示 {shown_retained} / {len(retained)} 项，所有需决策项均已列出。", ""]
+    lines += [f"空间为表观字节；上次活跃、领先/落后、基础设施及完整明细见"
+              f"[证据]({s['round_dir']}/evidence.json) · [运行状态]({s['round_dir']}/run-status.json)。", ""]
+    return "\n".join(lines)
 
 
 def mirror_round(round_dir: str, mirror_root: str):
@@ -1507,15 +1719,17 @@ def mirror_round(round_dir: str, mirror_root: str):
     dst = os.path.join(mirror_root, os.path.basename(round_dir.rstrip("/")))
     try:
         os.makedirs(dst, exist_ok=True)
-        for item in ("evidence.json", "summary.json", "audit_section.md"):
+        for item in ("evidence.json", "summary.json", "audit_section.md", "run-status.json", "report.md"):
             src = os.path.join(round_dir, item)
             if os.path.exists(src):
                 shutil.copy2(src, os.path.join(dst, item))
         raw_src = os.path.join(round_dir, "raw")
         if os.path.isdir(raw_src):
             shutil.copytree(raw_src, os.path.join(dst, "raw"), dirs_exist_ok=True)
-        with open(os.path.join(mirror_root, ".current_round"), "w") as fh:
+        pointer = os.path.join(mirror_root, ".current_round")
+        with open(pointer + ".tmp", "w") as fh:
             fh.write(os.path.basename(round_dir.rstrip("/")) + "\n")
+        os.replace(pointer + ".tmp", pointer)
         return dst
     except OSError:
         return None
@@ -1612,7 +1826,7 @@ def render_audit(summary, executed, unreclaimed, by_reason, verify, failed) -> s
              f"（脚本轮 {summary['run_id']}；执行 {summary['executed_count']} 项 / "
              f"{fmt_bytes(summary['executed_bytes'])}）\n")
     L.append(f"- 规则：age ≥ {summary['min_age_hours']:g}h + 远端/主干已有 + 干净无引用无 BB 归属；"
-             f"执行器 worktree-cleanup（非 --force、不删分支）。")
+             f"执行器 worktree-cleanup（非 --force、分支按远端证明删除）。")
     L.append(f"- 采集：登记 {summary['registered_entries']}，可访问链接 {summary['linked_present']}，"
              f"测量 {summary['measured']} / 缓存复用 {summary['reused']}，"
              f"who-uses 串行 {summary['who_uses_probed']}。")
@@ -1625,15 +1839,15 @@ def render_audit(summary, executed, unreclaimed, by_reason, verify, failed) -> s
         L.append("|---|---|---|---|---|")
         for x in executed:
             L.append(f"| {x['path']} | {x['head'][:12]} | {x['age_days']}d | "
-                     f"#{x['pr']} | {x['size_bytes']:,} |")
+                     f"#{x['pr']} | {x['size_bytes'] if x['size_bytes'] is not None else '不可得'} |")
         if summary.get("gongfeng_executed_count"):
             L.append(f"- 其中工蜂（git.woa.com）{summary['gongfeng_executed_count']} 项经 "
-                     f"`--remote-evidence` 走同一 owner 执行器（非 --force、不删分支）。")
+                     f"`--remote-evidence` 走同一 owner 执行器（非 --force、分支按远端证明删除）。")
         for v in verify:
             L.append(f"- 复核 {v['path']}：commit={v['commit_type']}，"
                      f"分支{'已删（政策默认）' if not v.get('branch_present') else '未删（需关注）'}")
     if failed:
-        L.append("\n失败：" + "; ".join(f"{f['path']}: {f['error']}" for f in failed))
+        L.append("\n失败：" + "; ".join(f"{f.get('path') or f.get('repo')}: {f['error']}" for f in failed))
     if summary.get("gongfeng_blocked_count"):
         L.append(f"- 工蜂已核验但被 git 拒绝非 --force 移除 "
                  f"{summary['gongfeng_blocked_count']} 项（含 submodule，需 owner 决定）。")
@@ -1647,7 +1861,7 @@ def render_audit(summary, executed, unreclaimed, by_reason, verify, failed) -> s
              f"prunable 无实体登记 {summary.get('prunable_registrations', 0)} 项；"
              f"累计回收 {fmt_bytes(summary['cumulative_reclaimed_bytes'])}"
              f"（自 {summary['cumulative_since']}）。")
-    L.append(f"\n### 基础设施健康\n")
+    L.append("\n### 基础设施健康\n")
     L.append(f"- clean-tmp 连续失败 {summary.get('cleaner_consecutive_failures', '?')} 天。")
     L.append(f"- 非回环监听中未命中白名单 {summary.get('listeners_unknown', '?')} 个。")
     L.append(f"- 增量：测量 {summary['measured']} / 缓存复用 {summary['reused']}；"

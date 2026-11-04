@@ -9,7 +9,6 @@ import importlib.util
 import json
 import os
 from pathlib import Path
-import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -91,8 +90,8 @@ class GongfengLookupTests(unittest.TestCase):
         self.assertEqual(mr['iid'], 47)
         self.assertEqual(mr['url'],
                          'https://git.woa.com/lighthouse/lightginkgo/-/merge_requests/47')
-        # merged is queried first; later states are skipped once a match is found.
-        self.assertEqual(len(seen), 1)
+        # Open MR takes precedence over an older merged MR on a reused branch.
+        self.assertEqual([cmd[cmd.index("--state") + 1] for cmd in seen], ["opened", "merged"])
 
     def test_other_branch_match_is_not_accepted(self):
         def fake_run(cmd, **kwargs):
@@ -288,3 +287,32 @@ class DirtySummaryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class RunHealthTests(unittest.TestCase):
+    """异常驱动的新增/持续/恢复/复现语义。"""
+
+    def test_new_persistent_recovered_recurring(self):
+        cur = [{"key": "bb-query-failed", "code": "bb-query-failed", "detail": "x"}]
+        h1 = m.evaluate_run_health({}, cur, "T1")
+        self.assertEqual(len(h1["notifiable"]), 1)
+        self.assertEqual(h1["recovered"], [])
+
+        h2 = m.evaluate_run_health(h1["exceptions"], cur, "T2")
+        self.assertEqual(h2["notifiable"], [])   # 持续 → 静默
+        self.assertEqual(h2["recovered"], [])
+
+        h3 = m.evaluate_run_health(h2["exceptions"], [], "T3")
+        self.assertEqual(len(h3["recovered"]), 1)  # 恢复 → 通知一次
+        self.assertIsNotNone(h3["exceptions"]["bb-query-failed"]["resolved_at"])
+
+        h4 = m.evaluate_run_health(h3["exceptions"], cur, "T4")
+        self.assertEqual(len(h4["notifiable"]), 1)  # 恢复后复现 → 重新通知
+        self.assertIsNone(h4["exceptions"]["bb-query-failed"]["resolved_at"])
+
+    def test_different_entities_are_separate_exceptions(self):
+        cur = [{"key": "execute-failed:/a", "code": "execute-failed", "entity": "/a"},
+               {"key": "execute-failed:/b", "code": "execute-failed", "entity": "/b"}]
+        h = m.evaluate_run_health({"execute-failed:/a": {"key": "execute-failed:/a", "notified": True}}, cur, "T1")
+        self.assertEqual(len(h["notifiable"]), 1)
+        self.assertEqual(h["notifiable"][0]["entity"], "/b")

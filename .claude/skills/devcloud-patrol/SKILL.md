@@ -1,6 +1,6 @@
 ---
 name: devcloud-patrol
-description: 巡检这台 DevCloud 服务器：磁盘空间 + 开发期残留的对外暴露服务（Vite 等 dev server、PostgreSQL 等数据库、临时容器）。只读取证与分类；worktree 按 owner 常设的 7 天/远端持久规则自动回收，其余处置逐项确认后执行。
+description: 巡检这台 DevCloud 服务器：磁盘空间 + 开发期残留的对外暴露服务（Vite 等 dev server、PostgreSQL 等数据库、临时容器）。只读取证与分类；worktree 由独立的每日清理任务处理，其余处置逐项确认后执行。
 disable-model-invocation: true
 ---
 
@@ -8,7 +8,7 @@ disable-model-invocation: true
 
 这台开发机的磁盘经常被 Docker、worktree、日志和缓存填满；开发过程还会留下绑定在非回环地址上的临时服务——安全扫描已两次点名本机：Vite dev server（5173，CVE-2025-30208 任意文件读取）和 PostgreSQL（5432，弱口令）。这类残留没法靠固定脚本判定生死：同一个端口上，可能是三天前 `nohup` 忘关的孤儿进程，也可能是同事此刻正在用的预览服务。巡检的价值在取证和分类；处置永远逐项过人。
 
-一条铁律贯穿全程：**巡检只读取证；处置只有两类——worktree 满足 [references/storage-rules.md](references/storage-rules.md) 的「7 天 + 远端/主干已有 + 干净无引用」三条件时按 owner 常设授权自动回收，其余一律逐项过人。**
+一条铁律贯穿全程：**巡检只读取证；worktree 的自动归档清理由独立每日任务负责，现役入口见存储规则，其余处置逐项过人。**
 
 ## 流程
 
@@ -44,27 +44,29 @@ docker ps --format '{{.Names}}\t{{.Status}}\t{{.Ports}}'
 
 **白名单是唯一豁免源**：分类前先读 `devcloud-exposure/whitelist.json`。豁免条件是**端口和身份证据同时匹配**（如 8080 上跑的必须是 lighttools-frontend-1）；只对上端口、身份变了的一律按未知处理——端口被顶替是劫持信号，不是白名单失效。
 
-磁盘侧候选沿用 `./mo devcloud` 输出的分类，逐条对照 [references/storage-rules.md](references/storage-rules.md) 的持久规则（binlog 走 retention、包缓存走 owner prune、worktree 走 7 天/远端持久规则等），那里是唯一规则源。
+磁盘侧候选沿用 `./mo devcloud` 输出的分类，逐条对照 [references/storage-rules.md](references/storage-rules.md) 的持久规则（binlog 走 retention、包缓存走 owner prune、worktree 走当前保留期/远端持久规则等），那里是唯一规则源。
 
 完成条件：没有"未分类"条目；每个候选的证据链能在一行话里讲给 owner 听。
 
 ### 3. 报告与逐项决策
 
-磁盘/worktree 侧每轮由确定性脚本 [scripts/patrol_worktrees.py](scripts/patrol_worktrees.py) 采集、增量比对、
-判定、执行与渲染，输出形状以 [references/worktree-report-format.md](references/worktree-report-format.md) 为准：
+需要回顾旧巡检数据时，可用 [scripts/patrol_worktrees.py](scripts/patrol_worktrees.py)
+只读采集与渲染；调用方先按名称加载 `worktree-cleanup`，把宿主解析的脚本入口显式传入。
+旧报告形状见 [references/worktree-report-format.md](references/worktree-report-format.md)：
 
 ```bash
-python3 -u .claude/skills/devcloud-patrol/scripts/patrol_worktrees.py --execute --append-audit
+python3 -u <本 Skill 根>/scripts/patrol_worktrees.py \
+  --worktree-tool <已加载的 worktree-cleanup Skill 根>/scripts/cleanup_worktrees.py
 ```
 
 脚本把「按项目分组的已清理」（年龄、功能推断、释放空间、PR/MR 地址、可恢复性）与
 「≥7 天未清理」（原因、PR/MR 地址、大概空间）连同紧凑摘要直接打到 stdout；Agent 只读摘要并补
-需要判断的部分（主 checkout/ignored 依据、≤5 条待决事项、异常说明），不要重写脚本已产出的章节。
-worktree 满足三条件时该轮脚本直接执行并写入「已清理」，不进入决策队列；其余走下面的逐项决策。
+需要判断的部分（主 checkout/ignored 依据、真实待决事项的完整清单、异常说明），不要重写脚本已产出的章节。
+新的 worktree 清理结果以 `/root/.local/share/fork-maintenance/state/idle-cleanup.json` 及对应 worker 终态为准；其余走下面的逐项决策。
 
 一屏汇总，每行：资产（端口/路径）｜证据｜风险｜建议动作（owner 命令优先）｜状态。然后让用户对每一项表态：**保留 / 处置 / 暂缓**。用户没逐项点头的条目不动——"都清了吧"不算对具体条目的授权，要回放清单拿到确认。
 
-所有面向 owner 的自动化回复统一用表格，形状以 [references/automation-report-format.md](references/automation-report-format.md) 为准（一屏汇总表 → 按结论分组明细表 → 安全边界表 → 下一步表；结论只取 已清理 / 自动清理（本轮）/ 不清理（原因）/ 需决策（原因）；表末给「已清理 N · 不清理 M · 需决策 K」）。DB / worktree / 每周复盘三项 BB 自动化共用这一份契约，不各自发明格式。
+现存 DB / 每周复盘自动化回复格式见 [references/automation-report-format.md](references/automation-report-format.md)。
 
 ### 4. 处置与记账
 
@@ -80,6 +82,6 @@ worktree 满足三条件时该轮脚本直接执行并写入「已清理」，�
 
 ## 周期化
 
-完整巡检流程由人或 agent 显式调用（`$devcloud-patrol`）。本机复用已有每日 cron 清理和每周 BB 容量复盘：每日只执行已授权的临时清理器，每周读取结果并解释增长，必要时预览同一版本；迁移一次性实施与验收。
+完整巡检流程由人或 agent 显式调用（`$devcloud-patrol`）。Worktree 每日清理由独立 BB script automation 执行；临时目录清理和每周 BB 容量复盘按各自任务运行。
 
-自动处置范围、固定版本命令、失败恢复与日志位置以 [references/storage-rules.md](references/storage-rules.md)「临时目录与 worktree」为准，不维护第二套删除规则；每轮输出形状以 [references/worktree-report-format.md](references/worktree-report-format.md) 为准。超出既有授权的项目继续按上面的只读取证、逐项决策流程处理。
+临时目录的范围与失败恢复仍见 [references/storage-rules.md](references/storage-rules.md)；worktree 清理规则与恢复证据见存储规则所指的现役执行器 README 和状态报告。旧巡检报告格式只用于阅读历史产物。
