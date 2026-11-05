@@ -69,6 +69,6 @@ python3 -I <本技能根>/scripts/worktree_sweep.py --execute
 - 本机推 GitHub 没有 SSH agent（`Permission denied (publickey)`），要走 `gh` 的 https 凭据，脚本会自动改写 GitHub 的地址。GitHub 偶尔返回 500，失败项下一轮重跑即可。
 - 归档分支名带路径哈希：BB 托管的 worktree 和 `/data/ops/*` 里常有同名目录（`weekly-report`、`mono2`），只用目录名会互相覆盖，推送被 non-fast-forward 拒绝。
 - 停进程用 PID。`pkill -f <模式>` 会匹配到执行它的 shell 自己的命令行，把自己也杀掉。
-- 两个清理器各只覆盖一隅。`clean-tmp` 已改为 3 天、不限数量，但仍然不处理含 `.git`、凭据、数据库等内容的树：/tmp 下约 39 个独立 clone（带 `.git`，非 worktree）和一直有新运行写入的容器目录（opencraft 本地 smoke）不会被它清，只能由创建它们的任务自己收尾。fork-maintenance 的 09:00 任务仍会保留含任何 ignored 文件的 worktree。
+- 两个清理器各只覆盖一隅。`clean-tmp` 已改为 3 天、不限数量，但仍然不处理含 `.git`、凭据、数据库等内容的树：/tmp 下约 39 个独立 clone（带 `.git`，非 worktree）和一直有新运行写入的容器目录（opencraft 本地 smoke）不会被它清，只能由创建它们的任务自己收尾。
 - systemd-tmpfiles 已不再清理 /tmp（`/etc/tmpfiles.d/tmp.conf` 不再按年龄删），破坏闲置 worktree 的原因见 storage-rules「临时目录与 worktree」一节。
 - 定时任务的现状以 `bb automation list` 为准，不要凭记忆。定时运行用的是 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 里的不可变副本，不是仓库里的脚本。重新部署时，把 `scripts/docker_leftovers.py`、`scripts/go_cache_trim.py` 和 `scripts/worktree_sweep.py` 复制到新目录，同目录写 `manifest.json`（每个文件的 sha256 和 mode）；`<sha16>` 是这份 manifest 内容 sha256 的前 16 位；文件模式 `0444`，目录模式 `0555`。然后把定时任务里的命令改到新目录。

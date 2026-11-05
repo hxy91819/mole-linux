@@ -1,6 +1,6 @@
 # 自动化回复统一格式（表格）
 
-本文件是 `devcloud-patrol` 下保留的 BB 自动化（DB 存储巡检、每周系统盘复盘）
+本文件是 `devcloud-patrol` 巡检报告（原 DB 存储巡检、每周系统盘复盘两项 BB 自动化已于 2026-11-05 退役）
 面向 owner 的**回复格式唯一契约**。规则来源见 [storage-rules.md](storage-rules.md)；
 worktree 的对象级内容契约见 [worktree-report-format.md](worktree-report-format.md)。
 本文件只定义「发出去的那段回复长什么样」，不重复判定规则。

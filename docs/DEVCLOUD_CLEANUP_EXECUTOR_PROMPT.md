@@ -1,5 +1,7 @@
 # 唯一DSH：本机空间回收执行与迭代
 
+> **已退役（2026-11-05）**：本执行端随监督任务 `auto_cvheqhfkaf4` 一起退役，现行配置见 [DEVCLOUD_AUTOMATION.md](DEVCLOUD_AUTOMATION.md)「当前任务」。本文只作历史记录。
+
 你是当前服务器唯一的空间清理DSH执行线程，父检查线程为 `thr_rd3ahpzrae`。使用简体中文，在已有 `/data/code/mole-linux` 环境工作。用户明确允许程序或最多一个DSH完成清理；复用当前线程，不创建其他Agent/清理线程/worktree，不启动嵌套审查。父线程负责独立审查与验收。
 
 ## 读取与目标
