@@ -132,7 +132,7 @@ python3 -m worktree_cleanup scan \
 
 检查报告中的主 checkout、保留原因、真实线程/进程状态和归档目的地。工蜂私有项目只允许归档到适合的私有远端；同时配置工蜂与公开 GitHub mirror 的仓库，必须核对执行器的远端选择，不能默认加 `--owner` 后直接批量推公开 fork。输出 remote URL 前脱敏，不把 HTTPS URL 内的 token 写报告。
 
-当前09:00原owner入口的保护修复已本地提交`fork-maintenance@8d87f7a`：未验证依赖显式保留，worktree使用非force移除，并在最后引用检查后重新核ignored/源状态与根身份。源码仍dirty或留有唯一数据时保留。新依赖原型和缓存reset未启用；本机没有该owner仓库远端，提交未push；真实周期回收效果待后续验证。
+09:00 原 owner 入口（`auto_o3pwesztbpg`，已于 2026-11-05 退役）的保护修复已本地提交`fork-maintenance@8d87f7a`：未验证依赖显式保留，worktree使用非force移除，并在最后引用检查后重新核ignored/源状态与根身份。源码仍dirty或留有唯一数据时保留。新依赖原型和缓存reset未启用；本机没有该owner仓库远端，提交未push；真实周期回收效果待后续验证。
 
 维护命令的进程收尾另有本机提交`d7aa3eb`：正常结束及中断后检查自有session，按身份与期限收尾残留写入者。当前部署和适用范围仍以监督state、验收回执及唯一存储规则源为准；该控制修复的真实周期容量收益尚待验证。
 

@@ -11,11 +11,9 @@
 | 存储：Docker 残留（每小时） | 每小时第 7 分钟 | BB 脚本任务：`docker_leftovers.py --execute --quiet`（storage-upkeep 快照） | 满 1 小时的匿名测试 DB 卷、满 24 小时的悬空镜像、满 72 小时的 BuildKit 缓存；持 fork-maintenance run.lock 非阻塞 flock，拿不到即跳过，删卷前排除 retained_volumes | 启用 |
 | 存储：worktree 清理（每天） | 每天 06:30 | BB 脚本任务：`worktree_sweep.py --execute --quiet --budget-minutes 12`（storage-upkeep 快照） | 无人用且闲置满 24 小时的附加 worktree：已在远端直接删，否则归档核验后删 | 启用 |
 | 存储：Go 缓存修剪（每小时） | 每小时第 37 分钟 | BB 脚本任务：`go_cache_trim.py --execute --quiet`（storage-upkeep 快照） | go-build 里 2 小时以上没用过的条目；Go 只在条目 mtime 超过 1 小时时才刷新它，所以正在跑的构建用不到被删的条目。npm、pnpm 不自动清 | 启用 |
-| 存储：每日 DSH 检查 | 每天 07:30 | BB agent 任务 `auto_5gacevqssoe`（acp-dsh，DeepSeek V4.1 Flash），只读 | 核对三个脚本任务的定时运行、Go 缓存修剪、03:30 的 /tmp 清理、systemd-tmpfiles 和 /data 可用 ≥150 GiB；全部符合不出声，不符合时合成一条消息发给协调线程 thr_tikzbd34dg。协调线程换了要同步改这个任务的 prompt | 启用 |
+| 存储：每日 DSH 检查 | 每天 07:30 | BB agent 任务 `auto_5gacevqssoe`（acp-dsh，DeepSeek V4.1 Flash），只读 | 核对三个脚本任务的定时运行、Go 缓存修剪、03:30 的 /tmp 清理、systemd-tmpfiles 和 / 与 /data 的可用空间（都 ≥150 GiB）；全部符合不出声，不符合时合成一条消息发给协调线程 thr_tikzbd34dg。协调线程换了要同步改这个任务的 prompt | 启用 |
 | /tmp 清理 | 每天 03:30 | crontab `# devcloud-clean-tmp`：`clean-tmp --execute --age-days 3 --json`（外层 timeout 1790 秒） | /tmp 满 3 天候选：扫描预算 240 秒、单树 5 秒、不限数量按大小排序、执行预算 1740 秒用完为止 | 启用 |
-| 每周系统盘容量复盘 | 周日 04:00 | BB agent 任务：读 /tmp 清理 summary，比较容量并解释增长 | 只读复盘，必要时预览同一执行器 | 启用 |
-| 每周 DB 存储巡检与安全清理 | 周日 04:40 | BB agent 任务：以 storage-rules 为唯一规则源 | Docker 镜像/卷等逐类巡检；规则更新后自动按新规则执行 | 启用 |
-| 闲置工作区归档与依赖清理 | 每天 09:00 | BB 脚本任务（项目 proj_bdg8tywu4a）：`fork-maintenance/scheduled.py idle-cleanup` | 附加 worktree 旧执行端，仍按 3 天门槛运行 | 启用（更慢的旧入口） |
+2026-11-05 owner 决定，存储自动化统一使用上表这套配置。已删除：`auto_aburimdwdjg`（每周系统盘容量复盘，系统盘容量改由每日 DSH 检查覆盖）、`auto_caovoqtwj9e`（每周 DB 存储巡检与安全清理）、`auto_cvheqhfkaf4`（空间清理独立检查，原已暂停），以及项目 proj_bdg8tywu4a 的 `auto_o3pwesztbpg`（fork-maintenance 09:00 闲置工作区清理）。删除前的完整配置存档在 `/root/.local/state/devcloud-storage-upkeep/retired-automations-20261105.json`。下列 systemd 定时器不属于这套存储维护，继续保留：`safe-system-cleanup.timer`（周日 05:00 清 DNF 缓存和归档 journal）、`clean-openclaw-residue.timer`（每小时清 OpenClaw 卸载残留）、`html-preview-gc.timer` 和 `codebuddy-logrotate.timer`（生产端自带的过期清理与日志轮转）。
 
 systemd-tmpfiles 自 2026-11-04 起不再清理 `/tmp`（`/etc/tmpfiles.d/tmp.conf` 为 `q /tmp 0700 root root -`）：
 原来的按年龄删除曾删掉闲置 worktree 里已跟踪的文件，遇到孤立 FIFO 还会卡死。阈值与授权的规则源：

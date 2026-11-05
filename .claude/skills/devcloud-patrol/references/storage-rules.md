@@ -141,15 +141,15 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
   更晚、实际保留的标签/镜像。每个 repository 保留最新一个；镜像不记录 last-used，不用年龄冒充不活跃时间。
   既有 owner 保留/保护声明优先。先落精确 tag→ID、创建时间、全部容器引用及最新保留项清单；删除前重查，
   标签指向变化、引用查询失败或不满足条件时保留。只用 `docker image rm <repository:tag>`，不加 force，
-  不用全局 prune。执行沿既有“DB 存储巡检与安全清理”BB 自动化（`auto_caovoqtwj9e`，周日 04:40），
-  不新增定时任务；本条不授权删除已停止测试容器，也不改变任何卷规则。
+  不用全局 prune。原执行器“DB 存储巡检与安全清理”（`auto_caovoqtwj9e`）已于 2026-11-05 退役，本条目前没有定时执行器，登记仓库出现旧标签时按本条手动执行；
+  本条不授权删除已停止测试容器，也不改变任何卷规则。
   回归检查：只读预览中，登记仓库的超过 14 天旧标签且有更新保留项时才入候选；最新标签、任何容器引用、
   保护声明、未登记仓库及证据查询失败均不入候选；执行后核对最新保留项仍在、运行容器 ID/StartedAt/镜像/挂载
-  不变、容器和卷未删除。不手动触发清理，等待原周期巡检执行。
+  不变、容器和卷未删除。
 
 ## 数据库卷
 
-- **旧 worktree 调度（门槛已由 owner 2026-11-04 策略改为闲置 24 小时，见上文；本任务仍按 72 小时运行，只是更慢的旧入口）**：附加 worktree 连续闲置满
+- **旧 worktree 调度（`auto_o3pwesztbpg` 已于 2026-11-05 退役删除，下文仅作历史；现行规则见上文 owner 2026-11-04 策略，执行入口 `worktree_sweep.py`）**：附加 worktree 连续闲置满
   **3 天（72 小时）**才可归档并核验后清理，替代 11-01 引入的 30 天；扫描与删除前复查
   使用同一门槛。`auto_o3pwesztbpg` 每日 09:00（Asia/Shanghai）调用
   `/data/code/fork-maintenance/scheduled.py idle-cleanup`，默认扫描 `/data/code`。
@@ -388,7 +388,7 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
   判定优先级：**owner 项目级策略 > 容器引用 > 通用规则**。凡因“未到期”不清理的，必须写出
   `MM-DD HH:MM 起自动清理`；到期时间按 0.1 天精度（约 ±2.4h），只作排期参考，执行时刻以脚本实算为准。
   表末给一行汇总：`自动清理 N · 不清理 M · 需决策 K`。**不允许只写“待确认”而不给处置。**
-- **回复格式统一契约**：`devcloud-patrol` 下所有自动化（DB / worktree / 每周复盘）的 owner 回复形状
+- **回复格式统一契约**：`devcloud-patrol` 巡检报告的 owner 回复形状
   由 [automation-report-format.md](automation-report-format.md) 定义（一屏汇总表 → 按结论分组明细表 →
   安全边界表 → 下一步表），各任务不再自行发明格式；worktree 的对象级内容契约仍见
   [worktree-report-format.md](worktree-report-format.md)。

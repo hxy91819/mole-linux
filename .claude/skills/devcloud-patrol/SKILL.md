@@ -66,7 +66,7 @@ python3 -u <本 Skill 根>/scripts/patrol_worktrees.py \
 
 一屏汇总，每行：资产（端口/路径）｜证据｜风险｜建议动作（owner 命令优先）｜状态。然后让用户对每一项表态：**保留 / 处置 / 暂缓**。用户没逐项点头的条目不动——"都清了吧"不算对具体条目的授权，要回放清单拿到确认。
 
-现存 DB / 每周复盘自动化回复格式见 [references/automation-report-format.md](references/automation-report-format.md)。
+巡检报告的回复格式见 [references/automation-report-format.md](references/automation-report-format.md)。
 
 ### 4. 处置与记账
 
