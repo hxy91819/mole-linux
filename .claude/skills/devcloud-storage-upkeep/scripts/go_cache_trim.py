@@ -23,6 +23,7 @@ import time
 MAX_AGE_SECONDS = 24 * 3600
 ENTRY_NAME = re.compile(r"^[0-9a-f]{64}-[ad]$")
 README_FIRST_LINE = "This directory holds cached build artifacts from the Go build system."
+LINT_README_FIRST_LINE = "This directory holds cached build artifacts from golangci-lint."
 
 
 def run(cmd, timeout=120):
@@ -40,7 +41,11 @@ def cache_directory():
     return os.path.realpath(path)
 
 
-def readme_ok(cache):
+def lint_cache_directory():
+    return os.path.realpath(os.path.expanduser("~/.cache/golangci-lint"))
+
+
+def readme_ok(cache, expected=README_FIRST_LINE):
     try:
         with open(os.path.join(cache, "README"), "r", encoding="utf-8", errors="replace") as handle:
             line = handle.readline()
@@ -50,7 +55,7 @@ def readme_ok(cache):
         line = line[:-1]
     if line.endswith("\r"):
         line = line[:-1]
-    return line == README_FIRST_LINE
+    return line == expected
 
 
 def cache_bytes(cache):
@@ -110,15 +115,10 @@ def still_eligible(path, cutoff):
     return st.st_size
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Delete unused Go build-cache entries older than 24 hours.")
-    parser.add_argument("--execute", action="store_true", help="unlink; default is a dry run")
-    parser.add_argument("--quiet", action="store_true", help="print nothing unless files were deleted or a command failed")
-    args = parser.parse_args(argv)
+def trim_cache(cache, label, expected, args):
     try:
-        cache = cache_directory()
-        if not readme_ok(cache):
-            raise RuntimeError("not a Go build cache (README missing or unexpected)")
+        if not readme_ok(cache, expected):
+            raise RuntimeError("README missing or unexpected")
         now = time.time()
         paths = eligible(cache, now)
         deleted = 0
@@ -146,21 +146,40 @@ def main(argv=None):
                 if stat.S_ISREG(st.st_mode):
                     deleted_bytes += st.st_size
     except Exception as exc:
-        print(f"go build cache: {exc}", file=sys.stderr)
+        print(f"{label}: {exc}", file=sys.stderr)
         return 1
     if not args.execute:
         if not args.quiet:
-            print(f"would delete {deleted} files, {deleted_bytes} bytes")
+            print(f"{label}: would delete {deleted} files, {deleted_bytes} bytes")
         return 0
     if deleted == 0 and args.quiet:
         return 0
     size = cache_bytes(cache)
     if size is None:
-        print(f"deleted {deleted} files, {deleted_bytes} bytes, cache unknown", file=sys.stderr)
+        print(f"{label}: deleted {deleted} files, {deleted_bytes} bytes, cache unknown", file=sys.stderr)
         return 1
     if deleted or not args.quiet:
-        print(f"deleted {deleted} files, {deleted_bytes} bytes, cache {size} bytes")
+        print(f"{label}: deleted {deleted} files, {deleted_bytes} bytes, cache {size} bytes")
     return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Trim Go and golangci-lint build caches older than 24 hours.")
+    parser.add_argument("--execute", action="store_true", help="unlink; default is a dry run")
+    parser.add_argument("--quiet", action="store_true", help="silent unless files were deleted or a command failed")
+    args = parser.parse_args(argv)
+    try:
+        caches = [(cache_directory(), "go build cache", README_FIRST_LINE)]
+        lint = lint_cache_directory()
+        if os.path.lexists(lint):
+            caches.append((lint, "golangci-lint cache", LINT_README_FIRST_LINE))
+    except Exception as exc:
+        print(f"build cache: {exc}", file=sys.stderr)
+        return 1
+    failed = False
+    for cache, label, expected in caches:
+        failed = trim_cache(cache, label, expected, args) != 0 or failed
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
