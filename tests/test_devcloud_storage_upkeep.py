@@ -25,6 +25,9 @@ assert SPEC and SPEC.loader
 m = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(m)
 
+_REAL_STORAGE_RUN = subprocess.run
+_REAL_STORAGE_POPEN = subprocess.Popen
+
 OLD = time.time() - 3 * 86400
 
 
@@ -2073,3 +2076,381 @@ def test_pnpm_node_options_and_option_terminator(args, busy):
 ] + [['pnpm', 'pm', 'install']])
 def test_pnpm_verified_remaining_writer_aliases(args):
     assert load_upkeep('pnpm_store_prune').installing(args)
+
+
+@pytest.fixture
+def watermark_case(tmp_path, monkeypatch):
+    w = load_upkeep('storage_watermark_brake')
+    monkeypatch.setattr(w, 'STATE', tmp_path / 'state' / 'watermark.json')
+    monkeypatch.setattr(w, 'available', lambda disk: 200 * w.GIB)
+    calls = []
+    def fake_bb(*args):
+        calls.append(args)
+        return '[]' if args[:2] == ('automation', 'runs') else '{}'
+    monkeypatch.setattr(w, 'bb', fake_bb)
+    # No test can escape to the real clean-tmp launcher or any other command.
+    monkeypatch.setattr(w.subprocess, 'run', mock.Mock(side_effect=AssertionError('unmocked command')))
+    return w, calls
+
+
+@pytest.mark.parametrize('gib,expected', [(0, 'danger'), (49, 'danger'), (50, 'warning'),
+                                        (149, 'warning'), (150, None), (200, None)])
+def test_watermark_thresholds(gib, expected):
+    w = load_upkeep('storage_watermark_brake')
+    assert w.level(gib * w.GIB) == expected
+
+
+@pytest.mark.parametrize('disk,count', [('/', 1), ('/data', 6)])
+def test_watermark_selects_only_low_disk_and_prints_trigger_summary(watermark_case, monkeypatch, capsys, disk, count):
+    w, calls = watermark_case
+    monkeypatch.setattr(w, 'available', lambda p: (100 if p == disk else 200) * w.GIB)
+    invoked = []
+    monkeypatch.setattr(w, 'trigger', lambda aid: invoked.append(aid) or 'triggered')
+    assert w.main([]) == 0
+    output = capsys.readouterr().out
+    assert len(output.splitlines()) == 1 and f'{disk} warning' in output
+    assert invoked == [aid for _, aid in w.TASKS[disk]] and len(invoked) == count
+    assert len(calls) == 1 and calls[0][:3] == ('thread', 'tell', 'thr_tikzbd34dg')
+
+
+def test_watermark_healthy_is_silent_and_does_not_create_state(watermark_case, capsys):
+    w, calls = watermark_case
+    assert w.main([]) == 0
+    assert capsys.readouterr().out == '' and not calls
+    assert not w.STATE.parent.exists()
+
+
+def test_watermark_cooldown_silent_and_expiry_retriggers(watermark_case, monkeypatch, capsys):
+    w, calls = watermark_case
+    now = [100000]
+    monkeypatch.setattr(w.time, 'time', lambda: now[0])
+    monkeypatch.setattr(w, 'available', lambda _: 100 * w.GIB)
+    fired = []
+    monkeypatch.setattr(w, 'trigger', lambda aid: fired.append(aid) or 'triggered')
+    assert w.main([]) == 0
+    capsys.readouterr()
+    snapshot = w.STATE.read_bytes()
+    for minutes in (15, 30, 60, 119):
+        now[0] = 100000 + minutes * 60
+        assert w.main([]) == 0
+        assert capsys.readouterr().out == ''
+        assert w.STATE.read_bytes() == snapshot
+    assert len(calls) == 1 and len(fired) == 6
+    now[0] = 100000 + 7200
+    assert w.main([]) == 0
+    assert 'warning' in capsys.readouterr().out
+    assert len(calls) == 2 and len(fired) == 12
+
+
+def test_watermark_escalation_notifies_but_downgrade_stays_silent(watermark_case, monkeypatch, capsys):
+    w, calls = watermark_case
+    free = [100]
+    monkeypatch.setattr(w, 'available', lambda _: free[0] * w.GIB)
+    monkeypatch.setattr(w, 'trigger', lambda _: 'triggered')
+    assert w.main([]) == 0
+    capsys.readouterr()
+    free[0] = 40
+    assert w.main([]) == 0
+    assert 'danger' in capsys.readouterr().out and len(calls) == 2
+    free[0] = 100
+    assert w.main([]) == 0
+    assert capsys.readouterr().out == '' and len(calls) == 2
+
+
+@pytest.mark.parametrize('existing', [False, True])
+def test_watermark_preview_has_zero_bb_calls_and_zero_state_changes(watermark_case, monkeypatch, capsys, existing):
+    w, calls = watermark_case
+    monkeypatch.setattr(w, 'available', lambda _: 40 * w.GIB)
+    if existing:
+        w.STATE.parent.mkdir()
+        w.STATE.write_text('{"/": {"level": "warning", "ts": 1}}\n')
+    before = w.STATE.read_bytes() if existing else None
+    assert w.main(['--dry-run']) == 0
+    assert 'would trigger' in capsys.readouterr().out
+    assert not calls and w.subprocess.run.call_count == 0
+    assert (w.STATE.read_bytes() if w.STATE.exists() else None) == before
+    if not existing:
+        assert not w.STATE.parent.exists()
+
+
+@pytest.mark.parametrize('reply', ['bad json', '{}', '[{}]', '[{"status":"mystery"}]', None])
+def test_watermark_query_unknown_never_triggers(watermark_case, monkeypatch, capsys, reply):
+    w, calls = watermark_case
+    def fake_bb(*args):
+        calls.append(args)
+        if args[:2] == ('automation', 'runs'):
+            if reply is None:
+                raise subprocess.TimeoutExpired('bb', 8)
+            return reply
+        return '{}'
+    monkeypatch.setattr(w, 'bb', fake_bb)
+    monkeypatch.setattr(w, 'TASKS', {'/': [], '/data': [('docker', 'auto-stub')]})
+    monkeypatch.setattr(w, 'available', lambda p: (40 if p == '/data' else 200) * w.GIB)
+    assert w.main([]) == 0
+    assert 'unknown (查询失败，跳过)' in capsys.readouterr().out
+    assert not any(c[:2] == ('automation', 'run') for c in calls)
+
+
+def test_watermark_running_task_is_skipped(watermark_case, monkeypatch):
+    w, calls = watermark_case
+    monkeypatch.setattr(w, 'bb', lambda *a: calls.append(a) or '[{"status":"running"}]')
+    assert w.trigger('auto-stub') == 'running'
+    assert len(calls) == 1 and calls[0][1] == 'runs'
+
+
+def test_watermark_internal_failure_is_nonzero(watermark_case, monkeypatch, capsys):
+    w, calls = watermark_case
+    monkeypatch.setattr(w, 'available', lambda p: (40 if p == '/' else 200) * w.GIB)
+    monkeypatch.setattr(w, 'trigger', mock.Mock(side_effect=OSError('launcher failed')))
+    assert w.main([]) == 1
+    assert 'failed (launcher failed)' in capsys.readouterr().out
+
+
+@pytest.fixture
+def runner_case(tmp_path, monkeypatch):
+    r = load_upkeep('clean_tmp_runner')
+    for name, path in [('LOCK', 'cleanup.lock'), ('LOG', 'ledger.jsonl'), ('STDERR', 'stderr.log')]:
+        monkeypatch.setattr(r, name, tmp_path / path)
+    monkeypatch.setattr(r.subprocess, 'run', mock.Mock(side_effect=AssertionError('real cleanup forbidden')))
+    monkeypatch.setattr(r.subprocess, 'Popen', mock.Mock(side_effect=AssertionError('real cleanup forbidden')))
+    return r
+
+
+def test_clean_tmp_busy_lock_skips_without_launch(runner_case, capsys):
+    import fcntl
+    r = runner_case
+    with r.LOCK.open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert r.main(['--launch', '--path', '/var/tmp']) == 0
+    assert json.loads(capsys.readouterr().out)['status'] == 'lock'
+    assert not r.LOG.exists() and r.subprocess.Popen.call_count == r.subprocess.run.call_count == 0
+
+
+def test_clean_tmp_detached_child_keeps_inherited_lock(runner_case, monkeypatch, capsys):
+    import fcntl
+    r = runner_case
+    inherited = []
+    def launch(cmd, **kw):
+        assert kw['start_new_session'] is True
+        assert cmd[0] == '/usr/bin/timeout' and '1790' in cmd and '-I' in cmd
+        fd, = kw['pass_fds']
+        inherited.append(os.dup(fd))  # model the child inheriting the open file description
+        return mock.Mock(pid=42)
+    monkeypatch.setattr(r.subprocess, 'Popen', launch)
+    try:
+        assert r.main(['--launch', '--path', '/data/system-tmp']) == 0
+        assert json.loads(capsys.readouterr().out)['status'] == 'triggered'
+        with r.LOCK.open() as another:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(another, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        for fd in inherited:
+            os.close(fd)
+    with r.LOCK.open() as another:
+        fcntl.flock(another, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_clean_tmp_cron_and_single_root_share_commands_budgets_and_ledger(runner_case, monkeypatch):
+    import fcntl
+    r = runner_case
+    calls = []
+    def run(cmd, **kw):
+        calls.append(cmd)
+        with r.LOCK.open() as another:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(another, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert kw['pass_fds'] and kw['timeout'] <= 1790
+        return subprocess.CompletedProcess(cmd, 0, '{"event":"summary","status":"ok"}\n', '')
+    monkeypatch.setattr(r.subprocess, 'run', run)
+    assert r.main([]) == 0
+    assert [c[3] for c in calls] == ['325', '1435']
+    assert all('-B' in c and '--execute' in c and '--json' in c for c in calls)
+    single = calls[1]
+    calls.clear()
+    assert r.main(['--path', '/data/system-tmp']) == 0
+    assert calls == [single]
+    rows = [json.loads(line) for line in r.LOG.read_text().splitlines()]
+    assert sum(row['event'] == 'runner_finish' for row in rows) == 3
+    assert all(row['returncode'] == 0 and 'summary' in row['output']
+               for row in rows if row['event'] == 'runner_finish')
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'failed'])
+def test_growth_failed_measurement_is_unknown_without_bytes(monkeypatch, failure):
+    g = load_upkeep('storage_growth_measure')
+    monkeypatch.setattr(g.os, 'lstat', lambda _: mock.Mock(st_mode=0o40700))
+    fake = (mock.Mock(side_effect=subprocess.TimeoutExpired('du-stub', 0.01)) if failure == 'timeout'
+            else mock.Mock(return_value=subprocess.CompletedProcess([], 1, '999', 'denied')))
+    monkeypatch.setattr(g.subprocess, 'run', fake)
+    row = g.measure('/stub', time.monotonic() + 1)
+    assert row['status'] == 'unknown' and 'bytes' not in row
+    assert 'error' in row
+
+
+def test_growth_discovery_measures_children_not_data_aggregate(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    listings = {'/data': ['code', 'system-tmp'], '/data/system-tmp': ['clone', 'cache'], '/root/.bb': ['logs', 'plugins']}
+    monkeypatch.setattr(g.Path, 'iterdir', lambda p: [p / name for name in listings[str(p)]])
+    roots, errors = g.discover()
+    assert not errors and '/data' not in roots and '/root/.bb' not in roots
+    assert {'/data/code', '/data/system-tmp/clone', '/root/.bb/plugins',
+            '/var/tmp', '/root/.cache', '/data/bb-data/thread-storage'} <= set(roots)
+
+
+def test_growth_compare_top5_ownership_and_unknown_exclusion():
+    g = load_upkeep('storage_growth_measure')
+    rules = g.fingerprints()
+    assert g.owner('/data/itfs', rules) == 'itfs'
+    assert g.owner('/data/system-tmp/oc-local-smoke-123', rules) == 'opencraft'
+    assert g.owner('/data/unregistered', rules) == 'unknown'
+    rows = [{'root': f'/root/{n}', 'status': 'ok', 'bytes': n * g.GIB, 'owner': 'unknown'} for n in range(7)]
+    before = {'ts': 100, 'rows': [{**row, 'bytes': 0} for row in rows]}
+    before['rows'][6]['status'] = 'unknown'
+    rows.append({'root': '/unknown-now', 'status': 'unknown', 'owner': 'unknown'})
+    before['rows'].append({'root': '/unknown-now', 'status': 'ok', 'bytes': 999})
+    compared, top5 = g.compare(rows, before, 100 + 43200)
+    assert [row['root'] for row in top5] == [f'/root/{n}' for n in (5, 4, 3, 2, 1)]
+    assert top5[0]['daily_bytes'] == 10 * g.GIB
+    assert '/root/6' not in {r['root'] for r in compared}
+    assert '/unknown-now' not in {r['root'] for r in compared}
+
+
+def test_growth_retention_uses_sample_time_and_keeps_latest(tmp_path):
+    g = load_upkeep('storage_growth_measure')
+    now = 50 * 86400
+    for name, age in [('expired.json', 31), ('boundary.json', 30), ('recent.json', 2), ('latest.json', 40)]:
+        (tmp_path / name).write_text(json.dumps({'ts': now - age * 86400}))
+    g.retain(tmp_path, now)
+    assert {p.name for p in tmp_path.iterdir()} == {'boundary.json', 'recent.json', 'latest.json'}
+
+
+def test_growth_main_compares_previous_persists_top5_and_alerts(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: (['/data/itfs', '/new'], []))
+    monkeypatch.setattr(g, 'measure', lambda root, deadline: {'root': root, 'status': 'ok', 'bytes': 30 * g.GIB})
+    monkeypatch.setattr(g.time, 'time', lambda: 86401)
+    (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': [
+        {'root': root, 'status': 'ok', 'bytes': 0} for root in ('/data/itfs', '/new')]}))
+    assert g.main([]) == 0
+    result = json.loads((tmp_path / 'latest.json').read_text())
+    assert len(result['top5']) == 2 and result['unknown_count'] == 0
+    assert {row['owner'] for row in result['top5']} == {'itfs', 'unknown'}
+    assert len(result['alerts']) == 2 and result['interval_seconds'] == 86400
+
+
+def test_growth_overall_budget_bounds_queued_roots(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'TOTAL_SECONDS', 0.05)
+    monkeypatch.setattr(g, 'PER_ROOT_SECONDS', 0.02)
+    monkeypatch.setattr(g, 'WORKERS', 2)
+    monkeypatch.setattr(g, 'discover', lambda: ([f'/stub/{i}' for i in range(20)], []))
+    monkeypatch.setattr(g.os, 'lstat', lambda _: mock.Mock(st_mode=0o40700))
+    def run(cmd, **kw):
+        time.sleep(kw['timeout'])
+        raise subprocess.TimeoutExpired('stub', kw['timeout'])
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    start = time.monotonic()
+    assert g.main([]) == 0
+    assert time.monotonic() - start < 1
+    result = json.loads((tmp_path / 'latest.json').read_text())
+    assert result['unknown_count'] == 21 and not result['comparisons']
+    assert any(row.get('error') == 'total budget exhausted' for row in result['rows'])
+
+
+def test_watermark_reports_shared_launcher_lock_skip(watermark_case, monkeypatch):
+    w, calls = watermark_case
+    launcher = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{"status":"lock"}\n', ''))
+    monkeypatch.setattr(w.subprocess, 'run', launcher)
+    assert w.trigger('/var/tmp') == 'lock'
+    command = launcher.call_args.args[0]
+    assert command[0:2] == ['/usr/bin/python3', '-I']
+    assert command[-3:] == ['--launch', '--path', '/var/tmp']
+    assert command[2].endswith('/clean_tmp_runner.py') and not calls
+
+
+def test_watermark_both_disks_use_one_locked_worker(watermark_case, runner_case, monkeypatch, capsys):
+    import fcntl
+    w, calls = watermark_case
+    r = runner_case
+    monkeypatch.setattr(w, 'available', lambda _: 40 * w.GIB)
+    inherited, launches = [], []
+    def launch(cmd, **kw):
+        launches.append(cmd)
+        inherited.append(os.dup(kw['pass_fds'][0]))
+        return mock.Mock(pid=42)
+    monkeypatch.setattr(r.subprocess, 'Popen', launch)
+    def run_runner(cmd, **kw):
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            assert r.main(cmd[3:]) == 0
+        return subprocess.CompletedProcess(cmd, 0, out.getvalue(), '')
+    monkeypatch.setattr(w.subprocess, 'run', run_runner)
+    try:
+        assert w.main([]) == 0
+        assert len(launches) == 1 and '--path' not in launches[0]
+        output = capsys.readouterr().out
+        assert 'clean-tmp /var/tmp=triggered' in output
+        assert 'clean-tmp /data/system-tmp=triggered' in output
+        assert '=lock' not in output
+        with r.LOCK.open() as contender:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        for fd in inherited:
+            os.close(fd)
+
+
+def test_watermark_notification_failure_preserves_cooldown(watermark_case, monkeypatch, capsys):
+    w, calls = watermark_case
+    monkeypatch.setattr(w, 'available', lambda _: 40 * w.GIB)
+    fired = []
+    monkeypatch.setattr(w, 'trigger', lambda aid: fired.append(aid) or 'triggered')
+    monkeypatch.setattr(w, 'bb', mock.Mock(side_effect=subprocess.TimeoutExpired('notification-stub', 8)))
+    with pytest.raises(subprocess.TimeoutExpired):
+        w.main([])
+    assert w.STATE.exists() and len(fired) == 6
+    capsys.readouterr()
+    snapshot = w.STATE.read_bytes()
+    assert w.main([]) == 0
+    assert capsys.readouterr().out == '' and len(fired) == 6
+    assert w.STATE.read_bytes() == snapshot and w.bb.call_count == 1
+
+
+def test_clean_tmp_executor_preserves_same_directory_imports_without_pycache(runner_case, tmp_path, monkeypatch):
+    r = runner_case
+    executor = tmp_path / 'devcloud.py'
+    executor.write_text('from devcloud_tmp import value\nprint(value)\n')
+    (tmp_path / 'devcloud_tmp.py').write_text('value = "executor-dependency-ok"\n')
+    monkeypatch.setattr(r, 'EXECUTOR', str(executor))
+    # Use only our local harmless executor stub, never the real cleanup.
+    command = r.command('/var/tmp')
+    # subprocess is patched by runner_case; restore just for this harmless stub.
+    monkeypatch.setattr(r.subprocess, 'Popen', _REAL_STORAGE_POPEN)
+    result = _REAL_STORAGE_RUN(command, capture_output=True, text=True, check=True)
+    assert result.stdout == 'executor-dependency-ok\n'
+    assert not (tmp_path / '__pycache__').exists()
+
+
+def test_growth_plain_files_use_allocated_blocks_without_du(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    sparse = tmp_path / 'sparse'
+    with sparse.open('wb') as stream:
+        stream.truncate(100 * 1024 * 1024)
+    link = tmp_path / 'link'
+    link.symlink_to(sparse)
+    monkeypatch.setattr(g.subprocess, 'run', mock.Mock(side_effect=AssertionError('du fork for plain file')))
+    for path in (sparse, link):
+        row = g.measure(str(path), time.monotonic() + 1)
+        assert row['status'] == 'ok' and row['bytes'] == path.lstat().st_blocks * 512
+        assert row['bytes'] < sparse.stat().st_size
+    assert g.subprocess.run.call_count == 0
+
+
+def test_growth_critical_roots_start_before_large_tmp_inventory(monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    listings = {'/data': ['code'], '/root/.bb': ['logs'], '/data/system-tmp': [f'file-{i}' for i in range(10000)]}
+    monkeypatch.setattr(g.Path, 'iterdir', lambda p: [p / name for name in listings[str(p)]])
+    roots, _ = g.discover()
+    assert roots[:5] == ['/var/tmp', '/root/.cache', '/data/bb-data/thread-storage', '/data/code', '/root/.bb/logs']
+    assert len(roots) == 10005

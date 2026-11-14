@@ -9,6 +9,38 @@
 
 ## 1. 现行任务
 
+水位与增长两个任务使用独立快照 `916428875da4edee`，不改变下列五个清理任务的快照：
+
+| 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
+|---|---|---|---|---|
+| 水位刹车 | `auto_idedelow-3g` | `0,15,30,45 * * * *` | `/usr/bin/python3 -I <snap>/storage_watermark_brake.py` | 120 秒 |
+| 增长计量 | `auto_u4kos3to-di` | `0 7 * * *` | `/usr/bin/python3 -I <snap>/storage_growth_measure.py` | 240 秒 |
+
+均用 bash 启动脚本 exec 上述命令，工作目录 `/var/tmp`。水位只调用既有任务：/data 对应
+Docker、Go、worktree、tmp clone、pnpm、clean-tmp `/data/system-tmp`，/ 对应 clean-tmp `/var/tmp`。
+首次越线、级别升高或两小时冷却结束才触发并打印一行简报；正常/冷却完全静默（skipped）。
+运行查询 unknown 跳过并在简报注明。`--dry-run` 只打印计划，不查 BB、不写状态、不启动清理。
+状态在系统盘 `/var/lib/devcloud-storage-upkeep/watermark.json`，清理派发后、通知之前保存，
+通知失败不丢冷却（该次仍非零退出）。
+
+增长逐个计量 `/data` 顶层、`/data/system-tmp` 顶层、`/root/.bb` 下各项，另测 `/var/tmp`、
+`/root/.cache`、`/data/bb-data/thread-storage`、`docker system df`；8 并发，每根 60 秒、全轮 180 秒。
+重点根优先于 `/data/system-tmp` 清单排队；普通文件和符号链接直接读 `lstat.st_blocks * 512`，
+与单文件 du 的实占字节契约一致，避免数万次 fork；目录才运行 du。
+指标写 `/var/lib/devcloud-storage-upkeep/metrics`，`latest.json` 与带 UTC 时间的历史文件；只保留 30 天。
+`rows` 含已测 bytes 或 unknown/error；`comparisons` 只含前后有效根；`top5` 按间隔折算日增，
+`owner` 来自 storage-rules 的路径指纹表；`alerts` 收录正增长 unknown 或折算日增 >20 GiB 的根。
+父子根可能重叠，不能相加；第一次无可比样本时 Top5 为空。每日检查读取这些字段。
+
+预演和只读复现：
+
+```bash
+/usr/bin/python3 -I <snap>/storage_watermark_brake.py --dry-run
+/usr/bin/python3 -I <snap>/storage_growth_measure.py
+python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
+```
+
+
 五个脚本任务都属于 project `proj_8d3wrcajxn`，时区 `Asia/Shanghai`。
 它们跑的是 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 下的不可变副本，
 不是仓库工作区。`<sha16>` 是 `manifest.json` 规范化内容 sha256 的前 16 位；
@@ -46,7 +78,7 @@ export PATH=/root/.nvm/versions/node/v24.22.1/bin:/root/.nvm/versions/node/v24.1
 
 | 任务 | ID | 时间 | 执行 | 行为 |
 |---|---|---|---|---|
-| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对五个脚本任务的 schedule 运行、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用；全部符合只回一句，不符合才发协调线程 |
+| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对七个脚本任务的 schedule 运行、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源；全部符合只回一句，不符合才发协调线程 |
 
 prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)。改检查项时
 两边同步：改文件 → 用文件里的提取命令更新 `bb automation update ... --prompt` → `show` 回读。
@@ -72,6 +104,12 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
    回读 `bb automation show` 核对命令、`Asia/Shanghai`、cron、enabled。
 5. 保留旧快照用于回滚；不要覆盖旧目录。
 
+水位/计量快照包含 `storage_watermark_brake.py`、`storage_growth_measure.py`、`clean_tmp_runner.py`
+三个文件及 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
+文件 `0444`、目录 `0555`；三个入口都以 `python3 -I` 跑 `--help`，复算哈希并确认无 pycache，
+再更新两个任务的短名称 bash `--script-file`，回读命令、时区、cron、enabled。已知坏目录
+`8f4acd16bb88facd` 不保留；其他旧快照仍可回滚。
+
 `/tmp` 清理是另一条独立部署：快照 `/data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/`，
 由 crontab 直接引用；上一版 `7ca528d7c5f3f004`、`df3e2b353d8e1c72`、`f1e330c325c73fd0`、
 `1c2d71d3ab21cc79` 保留作回滚。升级它时要同时改 cron 版本路径和每日 DSH 检查覆盖的根。
@@ -82,14 +120,18 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 ```cron
 # devcloud-clean-tmp: ordinary entries 3d; structural caches idle 24h (owner-approved 2026-11-14)
-30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /bin/sh -c 'code=0; /usr/bin/timeout --signal=TERM --kill-after=10s 325 /usr/bin/python3 -B /data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/bin/devcloud.py clean-tmp --path /var/tmp --execute --age-days 3 --json || code=$?; /usr/bin/timeout --signal=TERM --kill-after=10s 1435 /usr/bin/python3 -B /data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/bin/devcloud.py clean-tmp --path /data/system-tmp --execute --age-days 3 --json || code=$?; exit "$code"' > /dev/null 2>> /data/metrics/devcloud-clean-tmp.stderr.log # devcloud-clean-tmp
+30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/916428875da4edee/clean_tmp_runner.py # devcloud-clean-tmp
 ```
 
 - 先 `/var/tmp`（内部预算 300 秒，timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒，
   timeout 1435 秒），外层 1790 秒，kill-after 10 秒。
-- stdout 丢弃；summary/intent/deleted 事件写 `/data/metrics/devcloud-clean-tmp.log`，
+- cron 与水位同用 `clean_tmp_runner.py`；全程持 `/var/lib/devcloud-storage-upkeep/clean-tmp.lock`，
+  非阻塞拿锁，后台 timeout/执行器继承 fd；两盘同时越线合并为一个两根顺序 worker，
+  执行器还保留自身每根 staging 锁。包装器用 `-I`，旧执行器维持 `-B` 以导入同目录 `devcloud_tmp`。
+- summary/intent/deleted 及包装器 runner_start/runner_finish（含退出码与 stdout）写 `/data/metrics/devcloud-clean-tmp.log`，
   stderr 追加到同名 `.stderr.log`。
-- 同一命令去掉 `--execute` 就是预览；不接受其他路径。
+- 水位用相同入口加 `--launch --path /var/tmp` 或 `--launch --path /data/system-tmp`；只派发不等待。
+  包装器仅接受这两根；人工查看候选使用底层执行器去掉 `--execute` 的预览命令。
 - 日志轮转由 `logrotate.timer` 管：每日检查，超过 5 MiB 提前轮转，保留 14 份/最长 30 天，
   压缩旧文件，不截断活跃日志。
 

@@ -6,6 +6,9 @@ This file is the shared source of truth for any AI agent working on this repo (C
 
 Mole is a macOS system cleanup and optimization tool with shell and Go components. It performs file cleanup, app protection checks, and maintenance tasks, so safety rules matter more than speed.
 
+Linux DevCloud 存储维护：先读 [设计与教训](docs/DEVCLOUD_STORAGE_DESIGN.md)，现行任务与部署见 [自动化手册](docs/DEVCLOUD_AUTOMATION.md)。
+分类或清理具体目标前，读取唯一规则源 [storage-rules](.claude/skills/devcloud-patrol/references/storage-rules.md)；本机账本约定见文末 Linux DevCloud Audit Ledger。
+
 ## Product Direction
 
 Mole is a terminal-first macOS maintenance toolkit. Its core job is to help power users inspect reclaimable space, remove known-safe leftovers, uninstall apps safely, run bounded maintenance, and check health from a CLI, script, or compact TUI. It is not a general Mac control center, package manager, background monitor, or GUI feature mirror.
