@@ -110,8 +110,6 @@ def process_anchors(anchors: dict):
     skip = ("/proc", "/sys", "/dev", "/usr", "/lib", "/bin", "/sbin", "/etc", "/run")
     try:
         pids = os.listdir("/proc")
-    except (FileNotFoundError, ProcessLookupError):
-        return
     except OSError as exc:
         raise ScanIncomplete("process scan incomplete") from exc
     for pid in pids:
@@ -275,14 +273,18 @@ class Repo:
             host, owner = parse_remote(push)
             if host and host == base_host and owner in logins:
                 return name
-        if base_host in INTERNAL_HOSTS and "origin" in self.remotes:
+        if (
+            base_host in INTERNAL_HOSTS
+            and "origin" in self.remotes
+            and parse_remote(self.remotes["origin"][1])[0] == base_host
+        ):
             return "origin"
         return None
 
-    def load_live(self):
+    def load_live(self, include_tags=False):
         for name in self.remotes:
             try:
-                out = git(self.main, "ls-remote", "--heads", transport_url(self.remotes[name][0]), timeout=90).stdout
+                out = git(self.main, "ls-remote", "--heads", *(["--tags"] if include_tags else []), transport_url(self.remotes[name][0]), timeout=90).stdout
             except Exception:
                 self.unreachable.add(name)  # do not plan a push we already know cannot land
                 continue
@@ -677,6 +679,25 @@ class BBEnvironmentCleaner:
             })
         item["bb_environments"] = outcomes
 
+    def process_missing(self):
+        """Retry missing environment records once per run, never within a run."""
+        if not self.enabled:
+            return []
+        self._ensure_loaded()
+        if self._load_error:
+            return [{"action": "bb-environment-sweep", "bb_environment_error": self._load_error}]
+        rows = []
+        for path in list(self._by_path):
+            try:
+                os.lstat(path)  # lexists, so a dangling symlink is NOT missing
+            except FileNotFoundError:
+                item = {"action": "bb-environment-sweep", "path": path}
+                self.process_removed_worktree(item)
+                rows.append(item)
+            except OSError as exc:
+                rows.append({"action": "bb-environment-sweep", "path": path, "bb_environment_error": failure_text(exc)})
+        return rows
+
 
 def execute_item(repo: Repo, item: dict, stamp: str, bb_envs: BBEnvironmentCleaner | None = None):
     path, head = item["path"], item["head"]
@@ -751,8 +772,11 @@ def failure_text(exc):
 
 def measure(items):
     def du(it):
-        r = run(["du", "-sx", "-B1", it["path"]], timeout=1800, check=False)
-        it["bytes"] = int(r.stdout.split()[0]) if r.stdout.strip() else None
+        try:
+            r = run(["du", "-sx", "-B1", it["path"]], timeout=1800, check=False)
+            it["bytes"] = int(r.stdout.split()[0]) if r.returncode == 0 and r.stdout.strip() else None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            it["bytes"] = None
 
     with cf.ThreadPoolExecutor(8) as pool:
         list(pool.map(du, items))
@@ -855,6 +879,12 @@ def main(argv=None):
                 [c for c in todo if todo[c]],
             ))
 
+    environment_rows = []
+    if args.execute:
+        environment_rows = bb_envs.process_missing()
+        with open(state_log, "a") as fh:
+            for row in environment_rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
     rows = [i for items in plan.values() for i in items]
     failed = any(i.get("result") == "failed" for i in rows)
     order = sorted(plan, key=lambda c: -len(plan[c]))
@@ -866,6 +896,10 @@ def main(argv=None):
             if any(i.get("result") in ("removed", "failed") for i in plan[c]):
                 print(repo_summary(repo_objs[c], plan[c], args.measure))
                 acted = True
+        deleted_envs = sum(e["result"] == "deleted" for row in environment_rows for e in row.get("bb_environments", []))
+        if deleted_envs:
+            print(f"missing BB environments deleted: {deleted_envs}")
+            acted = True
         if acted and args.execute:
             print(f"log: {state_log}")
         return 1 if failed else 0

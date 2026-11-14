@@ -655,9 +655,9 @@ class WorktreeSweepTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertFalse(wt.exists())
         saved = json.loads(state_file.read_text())
-        self.assertEqual([c for c in saved['calls'] if c[:2] == ['environment', 'delete']], [])
+        self.assertEqual([c[2] for c in saved['calls'] if c[:2] == ['environment', 'delete']], ['env_child', 'env_sibling'])
         for item in saved['environments']:
-            self.assertEqual(item['status'], 'ready')
+            self.assertEqual(item['status'], 'destroyed' if item['id'] in ('env_child', 'env_sibling') else 'ready')
         row = self._jsonl_rows()[0]
         self.assertEqual(row.get('bb_environments'), [])
         self.assertIn('git worktree add ', row.get('recovery_command', ''))
@@ -727,7 +727,7 @@ class WorktreeSweepTests(unittest.TestCase):
                     rc, out = self._sweep_with_bb(env, '--idle-hours', '1', '--execute')
                 self.assertEqual(rc, 0, out)
                 self.assertFalse(wt.exists())
-                row = [r for r in self._jsonl_rows() if r['path'] == str(wt)][0]
+                row = [r for r in self._jsonl_rows() if r.get('path') == str(wt)][0]
                 self.assertEqual(row['result'], 'removed')
                 self.assertIn('git worktree add ', row.get('recovery_command', ''))
                 has_err = bool(row.get('bb_environment_error')) or any(
@@ -1240,3 +1240,612 @@ class GoCacheTrimTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+# New owner 2026-11-14 maintenance surfaces. External services are fakes.
+import pytest
+
+
+def load_upkeep(name):
+    spec = importlib.util.spec_from_file_location(name, Path(__file__).resolve().parents[1] /
+        '.claude/skills/devcloud-storage-upkeep/scripts' / (name + '.py'))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture
+def clone_case(tmp_path, monkeypatch):
+    c = load_upkeep('tmp_clone_sweep')
+    root = tmp_path / 'tmp'
+    root.mkdir()
+    repo = root / 'clone'
+    (repo / '.git').mkdir(parents=True)
+    (repo / 'a').write_text('source')
+    state = tmp_path / 'state.json'
+    state.write_text(json.dumps({'path': str(repo), 'sha': 'a' * 40}))
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    fake = bindir / 'git'
+    fake.write_text(r"""#!/usr/bin/env python3
+import fcntl, json, os, sys
+p = os.environ['CLONE_STATE']
+lock = open(p + '.lock', 'a'); fcntl.flock(lock, fcntl.LOCK_EX)
+s = json.load(open(p)); a = sys.argv[3:]; path = sys.argv[2]
+s.setdefault('calls', []).append(a); json.dump(s, open(p, 'w'))
+h = s['sha']; cmd = a[0]
+if s.get('fail') == cmd: sys.exit(1)
+if cmd == 'rev-parse': print(str(path) + '/.git' if '--git-common-dir' in a or '--git-dir' in a else h)
+elif cmd == 'remote':
+    if len(a) == 1: print('origin')
+    else: print(s.get('url', 'https://github.com/hxy91819/example.git'))
+elif cmd == 'config': print('remote.origin.url ' + s.get('url', 'https://github.com/hxy91819/example.git'))
+elif cmd == 'status': print(s.get('dirty', ''), end='')
+elif cmd == 'stash': print(s.get('stash', ''), end='')
+elif cmd == 'worktree': print('worktree ' + path + '\nHEAD ' + h + '\n' + s.get('extra_worktree', ''))
+elif cmd == 'ls-files': print(s.get('ignored', ''), end='')
+elif cmd == 'for-each-ref':
+    print('refs/heads/main ' + h)
+    if s.get('local_branch'): print('refs/heads/local ' + 'b' * 40)
+    if s.get('tag'): print('refs/tags/local ' + 'c' * 40)
+elif cmd == 'ls-remote':
+    if s.get('offline'): sys.exit(1)
+    if a[-1].startswith(('refs/heads/archive/', 'refs/tags/archive/')):
+        print(s.get('pushed', 'WRONG') + '\t' + a[-1])
+    else:
+        if not s.get('unpublished'): print(h + '\trefs/heads/main')
+        for ref, sha in s.get('archives', {}).items(): print(sha + '\t' + ref)
+elif cmd == 'push':
+    if s.get('reject'): sys.exit(1)
+    s.setdefault('archives', {})[a[-1].split(':', 1)[1]] = a[-1].split(':')[0]; s['pushed'] = a[-1].split(':')[0]; json.dump(s, open(p, 'w'))
+elif cmd in ('merge-base', 'cat-file', 'symbolic-ref'): sys.exit(1)
+else: sys.exit(2)
+""")
+    fake.chmod(0o755)
+    monkeypatch.setattr(c.ws, 'ENV', dict(c.ws.ENV, PATH=str(bindir) + ':' + os.environ['PATH'], CLONE_STATE=str(state)))
+    for target in (repo / 'a', repo / '.git', repo): os.utime(target, (OLD, OLD))
+    return c, repo, root, state
+
+
+def execute_single_clone(c, item, roots, references, stamp):
+    c.prepare_clone(item, roots, references, stamp)
+    c.remove_prepared(item, roots, c.reference_index(roots, [item['path']]))
+
+
+def clone_plan(case, **changes):
+    c, repo, root, state = case
+    s = json.loads(state.read_text()); s.update(changes); state.write_text(json.dumps(s))
+    return c.plan_clone(str(repo), [str(root)], {}, {})
+
+
+@pytest.mark.parametrize('change,reason', [
+    ({'dirty': '?? local.txt\n'}, 'dirty'),
+    ({'stash': 'stash@{0}'}, 'stash'),
+    ({'extra_worktree': 'worktree /somewhere/linked\n'}, 'linked worktrees'),
+    ({'ignored': '.env\0'}, 'ignored credential'),
+    ({'offline': True, 'unpublished': True}, 'unreachable'),
+    ({'unpublished': True, 'url': 'https://github.com/other/upstream.git'}, 'no personal or internal remote'),
+    ({'fail': 'status'}, 'check failed'),
+])
+def test_tmp_clone_guards_fail_closed(clone_case, change, reason):
+    row = clone_plan(clone_case, **change)
+    assert row['action'] == 'keep'
+    assert reason in row['reason']
+
+
+@pytest.mark.parametrize('guard', ['process', 'unknown', 'container', 'bb', 'recent', 'nested', 'remote_reference', 'alternate_reference', 'symlink', 'outside'])
+def test_tmp_clone_filesystem_and_usage_guards(clone_case, guard, tmp_path):
+    c, repo, root, state = clone_case
+    anchors, refs, error = {}, {}, None
+    if guard in ('process', 'container', 'bb'): c.ws.add_anchor(anchors, str(repo / 'child'), guard)
+    if guard == 'unknown': error = 'process scan incomplete'
+    if guard == 'recent': os.utime(repo / 'a', None)
+    if guard == 'nested': (repo / 'inner' / '.git').mkdir(parents=True)
+    if guard.endswith('_reference'): refs[str(repo)] = guard
+    if guard == 'symlink':
+        link = root / 'alias'; link.symlink_to(repo, target_is_directory=True); repo = link
+    if guard == 'outside': root = tmp_path / 'other'; root.mkdir()
+    row = c.plan_clone(str(repo), [str(root)], anchors, refs, scan_error=error)
+    assert row['action'] == 'keep', row
+    expected = {
+        'process': 'in use', 'container': 'in use', 'bb': 'in use',
+        'unknown': 'process scan incomplete', 'recent': 'active within',
+        'nested': 'nested .git', 'remote_reference': 'remote_reference',
+        'alternate_reference': 'alternate_reference', 'symlink': 'symlink', 'outside': 'outside',
+    }
+    assert expected[guard] in row['reason']
+
+
+def test_tmp_clone_all_refs_need_live_proof(clone_case):
+    assert clone_plan(clone_case)['action'] == 'remove'
+    for change in ({'local_branch': True}, {'tag': True}, {'unpublished': True}):
+        row = clone_plan(clone_case, **change)
+        assert row['action'] == 'archive+remove'
+        assert row['archive_objects']
+
+
+@pytest.mark.parametrize('failure', ['reject', 'wrong_proof', 'busy_again', 'unknown_again', 'changed_again', 'delete_error'])
+def test_tmp_clone_sink_failure_keeps_clone(clone_case, monkeypatch, failure):
+    c, repo, root, state = clone_case
+    row = clone_plan(clone_case, unpublished=True, reject=failure == 'reject')
+    row['bytes'] = 4096
+    anchors = {}
+    if failure == 'busy_again': c.ws.add_anchor(anchors, str(repo), 'process new')
+    def usage():
+        if failure == 'unknown_again': raise c.ws.ScanIncomplete('process scan incomplete')
+        if failure == 'changed_again': os.utime(repo / 'a', None)
+        return anchors
+    monkeypatch.setattr(c, 'usage_anchors', usage)
+    if failure == 'wrong_proof':
+        original = c.ws.git
+        def wrong(path, *args, **kw):
+            if args[0] == 'ls-remote' and args[-1].startswith('refs/heads/archive/'):
+                return subprocess.CompletedProcess([], 0, 'WRONG\t' + args[-1] + '\n', '')
+            return original(path, *args, **kw)
+        monkeypatch.setattr(c.ws, 'git', wrong)
+    if failure == 'delete_error': monkeypatch.setattr(c.shutil, 'rmtree', mock.Mock(side_effect=PermissionError('denied')))
+    expected = {'reject': 'push', 'wrong_proof': 'does not match', 'busy_again': 'in use', 'unknown_again': 'scan incomplete', 'changed_again': 'active within', 'delete_error': 'denied'}[failure]
+    with pytest.raises(Exception, match=expected): execute_single_clone(c, row, [str(root)], {}, 'test')
+    assert repo.exists()
+    calls = json.loads(state.read_text()).get('calls', [])
+    assert not any('--force' in call or '-f' in call for call in calls if call[0] == 'push')
+
+
+def test_tmp_clone_archive_logs_exact_refs_and_unlinks_no_symlink_target(clone_case, monkeypatch, tmp_path):
+    c, repo, root, state = clone_case
+    outside = tmp_path / 'outside'; outside.mkdir(); (outside / 'keep').write_text('keep')
+    (repo / 'link').symlink_to(outside, target_is_directory=True)
+    os.utime(repo, (OLD, OLD)); os.utime(repo / 'link', (OLD, OLD), follow_symlinks=False)
+    row = clone_plan(clone_case, local_branch=True, tag=True); row['bytes'] = 4096
+    monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+    execute_single_clone(c, row, [str(root)], {}, 'test')
+    assert not repo.exists() and (outside / 'keep').exists()
+    assert row['result'] == 'removed'
+    assert len(row['archives']) == 2
+    assert row['head'] == 'a' * 40 and row['urls'] and row['bytes'] == 4096
+
+
+def test_tmp_clone_mono2_never_archives_to_github(clone_case):
+    c, repo, root, state = clone_case
+    (repo / '.git' / 'config').write_text('mono2')
+    row = clone_plan(clone_case, unpublished=True, url='https://github.com/hxy91819/mono2.git')
+    assert row['action'] == 'keep' and 'mono2' in row['reason']
+
+
+@pytest.fixture
+def pnpm_case(tmp_path, monkeypatch):
+    p = load_upkeep('pnpm_store_prune')
+    store = tmp_path / 'store'; store.mkdir(); (store / 'cached').write_bytes(b'x' * 8192)
+    bindir = tmp_path / 'bin'; bindir.mkdir()
+    fake = bindir / 'pnpm'
+    fake.write_text(r"""#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+with open(os.environ['PNPM_CALLS'], 'a') as f: f.write(' '.join(sys.argv[1:]) + '\n')
+if os.environ.get('PNPM_FAIL') == sys.argv[-1]: sys.exit(1)
+if sys.argv[1:] == ['store', 'path']: print(os.environ['PNPM_STORE'])
+elif sys.argv[1:] == ['store', 'prune']: Path(os.environ['PNPM_STORE'], 'cached').unlink(missing_ok=True)
+else: sys.exit(2)
+""")
+    fake.chmod(0o755)
+    monkeypatch.setattr(p.ws, 'ENV', dict(p.ws.ENV, PATH=str(bindir) + ':' + os.environ['PATH'], PNPM_STORE=str(store), PNPM_CALLS=str(tmp_path / 'calls')))
+    monkeypatch.setattr(p, 'package_process_state', lambda: (1, 'idle'))
+    return p, store, tmp_path
+
+
+@pytest.mark.parametrize('state', [0, 2])
+def test_pnpm_busy_or_unknown_skips_prune(pnpm_case, monkeypatch, state):
+    p, store, root = pnpm_case
+    monkeypatch.setattr(p, 'package_process_state', lambda: (state, 'busy or unknown'))
+    assert p.main(['--execute', '--quiet', '--state-dir', str(root / 'log')]) == 0
+    assert (store / 'cached').exists()
+    row = json.loads(next((root / 'log').glob('pnpm*.jsonl')).read_text().splitlines()[-1])
+    assert row['result'] == 'skipped' and row['reason'] == 'busy or unknown'
+    assert 'store prune' not in (root / 'calls').read_text() if (root / 'calls').exists() else True
+
+
+def test_pnpm_default_is_read_only_and_quiet(pnpm_case, capsys):
+    p, store, root = pnpm_case
+    assert p.main(['--quiet', '--state-dir', str(root / 'log')]) == 0
+    assert (store / 'cached').exists() and not capsys.readouterr().out
+
+
+def test_pnpm_executes_owner_command_and_records_sizes(pnpm_case):
+    p, store, root = pnpm_case
+    assert p.main(['--execute', '--state-dir', str(root / 'log')]) == 0
+    assert not (store / 'cached').exists()
+    row = json.loads(next((root / 'log').glob('pnpm*.jsonl')).read_text().splitlines()[-1])
+    assert row['before_bytes'] > row['after_bytes'] and row['result'] == 'pruned'
+
+
+@pytest.mark.parametrize('failure', ['path', 'prune', 'measure', 'missing'])
+def test_pnpm_failures_are_reported(pnpm_case, monkeypatch, failure, capsys):
+    p, store, root = pnpm_case
+    if failure == 'measure': monkeypatch.setattr(p, 'store_bytes', lambda path: (_ for _ in ()).throw(RuntimeError('du failed')))
+    elif failure == 'missing': monkeypatch.setitem(p.ws.ENV, 'PATH', '/nonexistent')
+    else: monkeypatch.setitem(p.ws.ENV, 'PNPM_FAIL', failure)
+    assert p.main(['--execute', '--quiet', '--state-dir', str(root / 'log')]) == 1
+    assert capsys.readouterr().err
+
+
+@pytest.mark.parametrize('args,busy', [(['node', '/usr/bin/pnpm.cjs', 'install'], True), (['npm', 'ci'], True), (['yarn'], True), (['pnpm', 'add', 'x'], True), (['pnpm', 'run', 'dev'], False), (['python', 'some-pnpm-install-test.py'], False)])
+def test_package_process_classification(args, busy):
+    p = load_upkeep('pnpm_store_prune')
+    assert p.installing(args) is busy
+
+
+def test_pnpm_proc_permission_is_unknown(tmp_path, monkeypatch):
+    p = load_upkeep('pnpm_store_prune')
+    with mock.patch.object(p.os, 'listdir', side_effect=PermissionError('denied')):
+        assert p.package_process_state()[0] == 2
+
+
+@pytest.mark.parametrize('execute', [False, True])
+def test_worktree_missing_environments_swept_even_without_worktrees(tmp_path, execute):
+    # Reuse the fake bb binary, not the real BB service.
+    helper = WorktreeSweepTests('test_dry_run_changes_nothing'); helper.setUp()
+    try:
+        state = tmp_path / 'bb.json'
+        state.write_text(json.dumps({'environments': [
+            {'id': 'gone', 'path': str(tmp_path / 'gone'), 'status': 'ready'},
+            {'id': 'refused', 'path': str(tmp_path / 'gone2'), 'status': 'ready', 'refuse': 'Environment still has live threads'},
+            {'id': 'existing', 'path': str(helper.main), 'status': 'ready'},
+            {'id': 'destroyed', 'path': str(tmp_path / 'old'), 'status': 'destroyed'}]}))
+        env = helper._install_fake_bb_and_git(state)
+        rc, out = helper._sweep_with_bb(env, *(['--execute'] if execute else []))
+        assert rc == 0
+        calls = [x for x in json.loads(state.read_text())['calls'] if x[:2] == ['environment', 'delete']]
+        assert [x[2] for x in calls] == (['gone', 'refused'] if execute else [])
+        if execute:
+            rows = helper._jsonl_rows()
+            assert any(x.get('bb_environments', [{}])[0].get('result') == 'refused' for x in rows)
+    finally: helper.doCleanups()
+
+
+def test_tmp_clone_reference_index_reads_remote_and_alternates(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    other = root / 'other'
+    (other / '.git' / 'objects' / 'info').mkdir(parents=True)
+    original = c.ws.git
+    def fake_config(path, *args, **kw):
+        if args[0] == 'config':
+            return subprocess.CompletedProcess([], 0, f'remote.origin.url file://{repo}\n', '')
+        return original(path, *args, **kw)
+    monkeypatch.setattr(c.ws, 'git', fake_config)
+    assert 'remote URL reference' in c.reference_index([str(root)], [str(repo)])[str(repo)]
+    def empty_config(path, *args, **kw):
+        if args[0] == 'config': return subprocess.CompletedProcess([], 1, '', '')
+        return original(path, *args, **kw)
+    monkeypatch.setattr(c.ws, 'git', empty_config)
+    (other / '.git' / 'objects' / 'info' / 'alternates').write_text(str(repo / '.git' / 'objects') + '\n')
+    assert 'alternates reference' in c.reference_index([str(root)], [str(repo)])[str(repo)]
+
+
+def test_tmp_clone_local_remote_aliases_and_tilde_are_resolved(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    monkeypatch.setenv('HOME', str(root))
+    assert c.local_path('~/clone', str(root / 'other')) == str(repo)
+
+
+def test_tmp_clone_still_checks_usage_after_archive(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    row = clone_plan(clone_case, unpublished=True)
+    calls = []
+    def usage():
+        calls.append(1)
+        anchors = {}
+        if len(calls) > 1: c.ws.add_anchor(anchors, str(repo), 'process after push')
+        return anchors
+    monkeypatch.setattr(c, 'usage_anchors', usage)
+    with pytest.raises(c.ws.Keep, match='in use'): execute_single_clone(c, row, [str(root)], {}, 'test')
+    assert repo.exists() and row['archives']
+
+
+@pytest.mark.parametrize('failure', ['status', 'stash', 'worktree', 'ls-files', 'for-each-ref', 'rev-parse'])
+def test_tmp_clone_git_failure_never_deletes(clone_case, failure):
+    assert clone_plan(clone_case, fail=failure)['action'] == 'keep'
+
+
+def test_pnpm_rechecks_processes_after_sizing(pnpm_case, monkeypatch):
+    p, store, root = pnpm_case
+    monkeypatch.setattr(p, 'package_process_state', mock.Mock(side_effect=[(1, 'idle'), (0, 'new installer')]))
+    assert p.main(['--execute', '--quiet', '--state-dir', str(root / 'log')]) == 0
+    assert (store / 'cached').exists()
+    assert 'store prune' not in (root / 'calls').read_text()
+
+
+def test_pnpm_process_title_is_detected():
+    p = load_upkeep('pnpm_store_prune')
+    assert p.installing(['npm install', '', ''])
+    assert p.installing(['node', '--no-warnings', '/usr/bin/pnpm.cjs', 'install'])
+
+
+def test_tmp_clone_real_git_preserves_unpublished_branch_and_annotated_tag(tmp_path, monkeypatch):
+    c = load_upkeep('tmp_clone_sweep')
+    root = tmp_path / 'clones'; root.mkdir()
+    repo = root / 'repo'; remote = tmp_path / 'remote.git'
+    sh('git', 'init', '-q', '--bare', '-b', 'main', str(remote))
+    sh('git', 'init', '-q', '-b', 'main', str(repo))
+    sh('git', 'config', 'user.name', 'T', cwd=repo)
+    sh('git', 'config', 'user.email', 't@example.com', cwd=repo)
+    sh('git', 'config', 'core.excludesFile', '/dev/null', cwd=repo)
+    (repo / 'a').write_text('published')
+    sh('git', 'add', '.', cwd=repo); sh('git', 'commit', '-qm', 'published', cwd=repo)
+    sh('git', 'remote', 'add', 'origin', str(remote), cwd=repo)
+    sh('git', 'push', '-q', 'origin', 'main', cwd=repo)
+    sh('git', 'checkout', '-qb', 'local', cwd=repo)
+    (repo / 'a').write_text('only local')
+    sh('git', 'commit', '-qam', 'local', cwd=repo)
+    sh('git', 'tag', '-am', 'local tag', 'local-tag', cwd=repo)
+    tag = sh('git', 'rev-parse', 'refs/tags/local-tag', cwd=repo)
+    head = sh('git', 'rev-parse', 'HEAD', cwd=repo)
+    for target in (repo / 'a', repo): os.utime(target, (OLD, OLD))
+    monkeypatch.setattr(c.ws.Repo, '_archive_destination', lambda *a: 'origin')
+    monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+    row = c.plan_clone(str(repo), [str(root)], {}, {})
+    assert row['action'] == 'archive+remove', row
+    execute_single_clone(c, row, [str(root)], {}, 'real')
+    assert not repo.exists()
+    refs = sh('git', 'for-each-ref', '--format=%(objectname)', cwd=remote).splitlines()
+    assert tag in refs and head in refs
+
+
+def test_tmp_clone_discovery_does_not_include_linked_worktree_or_symlink(clone_case, monkeypatch, tmp_path, capsys):
+    c, repo, root, state = clone_case
+    linked = root / 'linked'; linked.mkdir(); (linked / '.git').write_text('gitdir: somewhere')
+    (root / 'alias').symlink_to(repo, target_is_directory=True)
+    monkeypatch.setattr(c, 'ROOTS', (str(root),))
+    monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+    monkeypatch.setattr(c, 'reference_index', lambda *a: {})
+    assert c.main(['--quiet', '--state-dir', str(tmp_path / 'logs')]) == 0
+    assert repo.exists() and not capsys.readouterr().out
+    rows = [json.loads(x) for x in next((tmp_path / 'logs').glob('tmp-clone-sweep-*.jsonl')).read_text().splitlines()]
+    assert len(rows) == 1 and rows[0]['path'] == str(repo)
+
+
+def test_tmp_clone_proc_unknown_refuses_whole_run(clone_case, monkeypatch, tmp_path, capsys):
+    c, repo, root, state = clone_case
+    monkeypatch.setattr(c, 'ROOTS', (str(root),))
+    monkeypatch.setattr(c, 'usage_anchors', mock.Mock(side_effect=c.ws.ScanIncomplete('process scan incomplete')))
+    assert c.main(['--execute', '--quiet', '--state-dir', str(tmp_path / 'logs')]) == 1
+    assert repo.exists() and 'scan incomplete' in capsys.readouterr().err
+
+
+def test_pnpm_failure_after_prune_records_after_size(pnpm_case, monkeypatch):
+    p, store, root = pnpm_case
+    original = p.ws.run
+    def fail_after_deletion(cmd, **kw):
+        result = original(cmd, **kw)
+        if cmd == ['pnpm', 'store', 'prune']:
+            raise subprocess.CalledProcessError(1, cmd, '', 'partial prune failed')
+        return result
+    monkeypatch.setattr(p.ws, 'run', fail_after_deletion)
+    assert p.main(['--execute', '--state-dir', str(root / 'logs')]) == 1
+    row = json.loads(next((root / 'logs').glob('pnpm*.jsonl')).read_text().splitlines()[-1])
+    assert row['after_bytes'] < row['before_bytes']
+
+
+def test_tmp_clone_reference_scan_handles_non_git_cache_markers(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    fixture = root / 'fixture'; fixture.mkdir(); (fixture / '.git').write_text('not a gitfile')
+    original = c.ws.git
+    def config_only(path, *args, **kw):
+        if str(path) == str(fixture):
+            raise subprocess.CalledProcessError(128, ['git'], '', 'fatal: invalid gitfile format')
+        if args[0] == 'config': return subprocess.CompletedProcess([], 1, '', '')
+        return original(path, *args, **kw)
+    monkeypatch.setattr(c.ws, 'git', config_only)
+    assert c.reference_index([str(root)], [str(repo)]) == {}
+
+
+@pytest.mark.parametrize('args', [
+    ['pnpm', '--dir', '/project', 'install'],
+    ['npm', '--prefix', '/project', 'ci'],
+    ['node', '--require', '/tracer.js', '/usr/bin/pnpm.cjs', 'add', 'dep'],
+    ['node', '/project/.yarn/releases/yarn-4.9.0.cjs', 'install'],
+    ['npm exec playwright'],
+])
+def test_pnpm_installers_with_flags_and_process_titles(args):
+    p = load_upkeep('pnpm_store_prune')
+    assert p.installing(args)
+
+
+def test_tmp_clone_partial_du_is_not_a_reclaimable_size(monkeypatch):
+    c = load_upkeep('tmp_clone_sweep')
+    monkeypatch.setattr(c.ws, 'run', lambda *a, **kw: subprocess.CompletedProcess([], 1, '123 /incomplete\n', 'permission denied'))
+    rows = [{'path': '/unused'}]
+    c.ws.measure(rows)
+    assert rows[0]['bytes'] is None
+
+
+@pytest.mark.parametrize('kind', ['bb', 'bb-failed', 'docker-unknown', 'proc-unknown'])
+def test_tmp_clone_usage_probes_reserve_environment_paths(clone_case, monkeypatch, kind):
+    c, repo, root, state = clone_case
+    bindir = Path(c.ws.ENV['PATH'].split(':')[0])
+    bb = bindir / 'bb'
+    bb.write_text('#!/usr/bin/env python3\nimport sys, json\n' +
+        ('sys.exit(1)\n' if kind == 'bb-failed' else f'print(json.dumps([{{"id":"env","path":{str(repo / "child")!r},"status":"ready"}}]))\n'))
+    bb.chmod(0o755)
+    monkeypatch.setattr(c.ws, 'process_anchors', mock.Mock(side_effect=c.ws.ScanIncomplete('process unknown')) if kind == 'proc-unknown' else lambda a: None)
+    monkeypatch.setattr(c.ws, 'docker_anchors', mock.Mock(side_effect=c.ws.ScanIncomplete('docker unknown')) if kind == 'docker-unknown' else lambda a: None)
+    if kind == 'bb':
+        assert 'BB environment' in c.ws.anchored(c.usage_anchors(), str(repo))
+    else:
+        with pytest.raises(Exception): c.usage_anchors()
+
+
+def test_tmp_clone_missing_proc_root_is_unknown(monkeypatch):
+    c = load_upkeep('tmp_clone_sweep')
+    monkeypatch.setattr(c.ws.os, 'listdir', mock.Mock(side_effect=FileNotFoundError('/proc unavailable')))
+    with pytest.raises(c.ws.ScanIncomplete): c.ws.process_anchors({})
+
+
+def test_tmp_clone_reference_scan_skips_dead_linked_gitfiles(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    dead = root / 'dead'; dead.mkdir(); (dead / '.git').write_text('gitdir: /does-not-exist/gitdir\n')
+    original = c.ws.git
+    def fake(path, *args, **kw):
+        if str(path) == str(dead): raise subprocess.CalledProcessError(128, ['git'], '', 'not a git repository')
+        if args[0] == 'config': return subprocess.CompletedProcess([], 1, '', '')
+        return original(path, *args, **kw)
+    monkeypatch.setattr(c.ws, 'git', fake)
+    assert c.reference_index([str(root)], [str(repo)]) == {}
+
+
+def test_tmp_clone_reference_scan_handles_empty_git_directory(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    fixture = root / 'empty'; (fixture / '.git').mkdir(parents=True)
+    original = c.ws.git
+    def fake(path, *args, **kw):
+        if str(path) == str(fixture) and args[0] == 'rev-parse':
+            return subprocess.CompletedProcess([], 128, '', 'fatal: not a git repository') if kw.get('check') is False else (_ for _ in ()).throw(subprocess.CalledProcessError(128, ['git'], '', 'fatal: not a git repository'))
+        if args[0] == 'config': return subprocess.CompletedProcess([], 1, '', '')
+        return original(path, *args, **kw)
+    monkeypatch.setattr(c.ws, 'git', fake)
+    assert c.reference_index([str(root)], [str(repo)]) == {}
+
+
+def test_tmp_clone_last_network_window_cannot_hide_new_write(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    row = clone_plan(clone_case)
+    original = c.ws.git
+    calls = []
+    def write_during_last_proof(path, *args, **kw):
+        result = original(path, *args, **kw)
+        if args[0] == 'ls-remote':
+            calls.append(1)
+            if len(calls) == 2: (repo / 'a').write_text('new work while remote was queried')
+        return result
+    monkeypatch.setattr(c.ws, 'git', write_during_last_proof)
+    monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+    monkeypatch.setattr(c, 'reference_index', lambda *a: {})
+    try:
+        execute_single_clone(c, row, [str(root)], {}, 'test')
+    except c.ws.Keep as exc:
+        assert 'active within' in str(exc)
+    if len(calls) >= 2:
+        assert repo.exists()  # a late network query introduced real new work
+    else:
+        assert row['result'] == 'removed'  # no late query, so the mutation never occurred
+
+
+def test_tmp_clone_new_reference_during_archive_is_rechecked(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    row = clone_plan(clone_case, local_branch=True)
+    monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+    def refreshed(*args):
+        assert json.loads(state.read_text()).get('archives')
+        return {str(repo): 'objects alternates reference: newly changed repo'}
+    monkeypatch.setattr(c, 'reference_index', refreshed)
+    with pytest.raises(c.ws.Keep, match='alternates reference'): execute_single_clone(c, row, [str(root)], {}, 'test')
+    assert repo.exists()
+
+
+@pytest.mark.parametrize('incomplete', [False, True])
+def test_tmp_clone_batch_refreshes_after_all_network_and_fails_closed(clone_case, monkeypatch, tmp_path, capsys, incomplete):
+    c, repo, root, state = clone_case
+    second = root / 'clone2'; (second / '.git').mkdir(parents=True); (second / 'a').write_text('source')
+    for p in (second, second / 'a'): os.utime(p, (OLD, OLD))
+    monkeypatch.setattr(c, 'ROOTS', (str(root),))
+    monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+    prepared = []
+    original = c.prepare_clone
+    def prepare(*args):
+        original(*args)
+        prepared.append(args[0]['path'])
+    monkeypatch.setattr(c, 'prepare_clone', prepare)
+    scans = []
+    def refs(*args):
+        scans.append(1)
+        if len(scans) == 1: return {}
+        assert len(prepared) == 2
+        if incomplete: raise c.ws.ScanIncomplete('reference unknown')
+        return {str(repo): 'remote URL reference: changed while archiving'}
+    monkeypatch.setattr(c, 'reference_index', refs)
+    result = c.main(['--execute', '--quiet', '--state-dir', str(tmp_path / 'logs')])
+    assert repo.exists() and second.exists() is incomplete
+    assert len(scans) == 2
+    assert result == (1 if incomplete else 0)
+    if incomplete: assert 'reference unknown' in capsys.readouterr().err
+
+
+def test_tmp_clone_remote_inside_clone_is_not_a_recovery_copy(clone_case):
+    c, repo, root, state = clone_case
+    row = clone_plan(clone_case, url=str(repo / '.git' / 'remote.git'))
+    assert row['action'] == 'keep' and 'no personal or internal remote' in row['reason']
+
+
+def test_tmp_clone_bare_repository_alternate_is_a_reference(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    bare = root / 'bare.git'
+    (bare / 'objects' / 'info').mkdir(parents=True); (bare / 'refs').mkdir()
+    (bare / 'HEAD').write_text('ref: refs/heads/main\n'); (bare / 'config').write_text('[core]\n bare = true\n')
+    (bare / 'objects' / 'info' / 'alternates').write_text(str(repo / '.git' / 'objects') + '\n')
+    original = c.ws.git
+    def fake(path, *args, **kw):
+        if str(path) == str(bare) and args[0] == 'rev-parse': return subprocess.CompletedProcess([], 0, str(bare), '')
+        if args[0] == 'config': return subprocess.CompletedProcess([], 1, '', '')
+        return original(path, *args, **kw)
+    monkeypatch.setattr(c.ws, 'git', fake)
+    assert 'alternates reference' in c.reference_index([str(root)], [str(repo)])[str(repo)]
+
+
+def test_tmp_clone_split_fetch_push_url_deletes_after_verified_archive(tmp_path, monkeypatch):
+    c = load_upkeep('tmp_clone_sweep')
+    helper = WorktreeSweepTests('test_dry_run_changes_nothing'); helper.setUp()
+    try:
+        repo = helper.main
+        fork = Path(helper.temp.name) / 'fork.git'
+        sh('git', 'init', '-q', '--bare', '-b', 'main', str(fork))
+        sh('git', 'remote', 'set-url', '--push', 'origin', str(fork), cwd=repo)
+        (repo / 'a.txt').write_text('only in local branch')
+        sh('git', 'commit', '-qam', 'local fork work', cwd=repo)
+        head = sh('git', 'rev-parse', 'HEAD', cwd=repo)
+        for parent, dirs, files in os.walk(repo):
+            dirs[:] = [x for x in dirs if x != '.git']
+            for name in files: os.utime(Path(parent) / name, (OLD, OLD))
+            os.utime(parent, (OLD, OLD))
+        monkeypatch.setattr(c.ws.Repo, '_archive_destination', lambda *a: 'origin')
+        monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+        row = c.plan_clone(str(repo), [str(helper.code)], {}, {})
+        assert row['action'] == 'archive+remove'
+        execute_single_clone(c, row, [str(helper.code)], {}, 'split')
+        assert not repo.exists() and row['archives']
+        assert head in sh('git', 'for-each-ref', '--format=%(objectname)', cwd=fork).splitlines()
+        assert head not in sh('git', 'for-each-ref', '--format=%(objectname)', cwd=helper.bare).splitlines()
+    finally:
+        helper.doCleanups()
+
+
+@pytest.mark.parametrize('change,reason', [({'dirty': '?? new-work\n'}, 'dirty'), ({'ignored': '.env\0'}, 'ignored credential'), ({'stash': 'new stash'}, 'stash')])
+def test_tmp_clone_final_local_guards_run_after_reference_io(clone_case, monkeypatch, change, reason):
+    c, repo, root, state = clone_case
+    row = clone_plan(clone_case)
+    monkeypatch.setattr(c, 'usage_anchors', lambda: {})
+    def change_during_scan(*args):
+        s = json.loads(state.read_text()); s.update(change); state.write_text(json.dumps(s))
+        return {}
+    monkeypatch.setattr(c, 'reference_index', change_during_scan)
+    with pytest.raises(c.ws.Keep, match=reason): execute_single_clone(c, row, [str(root)], {}, 'test')
+    assert repo.exists()
+
+
+@pytest.mark.parametrize('name', ['tmp_clone_sweep.py', 'pnpm_store_prune.py'])
+def test_storage_snapshot_help_does_not_write_bytecode(tmp_path, name):
+    source = Path(__file__).resolve().parents[1] / '.claude/skills/devcloud-storage-upkeep/scripts'
+    for f in (name, 'worktree_sweep.py'): shutil.copy2(source / f, tmp_path / f)
+    before = sorted(p.name for p in tmp_path.iterdir())
+    subprocess.run(['python3', '-I', str(tmp_path / name), '--help'], check=True, capture_output=True, text=True)
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+def test_tmp_clone_internal_origin_pushurl_cannot_cross_to_github(clone_case, monkeypatch):
+    c, repo, root, state = clone_case
+    original = c.ws.git
+    def split(path, *args, **kw):
+        if args[:2] == ('remote', 'get-url') and '--push' in args:
+            return subprocess.CompletedProcess([], 0, 'https://github.com/hxy91819/public-copy.git\n', '')
+        return original(path, *args, **kw)
+    monkeypatch.setattr(c.ws, 'git', split)
+    row = clone_plan(clone_case, unpublished=True, url='https://git.example.invalid/team/internal-project.git')
+    assert row['action'] == 'keep' and 'no personal or internal remote' in row['reason']
