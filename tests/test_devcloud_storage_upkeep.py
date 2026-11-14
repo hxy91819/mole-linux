@@ -595,6 +595,10 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'image', 'ls']:
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+            if cmd == ['docker', 'builder', 'prune', '--help']:
+                return subprocess.CompletedProcess(cmd, 0, '--max-used-space bytes', '')
             if cmd[:3] == ['docker', 'volume', 'ls']:
                 return subprocess.CompletedProcess(cmd, 1, '', 'denied')
             if cmd[:2] == ['docker', 'image'] or cmd[:2] == ['docker', 'builder']:
@@ -615,6 +619,10 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'image', 'ls']:
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+            if cmd == ['docker', 'builder', 'prune', '--help']:
+                return subprocess.CompletedProcess(cmd, 0, '--max-used-space bytes', '')
             if cmd[:3] == ['docker', 'volume', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, stdout=kept + '\n' + other + '\n', stderr='')
             if cmd[:3] == ['docker', 'volume', 'inspect']:
@@ -643,6 +651,10 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'image', 'ls']:
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+            if cmd == ['docker', 'builder', 'prune', '--help']:
+                return subprocess.CompletedProcess(cmd, 0, '--max-used-space bytes', '')
             if cmd[:3] == ['docker', 'volume', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, stdout=name + '\n', stderr='')
             if cmd[:3] == ['docker', 'volume', 'inspect']:
@@ -669,6 +681,10 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'image', 'ls']:
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+            if cmd == ['docker', 'builder', 'prune', '--help']:
+                return subprocess.CompletedProcess(cmd, 0, '--max-used-space bytes', '')
             raise AssertionError(cmd)
 
         rc, out, err = self.invoke(
@@ -683,6 +699,10 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'image', 'ls']:
+                return subprocess.CompletedProcess(cmd, 0, '', '')
+            if cmd == ['docker', 'builder', 'prune', '--help']:
+                return subprocess.CompletedProcess(cmd, 0, '--max-used-space bytes', '')
             if cmd[:3] == ['docker', 'volume', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, '', '')
             if cmd[:3] == ['docker', 'image', 'prune']:
@@ -698,6 +718,172 @@ class DockerLeftoversTests(unittest.TestCase):
         self.assertIn('docker BuildKit cache older than 72h: reclaimed 2.5GB rc=0', out)
         self.assertNotIn('dangling', out)
         self.assertEqual(err, '')
+
+
+class TaggedImagePolicyTests(unittest.TestCase):
+    setUp = DockerLeftoversTests.setUp
+    invoke = DockerLeftoversTests.invoke
+
+    def policy(self, *, referenced=False, latest=False, recent=False, labels=None,
+               query_failure=False, final_reference=False, retag=False, protect_final=False,
+               execute=True, help_text='--max-used-space bytes', rm_failure=False, old_buildkit=False,
+               prune_failure=False, final_query_failure=False, fallback_failure=False,
+               multiple=False, final_inspect_failure=False):
+        from datetime import datetime, timezone
+        old = {'Id': 'sha256:old', 'RepoTags': ['registry:5000/team/app:old'],
+               'Created': '2020-01-01T00:00:00Z', 'Size': 1234, 'Config': {'Labels': labels or {}}}
+        newer = {'Id': 'sha256:new', 'RepoTags': ['registry:5000/team/app:new'],
+                 'Created': '2026-10-01T00:00:00Z', 'Size': 5678, 'Config': {'Labels': {}}}
+        if recent:
+            old['Created'] = datetime.now(timezone.utc).isoformat()
+            newer['Created'] = '2099-01-01T00:00:00Z'
+        middle = {'Id': 'sha256:middle', 'RepoTags': ['registry:5000/team/app:middle'],
+                  'Created': '2021-01-01T00:00:00Z', 'Size': 2345, 'Config': {'Labels': {}}}
+        images = [middle, old, newer] if multiple else ([old] if latest else [old, newer])
+        commands = []
+        queries = 0
+
+        def run(cmd, timeout=1800, check=False):
+            nonlocal queries
+            commands.append(cmd)
+            data, rc = '', 0
+            if cmd[:3] == ['docker', 'volume', 'ls']:
+                pass
+            elif cmd[:3] == ['docker', 'image', 'ls']:
+                data = '\n'.join(i['Id'] for i in images)
+            elif cmd[:3] == ['docker', 'image', 'inspect']:
+                if final_inspect_failure and 'registry:5000/team/app:old' in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, '', 'inspect denied')
+                found = [dict(i) for i in images if i['Id'] in cmd[3:] or set(i['RepoTags']) & set(cmd[3:])]
+                if 'registry:5000/team/app:old' in cmd:
+                    if retag:
+                        found[0]['Id'] = 'sha256:replacement'
+                    if protect_final:
+                        found[0]['Config'] = {'Labels': {'mole.protect': 'true'}}
+                data = json.dumps(found)
+            elif cmd[:3] == ['docker', 'container', 'ls']:
+                queries += 1
+                rc = 1 if query_failure == 'ls' or (final_query_failure and queries > 1) else 0
+                data = 'container' if referenced or query_failure == 'inspect' or (final_reference and queries > 1) else ''
+            elif cmd[:3] == ['docker', 'container', 'inspect']:
+                rc = 1 if query_failure == 'inspect' else 0
+                data = json.dumps([{'Image': 'sha256:old'}])
+            elif cmd[:3] == ['docker', 'image', 'rm']:
+                rc = int(rm_failure)
+                data = 'Untagged: ' + cmd[3]
+                if not rc:
+                    for image in images:
+                        image['RepoTags'] = [t for t in image['RepoTags'] if t != cmd[3]]
+            elif cmd[:3] == ['docker', 'builder', 'prune'] and '--help' in cmd:
+                data = help_text
+            elif cmd[:3] in (['docker', 'builder', 'prune'], ['docker', 'image', 'prune']):
+                data = 'Total reclaimed space: 0B'
+                if fallback_failure and '--keep-storage' in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, '', 'fallback denied')
+                if prune_failure:
+                    return subprocess.CompletedProcess(cmd, 1, '', 'permission denied')
+                if old_buildkit and '--max-used-space' in cmd:
+                    return subprocess.CompletedProcess(cmd, 1, '', 'ERROR: buildkit v0.17.0+ is required for max-used-space and min-free-space filters')
+            else:
+                raise AssertionError(cmd)
+            return subprocess.CompletedProcess(cmd, rc, data, 'denied' if rc else '')
+
+        rc, out, err = self.invoke(['--execute'] if execute else [], run=run,
+                                   which=lambda name: '/usr/bin/docker' if name == 'docker' else None)
+        return rc, out, [c for c in commands if c[:3] == ['docker', 'image', 'rm']], commands
+
+    def assert_kept(self, reason, **kwargs):
+        rc, out, removed, _ = self.policy(**kwargs)
+        self.assertEqual(removed, [], out)
+        self.assertIn(reason, out)
+        return rc
+
+    def test_tagged_referenced_including_stopped_and_created_kept(self):
+        self.assert_kept('container reference', referenced=True)
+
+    def test_tagged_repository_latest_kept(self):
+        self.assert_kept('repository latest', latest=True)
+
+    def test_tagged_under_30_days_kept(self):
+        self.assert_kept('not older than 30 days', recent=True)
+
+    def test_tagged_owner_protection_kept(self):
+        for key in ('mole.protect', 'devcloud.protect'):
+            with self.subTest(key=key):
+                self.assert_kept('owner protection', labels={key: 'true'})
+
+    def test_tagged_reference_query_failure_keeps_and_fails(self):
+        for probe in ('ls', 'inspect'):
+            with self.subTest(probe=probe):
+                self.assertEqual(self.assert_kept('reference query failed', query_failure=probe), 1)
+
+    def test_tagged_only_eligible_tag_removed_without_force(self):
+        rc, out, removed, _ = self.policy()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(removed, [['docker', 'image', 'rm', 'registry:5000/team/app:old']])
+        self.assertTrue(all('-aq' in c for c in _ if c[:3] == ['docker', 'container', 'ls']))
+
+    def test_tagged_final_reference_rechecked(self):
+        self.assert_kept('container reference', final_reference=True)
+
+    def test_tagged_final_tag_pointer_rechecked(self):
+        self.assert_kept('tag changed', retag=True)
+
+    def test_tagged_final_owner_label_rechecked(self):
+        self.assert_kept('owner protection', protect_final=True)
+
+    def test_tagged_dry_run_does_not_remove(self):
+        rc, out, removed, commands = self.policy(execute=False)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(removed, [])
+        self.assertFalse(any(c[:3] == ['docker', 'builder', 'prune'] and '--help' not in c for c in commands))
+
+    def test_tagged_remove_failure_exits_1(self):
+        self.assertEqual(self.policy(rm_failure=True)[0], 1)
+
+    def test_builder_cap_is_separate_from_age_prune(self):
+        for flag in ('--max-used-space', '--keep-storage'):
+            with self.subTest(flag=flag):
+                rc, out, _, commands = self.policy(help_text=flag + ' bytes')
+                self.assertEqual(rc, 0, out)
+                prunes = [c for c in commands if c[:3] == ['docker', 'builder', 'prune'] and '--help' not in c]
+                self.assertIn(['docker', 'builder', 'prune', '-f', flag, '10GB'], prunes)
+                self.assertIn(['docker', 'builder', 'prune', '-f', '--filter', 'until=72h'], prunes)
+
+    def test_builder_old_server_uses_supported_keep_storage(self):
+        rc, out, _, commands = self.policy(old_buildkit=True)
+        self.assertEqual(rc, 0, out)
+        self.assertIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB'], commands)
+
+    def test_builder_real_failure_does_not_fall_back_and_exits_1(self):
+        rc, out, _, commands = self.policy(prune_failure=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('permission denied', out)
+        self.assertNotIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB'], commands)
+
+    def test_tagged_multiple_old_tags_use_newest_witness_in_any_order(self):
+        rc, out, removed, _ = self.policy(multiple=True)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([c[3] for c in removed], ['registry:5000/team/app:middle', 'registry:5000/team/app:old'])
+
+    def test_tagged_final_image_query_failure_is_reported_per_tag(self):
+        rc, out, removed, _ = self.policy(final_inspect_failure=True)
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(removed, [])
+        self.assertIn('keep: final image query failed', out)
+        self.assertIn('keep: repository latest', out)
+
+    def test_tagged_final_reference_query_failure_keeps_and_exits_1(self):
+        self.assertEqual(self.assert_kept('reference query failed', final_query_failure=True), 1)
+
+    def test_builder_fallback_failure_exits_1_and_reports_error(self):
+        rc, out, _, commands = self.policy(old_buildkit=True, fallback_failure=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('fallback denied', out)
+        self.assertIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB'], commands)
+
+    def test_builder_unsupported_cap_exits_1(self):
+        self.assertEqual(self.policy(help_text='unknown')[0], 1)
 
 
 def _load_go_cache_trim():

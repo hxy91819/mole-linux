@@ -50,11 +50,25 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   `test_non_matching_go_cache_names_are_kept`、`test_go_cache_symlink_is_kept_and_target_is_untouched`、
   `test_missing_go_cache_readme_deletes_nothing_and_exits_1`、`test_go_cache_dry_run_deletes_nothing`、
   `test_go_cache_quiet_is_silent_when_nothing_is_deleted`。
-- **Docker 残留由 `docker_leftovers.py` 清（每小时定时任务）**，只清三类：满 1 小时的匿名测试 DB 卷、
-  满 24 小时的悬空镜像、满 72 小时的 BuildKit 缓存。执行时在 `/root/.local/share/fork-maintenance/state/run.lock`
+- **Docker 残留由 `docker_leftovers.py` 清（每小时定时任务）**，清理满 1 小时的匿名测试 DB 卷、
+  满 24 小时的悬空镜像，以及下述带标签镜像和 BuildKit 缓存（2026-11-14 owner 批准扩展）。执行时在 `/root/.local/share/fork-maintenance/state/run.lock`
   上非阻塞 flock，拿不到锁本轮跳过；删卷前先排除
   `/data/metrics/ai-storage-maintenance/local-data-modes.json` 中 `retained_volumes` 列出的卷。
   匿名测试 DB 卷的证据链见下一条。
+- **2026-11-14 owner 批准：带标签镜像**同时满足以下条件才删：没有任何容器（含 stopped、created）
+  引用 image ID、Created 严格超过 30×24h、同一 repository 有 Created 严格更新的镜像。
+  每个 repository 的最新镜像（含并列最新）始终保留；`mole.protect=true` / `devcloud.protect=true`
+  一律保留，悬空镜像 prune 也排除这两个标签。删除前重新检查全部容器引用、标签指向、保护标签和更新镜像证据；
+  更新镜像证据明确选仓库最新，不依赖 Docker 列表顺序；单标签复查失败保留并报错，继续报告其余标签。
+  查询失败最终 exit 1。只用 `docker image rm <repo:tag>`，不加 force。报告的 image_size_bytes
+  是含共享层的镜像大小，不是独占可回收字节。
+- **2026-11-14 owner 批准：BuildKit 总量最多 10GB**：保留现有
+  `docker builder prune -f --filter until=72h`，另跑不带年龄过滤的总量 prune；先查询本机
+  `docker builder prune --help`，支持时用 `--max-used-space 10GB`，否则用 `--keep-storage 10GB`。
+  新 buildx 客户端可能列出 `--max-used-space`，但旧 BuildKit 服务端拒绝；仅当返回明确的
+  `buildkit v0.17.0+ is required for max-used-space and min-free-space filters`（执行前能力检查）时，
+  记录该诊断并改用兼容的 `--keep-storage 10GB`。两者都不支持、查询失败或真实 prune 失败则 exit 1，
+  不对其他错误重试。Docker 自身锁定、不可回收的缓存仍由 Docker 保留。
 - **匿名测试 DB 卷满 1 小时即清**：无任何容器引用、名称为 64 位十六进制且只带
   `com.docker.volume.anonymous` 标签、内容是 MySQL/PostgreSQL 数据目录或为空，创建满 1 小时即
   `docker volume rm <id>`。容器已删的匿名卷没有任何程序还能挂回去；命名卷、compose 卷与 retained 登记照旧。

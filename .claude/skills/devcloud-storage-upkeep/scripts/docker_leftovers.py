@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """Remove Docker leftovers that nothing is using.
 
-Default is a dry run. ``--execute`` acts. Targets (owner policy 2026-11-04):
+Default is a dry run. ``--execute`` acts. Targets (owner policy 2026-11-04, extended 2026-11-14):
 anonymous test-database volumes older than one hour, dangling images older
-than 24 hours, and BuildKit cache older than 72 hours. Named volumes, tagged
-images, and anything retained or locked by the maintenance owner stay.
+than 24 hours, unreferenced tagged images older than 30 days with a newer
+repository image, and BuildKit cache (72h age prune plus 10GB cap). Named
+volumes, repository newest images and owner-protected images stay.
 Go, npm, and pnpm caches are not touched: those trees stay in use.
 """
 
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import fcntl
 import json
 import os
@@ -158,7 +160,142 @@ def docker_caps(args, report, quiet_notes):
         lock.close()
 
 
+def docker_json(kind, names):
+    """Only accept a complete, successful inspect; partial evidence never authorizes removal."""
+    out = []
+    for offset in range(0, len(names), 100):
+        batch = names[offset:offset + 100]
+        result = run(['docker', kind, 'inspect', *batch], timeout=120)
+        if result.returncode:
+            raise ValueError(f'{kind} inspect failed: {result.stderr.strip()}')
+        payload = json.loads(result.stdout)
+        if not isinstance(payload, list) or len(payload) != len(batch):
+            raise ValueError(f'{kind} inspect incomplete')
+        out.extend(payload)
+    return out
+
+
+def container_images():
+    result = run(['docker', 'container', 'ls', '-aq', '--no-trunc'], timeout=60)
+    if result.returncode:
+        raise ValueError('container listing failed: ' + result.stderr.strip())
+    images = set()
+    for container in docker_json('container', result.stdout.split()):
+        image = container['Image']
+        if not isinstance(image, str) or not image:
+            raise ValueError('container image missing')
+        images.add(image)
+    return images
+
+
+def image_created(image):
+    created = datetime.fromisoformat(image['Created'].replace('Z', '+00:00'))
+    if created.tzinfo is None:
+        raise ValueError('image Created has no timezone')
+    return created.timestamp()
+
+
+def owner_protected(image):
+    labels = (image.get('Config') or {}).get('Labels') or {}
+    return any(labels.get(key) == 'true' for key in ('mole.protect', 'devcloud.protect'))
+
+
+def tagged_images(args, report, quiet_notes):
+    target = 'docker tagged images older than 30 days'
+    try:
+        listed = run(['docker', 'image', 'ls', '-aq', '--no-trunc'], timeout=60)
+        if listed.returncode:
+            raise ValueError('image listing failed: ' + listed.stderr.strip())
+        images = docker_json('image', list(dict.fromkeys(listed.stdout.split())))
+        tags = {}
+        for image in images:
+            # Parse every creation time before any removal: unknown inventory stays intact.
+            image_created(image)
+            for tag in image.get('RepoTags') or []:
+                if ':' in tag.rsplit('/', 1)[-1] and not tag.startswith('<none>'):
+                    tags[tag] = image
+        if not tags:
+            return
+        try:
+            references = container_images()
+        except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as exc:
+            for tag, image in tags.items():
+                report.append({'target': tag, 'image_id': image['Id'],
+                               'action': 'keep: reference query failed', 'failed': True})
+            quiet_notes.append(f'{target}: reference query failed: {exc}')
+            return
+        for tag, image in tags.items():
+            entry = {'target': tag, 'image_id': image['Id'], 'image_size_bytes': image['Size']}
+            repo = tag.rsplit(':', 1)[0]
+            newer = [name for name, candidate in tags.items()
+                     if name.rsplit(':', 1)[0] == repo and image_created(candidate) > image_created(image)]
+            newer.sort(key=lambda name: image_created(tags[name]), reverse=True)
+            if owner_protected(image):
+                reason = 'owner protection'
+            elif image['Id'] in references:
+                reason = 'container reference'
+            elif time.time() - image_created(image) <= 30 * 86400:
+                reason = 'not older than 30 days'
+            elif not newer:
+                reason = 'repository latest'
+            else:
+                reason = None
+            if reason is None and args.execute:
+                # Rebind the exact tag and its strictly newer repository witness.
+                try:
+                    current, witness = docker_json('image', [tag, newer[0]])
+                except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as exc:
+                    entry.update(action='keep: final image query failed', failed=True, error=str(exc))
+                    report.append(entry)
+                    quiet_notes.append(f'{tag}: final image query failed: {exc}')
+                    continue
+                if current['Id'] != image['Id'] or tag not in (current.get('RepoTags') or []):
+                    reason = 'tag changed'
+                elif owner_protected(current):
+                    reason = 'owner protection'
+                elif time.time() - image_created(current) <= 30 * 86400:
+                    reason = 'not older than 30 days'
+                elif newer[0] not in (witness.get('RepoTags') or []) or image_created(witness) <= image_created(current):
+                    reason = 'repository newer image changed'
+                else:
+                    try:
+                        fresh_references = container_images()
+                    except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as exc:
+                        reason = 'reference query failed'
+                        entry['failed'] = True
+                        quiet_notes.append(f'{tag}: {reason}: {exc}')
+                    else:
+                        if current['Id'] in fresh_references:
+                            reason = 'container reference'
+            entry['action'] = f'keep: {reason}' if reason else 'docker image rm ' + tag
+            if reason is None and args.execute:
+                result = run(['docker', 'image', 'rm', tag], timeout=600)
+                entry.update(rc=result.returncode, removed=result.returncode == 0,
+                             failed=result.returncode != 0, result=result.stdout.strip(), error=result.stderr.strip())
+                quiet_notes.append(f'{tag}: removed={result.returncode == 0} rc={result.returncode}')
+            report.append(entry)
+    except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as exc:
+        report.append({'target': target, 'action': 'measure failed', 'error': str(exc)})
+        quiet_notes.append(f'{target}: measure failed: {exc}')
+
+
+def builder_cap(report, quiet_notes):
+    try:
+        help_result = run(['docker', 'builder', 'prune', '--help'], timeout=60)
+        if help_result.returncode:
+            raise ValueError('builder prune help failed')
+        for flag in ('--max-used-space', '--keep-storage'):
+            if flag in help_result.stdout:
+                return ['docker', 'builder', 'prune', '-f', flag, '10GB']
+        raise ValueError('builder prune has no supported storage limit')
+    except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
+        report.append({'target': 'docker BuildKit 10GB cap', 'action': 'measure failed', 'error': str(exc)})
+        quiet_notes.append(f'docker BuildKit 10GB cap: {exc}')
+        return None
+
+
 def _docker_caps_locked(args, report, quiet_notes):
+    tagged_images(args, report, quiet_notes)
     vols = anonymous_db_volumes(args.volume_min_age_minutes * 60)
     if vols is None:
         report.append({"target": "docker anonymous test-db volumes", "action": "measure failed"})
@@ -193,19 +330,36 @@ def _docker_caps_locked(args, report, quiet_notes):
                         f"docker anonymous test-db volumes: removed {len(removed)} ({removed_bytes} bytes) rc={rc}"
                     )
             report.append(entry)
-    for target, cmd in (
-        ("docker dangling images older than 24h", ["docker", "image", "prune", "-f", "--filter", "until=24h"]),
+    cap = builder_cap(report, quiet_notes)
+    prunes = [
+        ("docker dangling images older than 24h", ["docker", "image", "prune", "-f", "--filter", "until=24h",
+             "--filter", "label!=mole.protect=true", "--filter", "label!=devcloud.protect=true"]),
         ("docker BuildKit cache older than 72h", ["docker", "builder", "prune", "-f", "--filter", "until=72h"]),
-    ):
+    ]
+    if cap:
+        prunes.append(("docker BuildKit cache at most 10GB", cap))
+    for target, cmd in prunes:
         entry = {"target": target, "action": " ".join(cmd)}
         if args.execute:
             result = run(cmd, timeout=1800)
-            entry.update(rc=result.returncode, result=(result.stdout.strip().splitlines() or [""])[-1][:200])
+            # New buildx clients advertise this flag even with an older BuildKit daemon.
+            # That version check rejects before pruning; only this exact refusal permits
+            # the older keep-storage protocol, never a retry on permission/daemon errors.
+            if (result.returncode != 0 and '--max-used-space' in cmd
+                    and 'buildkit v0.17.0+ is required for max-used-space and min-free-space filters' in result.stderr):
+                entry['unsupported_attempt'] = {'action': ' '.join(cmd), 'rc': result.returncode,
+                                                'error': result.stderr.strip()}
+                cmd = ['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB']
+                entry['action'] = ' '.join(cmd)
+                result = run(cmd, timeout=1800)
+            entry.update(rc=result.returncode, result=(result.stdout.strip().splitlines() or [""])[-1][:200],
+                         error=result.stderr.strip())
             if result.returncode != 0:
                 entry["failed"] = True
             amount = reclaimed_amount(result.stdout + "\n" + result.stderr)
             if result.returncode != 0 or not reclaimed_is_zero(amount):
-                quiet_notes.append(f"{target}: reclaimed {amount or 'unknown'} rc={result.returncode}")
+                quiet_notes.append(f"{target}: reclaimed {amount or 'unknown'} rc={result.returncode}"
+                                   + (f" {result.stderr.strip()}" if result.returncode else ""))
         report.append(entry)
 
 
