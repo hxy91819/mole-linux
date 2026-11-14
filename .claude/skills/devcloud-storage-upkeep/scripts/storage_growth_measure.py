@@ -11,7 +11,7 @@ import stat
 import time
 
 OUT = Path(os.environ.get('MOLE_GROWTH_METRICS', '/var/lib/devcloud-storage-upkeep/metrics'))
-RULES = Path('/data/code/mole-linux/.claude/skills/devcloud-patrol/references/storage-rules.md')
+RULES = Path(__file__).resolve().with_name('storage_growth_fingerprints.md')
 PER_ROOT_SECONDS = 60
 TOTAL_SECONDS = 180
 WORKERS = 8
@@ -34,7 +34,7 @@ def discover():
 
 
 def fingerprints(path=RULES):
-    """The explicit table is part of storage-rules, not guessed from directory names."""
+    """Read the table packaged from storage-rules alongside this script."""
     text = path.read_text()
     section = text.split('<!-- growth-fingerprints -->', 1)[1].split('<!-- /growth-fingerprints -->', 1)[0]
     rows = []
@@ -125,7 +125,7 @@ def main(argv=None):
     now = time.time()
     comparisons, top5 = compare(rows, previous, now)
     alerts = [r for r in comparisons if r['delta_bytes'] > 0 and
-              (r['owner'] == 'unknown' or r['daily_bytes'] > 20 * GIB)]
+              (r['daily_bytes'] >= GIB if r['owner'] == 'unknown' else r['daily_bytes'] > 20 * GIB)]
     out = {'ts': now, 'previous_ts': previous.get('ts'),
            'interval_seconds': now - previous['ts'] if previous else None,
            'elapsed_seconds': round(time.monotonic() - started, 3),

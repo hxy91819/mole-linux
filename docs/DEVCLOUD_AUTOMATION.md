@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位与增长两个任务使用独立快照 `916428875da4edee`，不改变下列五个清理任务的快照：
+水位与增长两个任务使用独立快照 `30dfc0e97234b2cc`，不改变下列五个清理任务的快照：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -29,7 +29,8 @@ Docker、Go、worktree、tmp clone、pnpm、clean-tmp `/data/system-tmp`，/ 对
 与单文件 du 的实占字节契约一致，避免数万次 fork；目录才运行 du。
 指标写 `/var/lib/devcloud-storage-upkeep/metrics`，`latest.json` 与带 UTC 时间的历史文件；只保留 30 天。
 `rows` 含已测 bytes 或 unknown/error；`comparisons` 只含前后有效根；`top5` 按间隔折算日增，
-`owner` 来自 storage-rules 的路径指纹表；`alerts` 收录正增长 unknown 或折算日增 >20 GiB 的根。
+`owner` 来自随快照发布的路径指纹表；`alerts` 仅收录 unknown 来源折算日增 ≥1 GiB、
+已登记来源折算日增 >20 GiB 的根，较小正增长仍保留在 Top5。
 父子根可能重叠，不能相加；第一次无可比样本时 Top5 为空。每日检查读取这些字段。
 
 预演和只读复现：
@@ -105,10 +106,12 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 5. 保留旧快照用于回滚；不要覆盖旧目录。
 
 水位/计量快照包含 `storage_watermark_brake.py`、`storage_growth_measure.py`、`clean_tmp_runner.py`
-三个文件及 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
+及 `storage_growth_fingerprints.md` 四个文件与 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
 文件 `0444`、目录 `0555`；三个入口都以 `python3 -I` 跑 `--help`，复算哈希并确认无 pycache，
+发布前从 storage-rules 的 `growth-fingerprints` 标记段生成同目录指纹副本，测试核对两份表一致；
+计量入口仅按自身目录读取副本，工作区规则改变不会影响已发布任务。确认目录只有四个文件与 manifest。
 再更新两个任务的短名称 bash `--script-file`，回读命令、时区、cron、enabled。已知坏目录
-`8f4acd16bb88facd` 不保留；其他旧快照仍可回滚。
+`8f4acd16bb88facd` 不保留；`916428875da4edee` 保留作回滚；其他旧快照按引用情况维护。
 
 `/tmp` 清理是另一条独立部署：快照 `/data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/`，
 由 crontab 直接引用；上一版 `7ca528d7c5f3f004`、`df3e2b353d8e1c72`、`f1e330c325c73fd0`、
@@ -120,7 +123,7 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 ```cron
 # devcloud-clean-tmp: ordinary entries 3d; structural caches idle 24h (owner-approved 2026-11-14)
-30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/916428875da4edee/clean_tmp_runner.py # devcloud-clean-tmp
+30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/30dfc0e97234b2cc/clean_tmp_runner.py # devcloud-clean-tmp
 ```
 
 - 先 `/var/tmp`（内部预算 300 秒，timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒，

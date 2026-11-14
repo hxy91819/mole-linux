@@ -2454,3 +2454,65 @@ def test_growth_critical_roots_start_before_large_tmp_inventory(monkeypatch):
     roots, _ = g.discover()
     assert roots[:5] == ['/var/tmp', '/root/.cache', '/data/bb-data/thread-storage', '/data/code', '/root/.bb/logs']
     assert len(roots) == 10005
+
+
+@pytest.mark.parametrize('source_owner,daily,expected', [
+    ('unknown', -1, False), ('unknown', 0, False), ('unknown', 1, False),
+    ('unknown', 1024 ** 3 - 1, False), ('unknown', 1024 ** 3, True),
+    ('unknown', 1024 ** 3 + 1, True), ('unknown', 21 * 1024 ** 3, True),
+    ('registered', -1, False), ('registered', 0, False),
+    ('registered', 1024 ** 3, False), ('registered', 20 * 1024 ** 3 - 1, False),
+    ('registered', 20 * 1024 ** 3, False), ('registered', 20 * 1024 ** 3 + 1, True),
+])
+def test_growth_alert_daily_thresholds_preserve_small_growth_in_top5(tmp_path, monkeypatch, source_owner, daily, expected):
+    g = load_upkeep('storage_growth_measure')
+    root = '/test/source'
+    baseline = 50 * g.GIB
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: ([root], []))
+    monkeypatch.setattr(g, 'fingerprints', lambda: [(root, source_owner)])
+    monkeypatch.setattr(g, 'measure', lambda name, deadline: (
+        {'root': name, 'status': 'ok', 'output': 'docker stub'} if name == 'docker system df'
+        else {'root': name, 'status': 'ok', 'bytes': baseline + daily}))
+    monkeypatch.setattr(g.time, 'time', lambda: 86401)
+    (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': [
+        {'root': root, 'status': 'ok', 'bytes': baseline}]}))
+    assert g.main([]) == 0
+    result = json.loads((tmp_path / 'latest.json').read_text())
+    assert bool(result['alerts']) is expected
+    assert result['comparisons'][0]['daily_bytes'] == daily
+    if daily > 0:
+        assert result['top5'][0]['root'] == root
+        assert result['top5'][0]['daily_bytes'] == daily
+
+
+def test_growth_packaged_fingerprints_match_authoritative_table():
+    g = load_upkeep('storage_growth_measure')
+    source = (Path(__file__).resolve().parents[1] /
+              '.claude/skills/devcloud-patrol/references/storage-rules.md').read_text()
+    table = source.split('<!-- growth-fingerprints -->', 1)[1].split('<!-- /growth-fingerprints -->', 1)[0]
+    expected = [tuple(part.strip().strip('`') for part in line.strip('|').split('|'))
+                for line in table.splitlines() if line.startswith('| `')]
+    assert expected and g.fingerprints() == expected
+
+
+def test_growth_copied_snapshot_uses_own_fingerprints_after_workspace_changes(tmp_path, monkeypatch):
+    source = Path(load_upkeep('storage_growth_measure').__file__)
+    snapshot = tmp_path / 'release'
+    snapshot.mkdir()
+    shutil.copyfile(source, snapshot / source.name)
+    (snapshot / 'storage_growth_fingerprints.md').write_text(
+        '<!-- growth-fingerprints -->\n| `/test/*` | snapshot-owner |\n<!-- /growth-fingerprints -->\n')
+    workspace = tmp_path / 'workspace'
+    workspace.mkdir()
+    decoy = workspace / 'storage-rules.md'
+    decoy.write_text('<!-- growth-fingerprints -->\n| `/test/*` | workspace-owner |\n<!-- /growth-fingerprints -->\n')
+    monkeypatch.chdir(workspace)
+    spec = importlib.util.spec_from_file_location('growth_copied_snapshot', snapshot / source.name)
+    g = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(g)
+    assert g.owner('/test/path', g.fingerprints()) == 'snapshot-owner'
+    decoy.write_text('changed workspace rules')
+    assert g.owner('/test/path', g.fingerprints()) == 'snapshot-owner'
+    decoy.unlink()
+    assert g.owner('/test/path', g.fingerprints()) == 'snapshot-owner'

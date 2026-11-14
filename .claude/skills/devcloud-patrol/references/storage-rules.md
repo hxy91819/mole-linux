@@ -129,7 +129,7 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 ### 水位刹车与增长归因（2026-11-14）
 
-每 15 分钟读取 `/` 与 `/data` 的 `statvfs` 可用字节；低于 150 GiB 预警、低于 50 GiB 危险。首次越线、warning→danger 升级或两小时冷却结束后再次触发才通知；冷却期静默，恢复正常后重新越线视为首次。运行中或查询未知的任务跳过并在触发简报注明；clean-tmp 与 cron 共用 `clean_tmp_runner.py`，非阻塞锁由后台执行链持有到结束，两盘同时越线合并为同一 worker 顺序执行两根；新入口用 `-I`，旧执行器仍用 `-B`（同目录依赖）。路径、timeout、预算与 JSONL 记账只有一个入口。派发后先保存冷却再通知，通知失败仍非零退出。`--dry-run` 仅打印计划，不写状态、不调用 BB 或包装器。真实触发 stdout 输出一行摘要，正常/冷却完全静默。每日 07:00 以 8 并发逐根计量 `/data` 顶层、`/data/system-tmp` 顶层、`/root/.bb` 各项，另测 `/var/tmp`、`/root/.cache`、`/data/bb-data/thread-storage` 和 `docker system df`；重点根和 BB 项先于 tmp 项排队；普通文件/符号链接直接读 lstat 的已分配块数，只有目录 fork du。每根最多 60 秒、全轮最多 180 秒。超时/失败为未测，不当作 0 或参与比较；与上次结果比较，按实际间隔折算日增 Top5，重叠根不求和。只保留最近 30 天指标。每日检查遇到正增长的 unknown 来源或单根折算日增超过 20 GiB 时通知协调线程。
+每 15 分钟读取 `/` 与 `/data` 的 `statvfs` 可用字节；低于 150 GiB 预警、低于 50 GiB 危险。首次越线、warning→danger 升级或两小时冷却结束后再次触发才通知；冷却期静默，恢复正常后重新越线视为首次。运行中或查询未知的任务跳过并在触发简报注明；clean-tmp 与 cron 共用 `clean_tmp_runner.py`，非阻塞锁由后台执行链持有到结束，两盘同时越线合并为同一 worker 顺序执行两根；新入口用 `-I`，旧执行器仍用 `-B`（同目录依赖）。路径、timeout、预算与 JSONL 记账只有一个入口。派发后先保存冷却再通知，通知失败仍非零退出。`--dry-run` 仅打印计划，不写状态、不调用 BB 或包装器。真实触发 stdout 输出一行摘要，正常/冷却完全静默。每日 07:00 以 8 并发逐根计量 `/data` 顶层、`/data/system-tmp` 顶层、`/root/.bb` 各项，另测 `/var/tmp`、`/root/.cache`、`/data/bb-data/thread-storage` 和 `docker system df`；重点根和 BB 项先于 tmp 项排队；普通文件/符号链接直接读 lstat 的已分配块数，只有目录 fork du。每根最多 60 秒、全轮最多 180 秒。超时/失败为未测，不当作 0 或参与比较；与上次结果比较，按实际间隔折算日增 Top5，重叠根不求和。只保留最近 30 天指标。每日检查仅在 unknown 来源单根折算日增 ≥1 GiB，或已登记来源单根折算日增 >20 GiB 时通知协调线程；较小正增长仍列入 Top5。
 
 - 同一对象跨扫描批次出现时，先按路径/物理身份合并；单独运行的`du`不跨调用去重硬链接，
   路径实占相加不能称文件系统物理下界或独占可回收量。登记worktree按目标device区分主checkout、
@@ -252,7 +252,8 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 ### 增长计量的路径指纹
 
-以下为上述已知来源中可仅凭路径确认归属的部分，供 `storage_growth_measure.py` 读取。
+以下为上述已知来源中可仅凭路径确认归属的部分。发布时将表复制为 `storage_growth_fingerprints.md`，
+与 `storage_growth_measure.py` 同目录入 manifest；运行仅读该快照内副本，规则修改须重新发布。
 BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/code`、`/root/.cache`）、
 匿名数据库卷和泛称 Go 缓存仍需内容/进程证据，不凭目录名套用项目归属，未匹配为 `unknown`。
 
