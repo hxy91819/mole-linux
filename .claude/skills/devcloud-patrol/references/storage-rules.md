@@ -127,6 +127,10 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 ## 盘点的计量与只读要求
 
+### 水位刹车与增长归因（2026-11-14）
+
+每 15 分钟读取 `/` 与 `/data` 的 `statvfs` 可用字节；低于 150 GiB 预警、低于 50 GiB 危险。首次越线、warning→danger 升级或两小时冷却结束后再次触发才通知；冷却期静默，恢复正常后重新越线视为首次。运行中或查询未知的任务跳过并在触发简报注明；clean-tmp 与 cron 共用 `clean_tmp_runner.py`，非阻塞锁由后台执行链持有到结束，两盘同时越线合并为同一 worker 顺序执行两根；新入口用 `-I`，旧执行器仍用 `-B`（同目录依赖）。路径、timeout、预算与 JSONL 记账只有一个入口。派发后先保存冷却再通知，通知失败仍非零退出。`--dry-run` 仅打印计划，不写状态、不调用 BB 或包装器。真实触发 stdout 输出一行摘要，正常/冷却完全静默。每日 07:00 以 8 并发逐根计量 `/data` 顶层、`/data/system-tmp` 顶层、`/root/.bb` 各项，另测 `/var/tmp`、`/root/.cache`、`/data/bb-data/thread-storage` 和 `docker system df`；重点根和 BB 项先于 tmp 项排队；普通文件/符号链接直接读 lstat 的已分配块数，只有目录 fork du。每根最多 60 秒、全轮最多 180 秒。超时/失败为未测，不当作 0 或参与比较；与上次结果比较，按实际间隔折算日增 Top5，重叠根不求和。只保留最近 30 天指标。每日检查遇到正增长的 unknown 来源或单根折算日增超过 20 GiB 时通知协调线程。
+
 - 同一对象跨扫描批次出现时，先按路径/物理身份合并；单独运行的`du`不跨调用去重硬链接，
   路径实占相加不能称文件系统物理下界或独占可回收量。登记worktree按目标device区分主checkout、
   附加worktree及异盘，再与output/ops/tmp父scope去重。未完成扫描是unknown，不是recent；
@@ -246,6 +250,28 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 用内容、运行状态和路径证据确认归属。本机例子见 `.local/devcloud/publication-backup/.claude/skills/devcloud-patrol/references/storage-rules.md`。
 
+### 增长计量的路径指纹
+
+以下为上述已知来源中可仅凭路径确认归属的部分，供 `storage_growth_measure.py` 读取。
+BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/code`、`/root/.cache`）、
+匿名数据库卷和泛称 Go 缓存仍需内容/进程证据，不凭目录名套用项目归属，未匹配为 `unknown`。
+
+<!-- growth-fingerprints -->
+| 路径指纹 | 归属 |
+|---|---|
+| `/data/itfs` | itfs |
+| `/data/.pnpm-store` | pnpm store |
+| `/data/codex` | Codex sessions |
+| `/data/bb-data` | BB |
+| `/data/bb-data/thread-storage` | BB thread storage |
+| `/root/.bb/*` | BB |
+| `/data/system-tmp/oc-local-smoke-*` | opencraft |
+| `/data/system-tmp/saiens_bundle*` | SaiensCreditSystemRails |
+| `/data/system-tmp/saienscreditsystemrails_*` | SaiensCreditSystemRails |
+| `/data/system-tmp/fast-feedback-rules-followup_*` | SaiensCreditSystemRails |
+| `/data/system-tmp/scan-preview-drag-experiment_*` | SaiensCreditSystemRails |
+<!-- /growth-fingerprints -->
+
 ## 包缓存
 
 - `/data/.pnpm-store` 这类 package store 是 owner 管理的缓存，不是通用递归
@@ -265,7 +291,7 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 - **owner 2026-11-14 批准**：`/tmp` 即 `/data/system-tmp` 的 bind mount（数据盘），
   `/var/tmp` 是系统盘普通目录；两根普通项整树闲置 3 天、结构缓存满 24h，自动清理由
-  每日北京时间 03:30 cron 执行（crontab `# devcloud-clean-tmp` 行）：外层 timeout 1790 秒，
+  每日北京时间 03:30 cron 与水位刹车共用不可变快照内 `clean_tmp_runner.py`（crontab `# devcloud-clean-tmp` 行）。包装器持 `/var/lib/devcloud-storage-upkeep/clean-tmp.lock`，子进程继承 fd，锁忙不等待；外层 timeout 1790 秒，
   顺序执行 `/usr/bin/python3 -B <执行器> clean-tmp --path <固定根> --execute --age-days 3 --json`，
   先 `/var/tmp`（内部预算 300 秒、timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒、timeout 1435 秒），
   均 kill-after 10 秒，外层仍为 1790 秒。
