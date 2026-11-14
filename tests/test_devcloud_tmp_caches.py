@@ -15,6 +15,7 @@ spec.loader.exec_module(fixtures)
 m = fixtures.m
 
 
+@unittest.skipUnless(fixtures.sys.platform.startswith('linux'), 'Linux /proc and renameat2 contract')
 class CacheTests(unittest.TestCase):
     setUp = fixtures.CleanupTests.setUp
     old = fixtures.CleanupTests.old
