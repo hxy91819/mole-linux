@@ -121,6 +121,137 @@ class CleanupTests(unittest.TestCase):
             code = m.main(args + ['--json'])
         return code, json.loads(out.getvalue())
 
+    def var_tmp_cli(self):
+        # Approved root and staging live on the fixture filesystem; real planning,
+        # isolation, receipts and final guards run with host evidence and Mole stubbed.
+        def sink(receipt, item, preview, deadline=None):
+            if not preview:
+                item.unlink()  # Only the fixture this test created.
+        with mock.patch.object(m, 'TMP_ROOT', self.base / 'data-tmp'), \
+                mock.patch.object(m, 'VAR_TMP_ROOT', self.root, create=True), \
+                mock.patch.object(m, 'VAR_STATE', self.state, create=True), \
+                mock.patch.object(m, 'trusted'), \
+                mock.patch.object(m, 'validate_data_mount', create=True), \
+                mock.patch.object(m, 'process_snapshot', return_value=self.live), \
+                mock.patch.object(m, 'owner_delete', side_effect=sink):
+            return self.run_cli(['--path', str(self.root), '--execute'])
+
+    def test_var_tmp_systemd_private_is_retained(self):
+        path = self.old('systemd-private-fixture')
+        code, output = self.var_tmp_cli()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output['path'], str(self.root))
+        self.assertEqual(output['skipped']['protected name'], 1)
+        self.assertTrue(path.exists())
+
+    def test_var_tmp_git_tree_is_retained(self):
+        path = self.old('repository/.git')
+        code, output = self.var_tmp_cli()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output['path'], str(self.root))
+        self.assertEqual(output['skipped']['repository or persistent state'], 1)
+        self.assertTrue(path.exists())
+
+    def test_var_tmp_recent_tree_is_retained(self):
+        path = self.old('recent/new.log')
+        path.write_text('recent write')
+        code, output = self.var_tmp_cli()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output['path'], str(self.root))
+        self.assertEqual(output['skipped']['recent descendant'], 1)
+        self.assertTrue(path.exists())
+
+    def test_var_tmp_live_reference_is_retained(self):
+        path = self.old('active.log')
+        self.live['reserved'].add('active.log')
+        code, output = self.var_tmp_cli()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output['path'], str(self.root))
+        self.assertEqual(output['skipped']['live or mount reference'], 1)
+        self.assertTrue(path.exists())
+
+    def test_var_tmp_eligible_item_is_deleted(self):
+        path = self.old('eligible.log')
+        code, output = self.var_tmp_cli()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output['path'], str(self.root))
+        self.assertEqual(output['deleted'], 1)
+        self.assertFalse(path.exists())
+
+    def test_var_tmp_unknown_process_evidence_denies_execution(self):
+        path = self.old('unknown.log')
+        with mock.patch.object(m, 'VAR_TMP_ROOT', self.root), \
+                mock.patch.object(m, 'VAR_STATE', self.state), mock.patch.object(m, 'trusted'), \
+                mock.patch.object(m, 'validate_data_mount', create=True), \
+                mock.patch.object(m, 'process_snapshot', side_effect=m.Refused('unknown PID')):
+            code, output = self.run_cli(['--path', str(self.root), '--execute'])
+        self.assertEqual(code, 2)
+        self.assertEqual(output['scan'], 'incomplete')
+        self.assertEqual(output['deleted'], 0)
+        self.assertTrue(path.exists())
+
+    def test_var_tmp_policy_uses_its_own_whitelist_and_not_tmp_alias(self):
+        self.old('keep.log')
+        self.old('eligible.log')
+        config = self.base / '.config/mole'
+        config.mkdir(parents=True)
+        (config / 'whitelist').write_text(f'{self.root}/keep.log\n/tmp/eligible.log\n')
+        with mock.patch.dict(os.environ, {'HOME': str(self.base)}):
+            code, output = self.var_tmp_cli()
+        self.assertEqual(code, 0, output)
+        self.assertEqual(output['deleted'], 1)
+        self.assertTrue((self.root / 'keep.log').exists())
+        self.assertFalse((self.root / 'eligible.log').exists())
+
+    def test_var_tmp_rejects_symlink_and_nonsticky_writable_root(self):
+        for mode, accepted in ((0o700, True), (0o1777, True), (0o777, False)):
+            self.root.chmod(mode)
+            with mock.patch.object(m, 'VAR_TMP_ROOT', self.root), mock.patch.object(m, 'trusted'), \
+                    mock.patch.object(m, 'validate_data_mount', create=True):
+                if accepted:
+                    self.assertEqual(m.validate_root(self.root), self.root)
+                else:
+                    with self.assertRaises(m.Refused):
+                        m.validate_root(self.root)
+        self.root.chmod(0o700)
+        alias = self.base / 'alias'
+        alias.symlink_to(self.root)
+        with mock.patch.object(m, 'VAR_TMP_ROOT', alias), mock.patch.object(m, 'trusted'), \
+                mock.patch.object(m, 'validate_data_mount', create=True):
+            with self.assertRaises(m.Refused):
+                m.validate_root(alias)
+
+    def test_var_tmp_rejects_same_device_bind_mount_root(self):
+        device = self.root.stat().st_dev
+        dev = f'{os.major(device)}:{os.minor(device)}'
+        mountinfo = f'1 0 {dev} / {self.base} rw - ext4 fixture rw\n' + \
+                    f'2 1 {dev} /elsewhere {self.root} rw - ext4 fixture rw\n'
+        with mock.patch.object(m, 'VAR_TMP_ROOT', self.root), mock.patch.object(m, 'trusted'), \
+                mock.patch.object(m, 'validate_data_mount', create=True), \
+                mock.patch.object(Path, 'read_text', return_value=mountinfo):
+            with self.assertRaises(m.Refused):
+                m.validate_root(self.root)
+
+    def test_var_tmp_requires_mounted_data_disk_for_its_audit_log(self):
+        with mock.patch.object(m, 'VAR_TMP_ROOT', self.root), mock.patch.object(m, 'trusted'):
+            with self.assertRaisesRegex(m.Refused, '/data is not a separate mounted filesystem'):
+                m.validate_root(self.root)
+
+    def test_var_tmp_staged_sink_reloads_original_path_whitelist(self):
+        stage = self.state / 'item-fixture'
+        stage.mkdir()
+        item = stage / 'keep.log'
+        item.write_text('retained fixture')
+        config = self.base / '.config/mole'
+        config.mkdir(parents=True)
+        (config / 'whitelist').write_text(f'{self.root}/keep.log\n')
+        with mock.patch.object(m, 'VAR_TMP_ROOT', self.root), \
+                mock.patch.object(m, 'VAR_STATE', self.state), \
+                mock.patch.dict(os.environ, {'HOME': str(self.base)}):
+            with self.assertRaisesRegex(m.Refused, 'Mole protection or whitelist'):
+                m.owner_delete(stage / 'receipt.json', item, preview=False)
+        self.assertEqual(item.read_text(), 'retained fixture')
+
     def test_old_temp_file_is_candidate_and_preview_does_not_remove(self):
         path = self.old('old.log')
         plan, _ = self.plan()

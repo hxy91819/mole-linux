@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Bounded cleanup of this host's approved temporary root; preview by default.
+"""Bounded cleanup of this host's approved temporary roots; preview by default.
 
 Used by devcloud.py clean-tmp. Parameters: --path /data/system-tmp (or its
-/tmp bind alias), --age-days >= 3, --execute, --json, --du, --limit.
+/tmp bind alias) or /var/tmp, --age-days >= 3, --execute, --json, --du, --limit.
 Outputs: one summary, including filesystem capacity; execute also writes a
 JSONL intent/result log. Exit 0 = completed/preview, 1 = partial/failed,
 2 = refused/unknown. No databases, migrations, or package-manager operations.
@@ -31,15 +31,17 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 TMP_ROOT = Path('/data/system-tmp')
+VAR_TMP_ROOT = Path('/var/tmp')
+VAR_STATE = Path('/var/lib/devcloud-maintenance')
 DATA_ROOT = Path('/data')
 PROC_ROOT = Path('/proc')
 STATE = Path('/data/metrics/devcloud-maintenance')
 LOG = Path('/data/metrics/devcloud-clean-tmp.log')
 REPO = Path(__file__).resolve().parent.parent
 # Host measurements: complete scans ~66-90s; guarded items ~2.4-6s each.
-# Keep the entire run below the cron TERM/KILL envelope of 1790s + 10s.
+# Cron runs the two roots sequentially: 2 * 840s < its 1790s TERM envelope.
 SCAN_SECONDS = 240
-RUN_SECONDS = 1740
+RUN_SECONDS = 840
 # Leave time for the existing per-item probes, Mole calls and restoration.
 ITEM_RUN_RESERVE_SECONDS = 120
 ITEM_SECONDS = 5
@@ -118,12 +120,37 @@ def capacity():
     return rows
 
 
-def validate_root(requested):
-    if requested not in (TMP_ROOT, Path('/tmp')):
-        raise Refused('only /data/system-tmp and its verified /tmp bind alias are allowed')
-    trusted(TMP_ROOT)
+def state_for(root):
+    return VAR_STATE if root == VAR_TMP_ROOT else STATE
+
+
+def policy_alias(root):
+    return root if root == VAR_TMP_ROOT else Path('/tmp')
+
+
+def validate_data_mount():
     if not DATA_ROOT.is_mount() or DATA_ROOT.stat().st_dev == Path('/').stat().st_dev:
         raise Refused('/data is not a separate mounted filesystem')
+
+
+def validate_root(requested):
+    if requested == VAR_TMP_ROOT:
+        validate_data_mount()
+        trusted(requested.parent)
+        # is_mount() misses same-device bind mounts; use kernel mount targets.
+        mounts = parse_mounts((PROC_ROOT / 'self/mountinfo').read_text())
+        if any(destination == str(requested) for _, _, destination in mounts):
+            raise Refused('/var/tmp must not be a mount point')
+        root = requested.lstat()
+        if (not stat.S_ISDIR(root.st_mode) or root.st_uid != 0
+                or (root.st_mode & 0o022 and not root.st_mode & stat.S_ISVTX)
+                or root.st_dev != Path('/').stat().st_dev or requested.is_mount()):
+            raise Refused('/var/tmp must be a root-owned system-disk directory (sticky if writable), not a mount')
+        return requested
+    if requested not in (TMP_ROOT, Path('/tmp')):
+        raise Refused('only /var/tmp, /data/system-tmp and its verified /tmp bind alias are allowed')
+    trusted(TMP_ROOT)
+    validate_data_mount()
     root = TMP_ROOT.stat()
     if root.st_dev != DATA_ROOT.stat().st_dev:
         raise Refused('temporary root is not on the data filesystem')
@@ -343,7 +370,7 @@ def mole_environment(preview):
 
 def _policy_shard(command, root, chunk, timeout):
     """Run the unchanged policy script over one shard; fail closed on any error."""
-    result = subprocess.run(['/bin/bash', '-c', command, 'devcloud-policy', str(REPO), str(root)],
+    result = subprocess.run(['/bin/bash', '-c', command, 'devcloud-policy', str(REPO), str(root), str(policy_alias(root))],
                             input=''.join(name + '\0' for name in chunk).encode(),
                             capture_output=True, env=mole_environment(True), timeout=timeout)
     if result.returncode:
@@ -357,7 +384,7 @@ def policy_candidates(root, names, deadline):
         return set()
     checkpoint(deadline)
     command = MOLE_POLICY + '''while IFS= read -r -d '' name; do
-    if tmp_original_allowed "$2/$name" "/tmp/$name" > /dev/null 2>&1; then
+    if tmp_original_allowed "$2/$name" "$3/$name" > /dev/null 2>&1; then
         printf '%s\\0' "$name"
     fi
 done
@@ -408,7 +435,7 @@ def write_receipt(path, record):
 
 def final_guard(receipt):
     trusted(receipt.parent)
-    if (receipt.name != 'receipt.json' or receipt.parent.parent != STATE
+    if (receipt.name != 'receipt.json' or receipt.parent.parent not in (STATE, VAR_STATE)
             or not receipt.parent.name.startswith('item-')):
         raise Refused('invalid cleanup receipt location')
     s = receipt.lstat()
@@ -417,10 +444,11 @@ def final_guard(receipt):
     record = json.loads(receipt.read_text())
     if record['name'] in ('', '.', '..', 'receipt.json') or Path(record['name']).name != record['name']:
         raise Refused('invalid staged name')
-    if (record.get('source') != str(TMP_ROOT / record['name'])
+    root = VAR_TMP_ROOT if receipt.parent.parent == VAR_STATE else TMP_ROOT
+    if (record.get('source') != str(root / record['name'])
             or not math.isfinite(record['cutoff']) or record['cutoff'] > time.time() - 3 * 86400):
         raise Refused('receipt is outside the approved path or retention policy')
-    validate_root(TMP_ROOT)
+    validate_root(root)
     item = receipt.parent / record['name']
     if item.parent != receipt.parent or item.name != record['name']:
         raise Refused('invalid staged item')
@@ -447,9 +475,10 @@ tmp_clean_final_guard() { /usr/bin/python3 -B "$TMP_CLEAN_SCRIPT" _guard "$TMP_C
 _MOLE_SAFE_REMOVE_FINAL_GUARD=tmp_clean_final_guard
 mole_delete "$4" false
 '''
+    root = VAR_TMP_ROOT if receipt.parent.parent == VAR_STATE else TMP_ROOT
     child = subprocess.Popen(['/bin/bash', '-c', command, 'devcloud-clean', str(REPO),
                               str(Path(__file__).resolve()), str(receipt), str(item),
-                              str(TMP_ROOT / item.name), str(Path('/tmp') / item.name)],
+                              str(root / item.name), str(policy_alias(root) / item.name)],
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=mole_environment(preview), start_new_session=True)
     try:
@@ -489,7 +518,7 @@ def execute_item(root, candidate, cutoff, deadline):
                             min(deadline, time.monotonic() + ITEM_SECONDS))
     if current != {key: candidate[key] for key in ('fingerprint', 'bytes', 'entries')}:
         raise Refused('candidate changed since preview')
-    stage = Path(tempfile.mkdtemp(prefix='item-', dir=STATE))
+    stage = Path(tempfile.mkdtemp(prefix='item-', dir=state_for(root)))
     item, receipt = stage / name, stage / 'receipt.json'
     if name == receipt.name:
         stage.rmdir()
@@ -497,7 +526,7 @@ def execute_item(root, candidate, cutoff, deadline):
     record = {**candidate, 'cutoff': cutoff, 'source': str(root / name)}
     try:
         write_receipt(receipt, record)
-        append_log({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'intent', **record, 'staged': str(item)})
+        append_log({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'intent', **record, 'path': str(root / name), 'staged': str(item)})
         # 根目录 cwd 不代表每个子项在用；隔离移除旧入口，再检查旧对象的实际引用。
         rename_exclusive(root / name, item)
         final_guard(receipt)
@@ -535,7 +564,7 @@ def _main(argv=None):
     parser.add_argument('--limit', type=int, default=40, help='maximum candidate names displayed')
     options = parser.parse_args(args)
     summary = {'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'summary',
-               'mode': 'execute' if options.execute else 'preview', 'path': str(TMP_ROOT),
+               'mode': 'execute' if options.execute else 'preview', 'path': str(options.path),
                'age_days': options.age_days if math.isfinite(options.age_days) else None,
                'deleted': 0, 'failed': 0}
     lock = None
@@ -547,20 +576,22 @@ def _main(argv=None):
         if not math.isfinite(options.age_days) or options.age_days < 3 or options.limit < 0:
             raise Refused('age must be finite and >= 3 days; display limit must be nonnegative')
         root = validate_root(options.path)
+        summary['path'] = str(root)
+        state = state_for(root)
         if options.execute:
-            trusted(STATE.parent)
-            STATE.mkdir(mode=0o700, exist_ok=True)
-            trusted(STATE)
-            if STATE.stat().st_dev != root.stat().st_dev:
+            trusted(state.parent)
+            state.mkdir(mode=0o700, exist_ok=True)
+            trusted(state)
+            if state.stat().st_dev != root.stat().st_dev:
                 raise Refused('staging must be on the temporary filesystem')
-            lock = os.open(STATE / 'cleanup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+            lock = os.open(state / 'cleanup.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
             metadata = os.fstat(lock)
             if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
                     or metadata.st_mode & 0o022 or metadata.st_nlink != 1):
                 raise Refused('unsafe maintenance lock')
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             locked = True
-            pending = [str(p) for p in STATE.glob('item-*')]
+            pending = [str(p) for p in state.glob('item-*')]
             if pending:
                 raise Refused(f'unresolved staging receipt; review before continuing: {pending[0]}')
         cutoff = time.time() - options.age_days * 86400
