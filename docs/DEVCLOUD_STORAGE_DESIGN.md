@@ -281,8 +281,8 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
 - `/root/.bb` 在系统盘，放 `bb.db`（2026-11-14 约 12.7 GB）、artifacts、插件和部署检查点；
   `/root/.bb/thread-storage` 软链到 `/data/bb-data/thread-storage`，放线程产物和共享缓存。
   BB 自有数据（主库、artifacts）不在自动清理范围；只有 `.shared-cache` 由本仓修剪。
-- `bb environment delete <id>` 只清理环境记录和 attempt 标记，**不删除任何 Git 分支、ref
-  或目录**。路径已不存在时插件只清记录；仍有未归档线程时服务端返回 HTTP 409
+- `bb environment delete <id>` 只清理环境记录和 attempt 标记，**不删除 Git 分支或 ref**。
+  本仓只在 worktree 已删除或路径已不存在时调用；路径仍存在时不调用 delete。仍有未归档线程时服务端返回 HTTP 409
   `Environment still has live threads`，保留，下一轮自然补齐。
 - `worktree_sweep.py` 每轮在成功删除 worktree 后，按 `path` 精确全等处理未 `destroyed` 的
   BB 环境；每轮每个环境只尝试一次，被拒绝记原因、不重试、不令脚本失败；`bb` 不可用时
