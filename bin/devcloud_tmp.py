@@ -294,22 +294,23 @@ def process_snapshot(root, deadline, known=None):
                     processes.append({'pid': int(proc.name), 'via': sorted(via),
                                       'cmdline': (proc / 'comm').read_text().strip()})
                 break
-            except (FileNotFoundError, ProcessLookupError, PermissionError):
+            except OSError as error:
                 try:
                     current = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
                     if current[0] == 'Z' or (original_start is not None and current[19] != original_start):
                         break
                     if attempt == 3:
-                        raise Refused(f'incomplete evidence for live PID {proc.name}')
+                        raise Refused(f'incomplete evidence for live PID {proc.name}: '
+                                      f'{type(error).__name__} errno={error.errno}') from error
                 except (FileNotFoundError, ProcessLookupError):
                     break
                 # Exiting or execing processes can temporarily lose /proc access
-                # (including EACCES while non-dumpable) before becoming zombies.
+                # (including EACCES/EIO/EINVAL) before becoming zombies.
                 # Retry the complete probe, bounded by both count and scan deadline.
                 checkpoint(deadline)
                 time.sleep(min(0.1, max(0, deadline - time.monotonic())))
                 checkpoint(deadline)
-            except (OSError, ValueError, KeyError, IndexError) as error:
+            except (ValueError, KeyError, IndexError) as error:
                 raise Refused(f'cannot inspect PID {proc.name}: {type(error).__name__}') from error
     return {'reserved': reserved, 'watches': watches, 'processes': processes, 'identities': identities}
 
