@@ -27,7 +27,7 @@
 3. /tmp 与 /var/tmp 清理（cron 每天 03:30）。`/data/metrics/devcloud-clean-tmp.log` 每行一个 JSON。分别按 `path` 为 `/data/system-tmp` 和 `/var/tmp`，找 `ts` 晚于最近一次 03:30 的第一条 `"event": "summary"`；两根各自都必须存在，`status` 为 `ok`，`failed` 为 0，`scan` 为 `complete`。缺任一根的 summary 都算不符合。`deferred` 大于 0 是预算递延，属于正常。再看 `/data/metrics/devcloud-clean-tmp.stderr.log` 的修改时间：晚于最近一次 03:30 就算不符合，并贴出它的末尾 20 行。
 4. systemd-tmpfiles 不再按年龄清 /tmp。`/etc/tmpfiles.d/tmp.conf` 里 `/tmp` 那一行的第 6 列（年龄）是 `-`；`systemctl show systemd-tmpfiles-clean.service -p Result --value` 输出 `success`。
 5. 两块盘的容量。`df -B1 --output=avail /data` 和 `df -B1 --output=avail /`（系统盘）的可用字节都不少于 161061273600（150 GiB）。
-6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`ts` 距 NOW 不超过 25 小时，逐项列出 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`，并列 `unknown_count`，未测根按原因汇总，最多列 5 个路径示例。按 storage-rules「已知来源指纹／增长计量的路径指纹」核对归属；unknown 不猜测项目。`comparisons` 只允许前后两次均为 ok 且有 bytes 的根；未测不得当 0，不叠加父子根。`alerts` 中有正增长的未登记来源，或单根折算日增超过 21474836480（20 GiB），算不符合并通知协调线程；指标过期或缺失也算不符合；首次基线没有前次样本时说明尚无比较，不把缺少基线当作零增长。
+6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`ts` 距 NOW 不超过 25 小时，逐项列出 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`，并列 `unknown_count`，未测根按原因汇总，最多列 5 个路径示例。按当前计量任务指向快照内的 `storage_growth_fingerprints.md`（发布时取自 storage-rules「已知来源指纹／增长计量的路径指纹」）核对归属；unknown 不猜测项目。`comparisons` 只允许前后两次均为 ok 且有 bytes 的根；未测不得当 0，不叠加父子根。`alerts` 中未登记来源（owner=unknown）的单根折算日增不少于 1073741824（1 GiB），或已登记来源的单根折算日增超过 21474836480（20 GiB），算不符合并通知协调线程；指标过期或缺失也算不符合；首次基线没有前次样本时说明尚无比较，不把缺少基线当作零增长。
 
 ## 结果
 
