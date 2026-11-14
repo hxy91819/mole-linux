@@ -10,6 +10,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import time
@@ -521,6 +522,219 @@ class WorktreeSweepTests(unittest.TestCase):
         self.assertNotIn('unmeasured', seg)
         self.assertTrue(kept.exists(), out)
 
+    def _install_fake_bb_and_git(self, state_file, *, fail_mode=''):
+        bindir = Path(self.temp.name) / 'fake-bin'
+        bindir.mkdir(exist_ok=True)
+        real_git = shutil.which('git')
+        assert real_git
+        git_wrapper = bindir / 'git'
+        git_wrapper.write_text(
+            '#!/usr/bin/env python3\n'
+            'import json, os, subprocess, sys\n'
+            'log_path = os.environ.get("FAKE_GIT_LOG")\n'
+            'if log_path:\n'
+            '    with open(log_path, "a", encoding="utf-8") as fh:\n'
+            '        fh.write(json.dumps(sys.argv[1:]) + "\\n")\n'
+            f'os.execv("{real_git}", ["{real_git}"] + sys.argv[1:])\n'
+        )
+        git_wrapper.chmod(0o755)
+        bb = bindir / 'bb'
+        bb.write_text(
+            '#!/usr/bin/env python3\n'
+            'import json, os, sys\n'
+            'state_path = os.environ["FAKE_BB_STATE"]\n'
+            'fail_mode = os.environ.get("FAKE_BB_FAIL", "")\n'
+            'with open(state_path, "r", encoding="utf-8") as fh:\n'
+            '    state = json.load(fh)\n'
+            'args = sys.argv[1:]\n'
+            'state.setdefault("calls", []).append(args)\n'
+            'with open(state_path, "w", encoding="utf-8") as fh:\n'
+            '    json.dump(state, fh)\n'
+            'if args[:3] == ["thread", "list", "--include-hidden"]:\n'
+            '    print(json.dumps(state.get("threads", [])))\n'
+            '    sys.exit(0)\n'
+            'if args[:2] == ["environment", "list"]:\n'
+            '    if fail_mode == "env_list":\n'
+            '        sys.stderr.write("bb server unreachable\\n")\n'
+            '        sys.exit(1)\n'
+            '    print(json.dumps([e for e in state.get("environments", []) if e.get("status") != "destroyed"]))\n'
+            '    sys.exit(0)\n'
+            'if args[:2] == ["environment", "delete"]:\n'
+            '    if fail_mode == "env_delete":\n'
+            '        sys.stderr.write("bb rpc timeout\\n")\n'
+            '        sys.exit(1)\n'
+            '    env_id = args[2]\n'
+            '    for env in state.get("environments", []):\n'
+            '        if env["id"] == env_id:\n'
+            '            if env.get("refuse"):\n'
+            '                sys.stderr.write(env["refuse"] + "\\n")\n'
+            '                sys.exit(1)\n'
+            '            env["status"] = "destroyed"\n'
+            '            with open(state_path, "w", encoding="utf-8") as fh:\n'
+            '                json.dump(state, fh)\n'
+            '            print(json.dumps({"ok": True}))\n'
+            '            sys.exit(0)\n'
+            '    sys.stderr.write("Environment not found\\n")\n'
+            '    sys.exit(1)\n'
+            'sys.stderr.write(f"unexpected bb command: {args}\\n")\n'
+            'sys.exit(2)\n'
+        )
+        bb.chmod(0o755)
+        env = dict(
+            m.ENV,
+            PATH=str(bindir) + os.pathsep + m.ENV.get('PATH', os.environ.get('PATH', '')),
+            FAKE_BB_STATE=str(state_file),
+            FAKE_BB_FAIL=fail_mode,
+            FAKE_GIT_LOG=str(Path(self.temp.name) / 'fake-git-calls.jsonl'),
+        )
+        return env
+
+    def _sweep_with_bb(self, env, *extra):
+        out = io.StringIO()
+        with mock.patch.object(m, 'ENV', env), contextlib.redirect_stdout(out):
+            rc = m.main(['--root', str(self.code), '--state-dir', str(self.state), *extra])
+        return rc, out.getvalue()
+
+    def _jsonl_rows(self):
+        logs = sorted(Path(self.state).glob('worktree-sweep-*.jsonl'))
+        self.assertTrue(logs)
+        return [json.loads(line) for line in logs[-1].read_text().splitlines() if line.strip()]
+
+    def test_matching_bb_environment_is_deleted_with_recovery_command_after_worktree_removal(self):
+        wt = self.add_worktree('bb-clean')
+        head = sh('git', 'rev-parse', 'HEAD', cwd=wt)
+        self.age(wt)
+        state_file = Path(self.temp.name) / 'bb-state.json'
+        state_file.write_text(json.dumps({
+            'threads': [],
+            'environments': [
+                {'id': 'env_match', 'name': 'clean-env', 'path': str(wt), 'status': 'ready'},
+                {'id': 'env_already', 'name': 'old-env', 'path': str(wt), 'status': 'destroyed'},
+            ],
+        }))
+        env = self._install_fake_bb_and_git(state_file)
+        rc, out = self._sweep_with_bb(env, '--idle-hours', '1', '--execute')
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(wt.exists())
+        saved = json.loads(state_file.read_text())
+        by_id = {e['id']: e for e in saved['environments']}
+        self.assertEqual(by_id['env_match']['status'], 'destroyed')
+        delete_calls = [c for c in saved['calls'] if c[:2] == ['environment', 'delete']]
+        self.assertEqual([c[2] for c in delete_calls], ['env_match'])
+        git_calls = [
+            json.loads(line)
+            for line in Path(env['FAKE_GIT_LOG']).read_text().splitlines()
+            if line.strip()
+        ]
+        self.assertTrue(any('worktree' in c and 'remove' in c and str(wt) in c for c in git_calls))
+        rows = self._jsonl_rows()
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertEqual(row['result'], 'removed')
+        self.assertIn('git fetch ', row.get('recovery_command', ''))
+        self.assertIn(f'git worktree add ', row['recovery_command'])
+        self.assertIn(str(wt), row['recovery_command'])
+        self.assertIn(head, row['recovery_command'])
+        self.assertEqual(row.get('bb_environments'), [{'id': 'env_match', 'action': 'delete', 'result': 'deleted'}])
+
+    def test_non_exact_bb_environment_paths_are_untouched(self):
+        wt = self.add_worktree('exact')
+        self.age(wt)
+        state_file = Path(self.temp.name) / 'bb-nonexact.json'
+        state_file.write_text(json.dumps({
+            'threads': [],
+            'environments': [
+                {'id': 'env_parent', 'name': 'parent', 'path': str(wt.parent), 'status': 'ready'},
+                {'id': 'env_child', 'name': 'child', 'path': str(wt / 'sub'), 'status': 'ready'},
+                {'id': 'env_sibling', 'name': 'sibling', 'path': str(wt) + '-2', 'status': 'ready'},
+                {'id': 'env_main', 'name': 'main', 'path': str(self.main), 'status': 'ready'},
+            ],
+        }))
+        env = self._install_fake_bb_and_git(state_file)
+        rc, out = self._sweep_with_bb(env, '--idle-hours', '1', '--execute')
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(wt.exists())
+        saved = json.loads(state_file.read_text())
+        self.assertEqual([c for c in saved['calls'] if c[:2] == ['environment', 'delete']], [])
+        for item in saved['environments']:
+            self.assertEqual(item['status'], 'ready')
+        row = self._jsonl_rows()[0]
+        self.assertEqual(row.get('bb_environments'), [])
+        self.assertIn('git worktree add ', row.get('recovery_command', ''))
+
+    def test_refused_bb_environment_delete_is_logged_and_not_retried(self):
+        wt = self.add_worktree('bb-refused', commit='local work')
+        self.age(wt)
+        state_file = Path(self.temp.name) / 'bb-refused.json'
+        state_file.write_text(json.dumps({
+            'threads': [],
+            'environments': [
+                {
+                    'id': 'env_live',
+                    'name': 'live-env',
+                    'path': str(wt),
+                    'status': 'ready',
+                    'refuse': 'Environment still has live threads',
+                },
+            ],
+        }))
+        env = self._install_fake_bb_and_git(state_file)
+        rc, out = self._sweep_with_bb(env, '--idle-hours', '1', '--execute')
+        self.assertEqual(rc, 0, out)
+        self.assertFalse(wt.exists())
+        saved = json.loads(state_file.read_text())
+        delete_calls = [c for c in saved['calls'] if c[:2] == ['environment', 'delete']]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertEqual(saved['environments'][0]['status'], 'ready')
+        row = self._jsonl_rows()[0]
+        self.assertEqual(row['result'], 'removed')
+        self.assertIn('refs/heads/archive/worktree/bb-refused-', row.get('recovery_command', ''))
+        self.assertIn(row['recovery']['sha'], row['recovery_command'])
+        envs = row.get('bb_environments') or []
+        self.assertEqual(len(envs), 1)
+        self.assertEqual(envs[0]['id'], 'env_live')
+        self.assertEqual(envs[0]['result'], 'refused')
+        self.assertIn('Environment still has live threads', envs[0].get('reason', ''))
+
+    def test_bb_failure_does_not_block_worktree_deletion_and_logs_error(self):
+        for fail_mode in ('env_list', 'env_delete', 'missing_binary'):
+            with self.subTest(fail_mode=fail_mode):
+                wt = self.add_worktree(f'bb-down-{fail_mode}')
+                self.age(wt)
+                state_file = Path(self.temp.name) / f'bb-down-{fail_mode}.json'
+                state_file.write_text(json.dumps({
+                    'threads': [],
+                    'environments': [
+                        {'id': 'env_down', 'name': 'down-env', 'path': str(wt), 'status': 'ready'},
+                    ],
+                }))
+                env = self._install_fake_bb_and_git(state_file, fail_mode=fail_mode)
+                if fail_mode == 'missing_binary':
+                    orig_execute = m.execute_item
+                    no_bb_path = os.pathsep.join(
+                        p for p in os.environ.get('PATH', '').split(os.pathsep)
+                        if not (Path(p) / 'bb').exists()
+                    )
+
+                    def remove_bb_during_execute(repo, item, stamp, bb_envs=None):
+                        (Path(self.temp.name) / 'fake-bin' / 'bb').unlink(missing_ok=True)
+                        env['PATH'] = str(Path(self.temp.name) / 'fake-bin') + os.pathsep + no_bb_path
+                        return orig_execute(repo, item, stamp, bb_envs)
+
+                    with mock.patch.object(m, 'execute_item', side_effect=remove_bb_during_execute):
+                        rc, out = self._sweep_with_bb(env, '--idle-hours', '1', '--execute')
+                else:
+                    rc, out = self._sweep_with_bb(env, '--idle-hours', '1', '--execute')
+                self.assertEqual(rc, 0, out)
+                self.assertFalse(wt.exists())
+                row = [r for r in self._jsonl_rows() if r['path'] == str(wt)][0]
+                self.assertEqual(row['result'], 'removed')
+                self.assertIn('git worktree add ', row.get('recovery_command', ''))
+                has_err = bool(row.get('bb_environment_error')) or any(
+                    e.get('result') == 'failed' for e in (row.get('bb_environments') or [])
+                )
+                self.assertTrue(has_err, row)
+
 
 def _load_docker_leftovers():
     spec = importlib.util.spec_from_file_location(
@@ -937,16 +1151,16 @@ class GoCacheTrimTests(unittest.TestCase):
         return rc, out.getvalue(), err.getvalue()
 
     def test_old_go_cache_entries_are_deleted(self):
-        old_a = self.entry(1, 'a', 3, b'aaa')
-        old_d = self.entry(2, 'd', 5, b'dddd')
+        old_a = self.entry(1, 'a', 25, b'aaa')
+        old_d = self.entry(2, 'd', 30, b'dddd')
         kept_root = self.cache / (('cd' * 32) + '-a')
         kept_root.write_bytes(b'root')
-        os.utime(kept_root, (time.time() - 5 * 3600, time.time() - 5 * 3600))
+        os.utime(kept_root, (time.time() - 30 * 3600, time.time() - 30 * 3600))
         other = self.cache / 'not-a-bucket'
         other.mkdir()
         kept_other = other / (('ef' * 32) + '-a')
         kept_other.write_bytes(b'other')
-        os.utime(kept_other, (time.time() - 5 * 3600, time.time() - 5 * 3600))
+        os.utime(kept_other, (time.time() - 30 * 3600, time.time() - 30 * 3600))
         rc, out, err = self.run_trim('--execute')
         self.assertEqual(rc, 0, out + err)
         self.assertFalse(old_a.exists())
@@ -956,7 +1170,7 @@ class GoCacheTrimTests(unittest.TestCase):
         self.assertIn('deleted 2', out)
 
     def test_recent_go_cache_entries_are_kept(self):
-        recent = self.entry(3, 'a', 0.5, b'new')
+        recent = self.entry(3, 'a', 23, b'new')
         rc, out, err = self.run_trim('--execute')
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(recent.read_bytes(), b'new')
@@ -964,7 +1178,7 @@ class GoCacheTrimTests(unittest.TestCase):
     def test_non_matching_go_cache_names_are_kept(self):
         directory = self.cache / '0a'
         directory.mkdir()
-        when = time.time() - 5 * 3600
+        when = time.time() - 30 * 3600
         kept = {}
         for name, body in (
             ('notes.txt', b'notes'),
@@ -995,7 +1209,7 @@ class GoCacheTrimTests(unittest.TestCase):
         directory.mkdir()
         link = directory / (('12' * 32) + '-a')
         link.symlink_to(target)
-        when = time.time() - 5 * 3600
+        when = time.time() - 30 * 3600
         os.utime(link, (when, when), follow_symlinks=False)
         rc, out, err = self.run_trim('--execute')
         self.assertEqual(rc, 0, out + err)
@@ -1004,20 +1218,20 @@ class GoCacheTrimTests(unittest.TestCase):
 
     def test_missing_go_cache_readme_deletes_nothing_and_exits_1(self):
         (self.cache / 'README').unlink()
-        old = self.entry(4, 'a', 4, b'keep-me')
+        old = self.entry(4, 'a', 30, b'keep-me')
         rc, out, err = self.run_trim('--execute', '--quiet')
         self.assertEqual(rc, 1, out + err)
         self.assertEqual(old.read_bytes(), b'keep-me')
         self.assertTrue(out or err)
 
     def test_go_cache_dry_run_deletes_nothing(self):
-        old = self.entry(5, 'd', 4, b'dry')
+        old = self.entry(5, 'd', 30, b'dry')
         rc, out, err = self.run_trim()
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(old.read_bytes(), b'dry')
 
     def test_go_cache_quiet_is_silent_when_nothing_is_deleted(self):
-        self.entry(6, 'a', 0.25, b'fresh')
+        self.entry(6, 'a', 23, b'fresh')
         rc, out, err = self.run_trim('--execute', '--quiet')
         self.assertEqual(rc, 0)
         self.assertEqual(out, '')

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Delete Go build-cache entries that have not been used for two hours.
+"""Delete Go build-cache entries that have not been used for 24 hours.
 
 Default is a dry run. ``--execute`` unlinks. Only regular files named
 ``<64 hex>-a`` or ``<64 hex>-d`` inside the 256 hash buckets are eligible.
@@ -18,9 +18,9 @@ import time
 
 # Go refreshes a cache entry's mtime to now when the entry is used and that
 # mtime is already older than one hour (cmd/go/internal/cache, mtimeInterval).
-# An entry whose mtime is older than two hours has therefore not been used in
-# the last hour, so a compile that is running now will not need it.
-MAX_AGE_SECONDS = 2 * 3600
+# Keeping entries for 24 hours preserves day-to-day rebuild reuse while still
+# pruning cold entries well after any running compile could need them.
+MAX_AGE_SECONDS = 24 * 3600
 ENTRY_NAME = re.compile(r"^[0-9a-f]{64}-[ad]$")
 README_FIRST_LINE = "This directory holds cached build artifacts from the Go build system."
 
@@ -111,7 +111,7 @@ def still_eligible(path, cutoff):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Delete unused Go build-cache entries older than two hours.")
+    parser = argparse.ArgumentParser(description="Delete unused Go build-cache entries older than 24 hours.")
     parser.add_argument("--execute", action="store_true", help="unlink; default is a dry run")
     parser.add_argument("--quiet", action="store_true", help="print nothing unless files were deleted or a command failed")
     args = parser.parse_args(argv)
