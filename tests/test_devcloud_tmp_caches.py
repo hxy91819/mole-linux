@@ -275,3 +275,25 @@ class CacheTests(unittest.TestCase):
             self.fail('initial cancellation was not raised')
         with mock.patch.object(m, '_main', side_effect=restoring):
             self.assertEqual(m.main([]), 2)
+
+    def test_proc_io_error_only_clears_when_exit_is_confirmed(self):
+        for errno in (5, 22):
+            for exiting in (False, True):
+                proc = self.fake_process(pid=900100 + errno * 2 + exiting)
+                original = Path.read_text
+                def failed(path, *args, **kwargs):
+                    if path == proc / 'maps':
+                        raise OSError(errno, 'fixture proc error')
+                    return original(path, *args, **kwargs)
+                def changes(_seconds):
+                    if exiting:
+                        (proc / 'stat').unlink()
+                with mock.patch.object(m, 'PROC_ROOT', self.proc), mock.patch.object(m.os, 'getppid', return_value=1), \
+                        mock.patch.object(Path, 'read_text', failed), mock.patch.object(m.time, 'sleep', side_effect=changes):
+                    if exiting:
+                        self.assertFalse(m.process_snapshot(self.root, time.monotonic() + 5)['reserved'])
+                    else:
+                        with self.assertRaises(m.Refused):
+                            m.process_snapshot(self.root, time.monotonic() + 5)
+                if not exiting:
+                    (proc / 'maps').write_text('')
