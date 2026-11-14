@@ -398,6 +398,20 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
 | 保留声明中的对象仍可能消失 | retained 是“不自动删”，不是监控；外部删除不会通知 | 每轮重新核对 retained ID；消失也要记录，不假定是自己的清理 | storage-rules「数据库卷」；ledger 2026-11-01 |
 | 同一目录不同轮次的“使用率”不可比 | 分母是否含 ext4 保留块不同；扩容后总量也变了 | 固定写 `used/total` 或 `used/(used+avail)`；跨扩容不直接比百分比 | storage-rules「临时目录与 worktree」；`bin/devcloud_tmp.py` |
 
+**没有写成规则的未核实项**：这些只留在本机账本，作为调查线索，不当作容量结论或删除授权。
+
+- 协调线程提到的 `/tmp` 196 GiB 漏看数字在本机账本里找不到对应测量行；本文只把它当作
+  “超时不能当 0”的案例，不引用为已核实容量。
+- `local-data-modes.json` 里退役库的 `delete_after` 删方写作 `auto_nxymfdcsy5c`，但该 ID
+  不在当前 automation list 中，无法从实时配置核实；到期对象仍按 owner 指派处理。
+- ITFS 的 retained 匿名卷 `37ad2a2e…` 在 2026-11-01 已不存在，账本未记录删除方；
+  “retained”是保护声明，不是存活监控，每轮仍要重新核对对象是否还在。
+- `/data` 在 2026-10-11/12 的总量增长有 dmesg 的 vdb/EXT4 resize 证据，但执行方未记录；
+  跨这次扩容的 `used%` 不可直接比较。
+- 旧账本对 pnpm 11/12 与 v11 的对应关系有过不一致记录；现行映射以
+  `pnpm_store_prune.py` 的 `STORE_MAJORS`（9→v3、10→v10、12→v11）为准。
+- 账本日期混用 UTC 与 `+0800`；跨日比较必须带显式偏移，不能按“同一天”字符串直接比。
+
 ## 7. 文档地图
 
 | 文档 | 职责 | 读它的时候 |
