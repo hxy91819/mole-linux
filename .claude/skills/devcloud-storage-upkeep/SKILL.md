@@ -15,8 +15,8 @@ description: 本机（Linux DevCloud）数据盘的长期存储维护：查清�
 
 | 类别 | 例子 | 处置 |
 |---|---|---|
-| 可重建缓存 | go-build、npm `_cacache`、pnpm store、Docker 悬空/旧标签镜像和 BuildKit、无主匿名测试 DB 卷 | go-build 每小时只删 2 小时以上没用过的条目；npm、pnpm 不自动清。Docker 残留由 `scripts/docker_leftovers.py` 每小时清：2026-11-14 owner 批准无容器引用、Created >30 天且仓库有更新镜像的旧标签；仓库最新及 owner 保护标签保留；BuildKit 在 72h prune 外限总量 10GB，完整判据见 storage-rules 的 owner 策略节 |
-| Worktree | 附加 worktree（主 checkout 永远不动） | 没人用且闲置满 24 小时：已在远端就删，否则先推 `archive/worktree/*` 再删：`scripts/worktree_sweep.py` |
+| 可重建缓存 | go-build、npm `_cacache`、pnpm store、Docker 悬空/旧标签镜像和 BuildKit、无主匿名测试 DB 卷 | go-build 每小时只删 24 小时以上没用过的条目（2026-11-14 owner 批准由 2 小时改为 24 小时）；npm、pnpm 不自动清。Docker 残留由 `scripts/docker_leftovers.py` 每小时清：2026-11-14 owner 批准无容器引用、Created >30 天且仓库有更新镜像的旧标签；仓库最新及 owner 保护标签保留；BuildKit 在 72h prune 外限总量 10GB，完整判据见 storage-rules 的 owner 策略节 |
+| Worktree | 附加 worktree（主 checkout 永远不动） | 没人用且闲置满 24 小时：已在远端就删，否则先推 `archive/worktree/*` 再删，并同步清理 `path` 精确匹配的 BB 环境（2026-11-14 owner 批准）：`scripts/worktree_sweep.py` |
 | 数据 | 会话（`/data/codex`、`/data/bb-data`）、凭据、在用数据库、命名卷、备份与迁移副本 | 不自动删；列出大小和归属，交 owner 决定 |
 
 ## 1. 找增长源
@@ -50,7 +50,7 @@ python3 -I <本技能根>/scripts/worktree_sweep.py --measure    # 预演，并�
 python3 -I <本技能根>/scripts/worktree_sweep.py --execute
 ```
 
-- `worktree_sweep.py` 执行时按 worktree 逐个记 JSONL 到 `~/.local/state/devcloud-storage-upkeep/`，含归档 ref 和 SHA；恢复命令是 `git fetch <url> <ref>`，再 `git worktree add <路径> <sha>`。
+- `worktree_sweep.py` 执行时按 worktree 逐个记 JSONL 到 `~/.local/state/devcloud-storage-upkeep/`，含归档 ref、SHA 和完整恢复命令（`git fetch <url> <ref> && git worktree add <路径> <sha>`）。每个 worktree 删除成功后同步处理 `bb environment list --json` 中 `path` 精确全等且未 `destroyed` 的 BB 环境：调用 `bb environment delete <id>`（BB 插件不删 Git 分支/ref；仍有未归档线程拒绝时记录原因不重试），`bb` 不可用时 fail open 只记 JSONL 不阻塞删除（2026-11-14 owner 批准）。
 - 删 worktree 之后再跑一次 `docker_leftovers.py --execute`，只清没人用的 Docker 残留。`node_modules` 大多是指向 pnpm store 的硬链接，但 pnpm store 有进程在用，不自动 prune。逐个目录 `du` 的合计会明显大于实际能腾出的空间，回收量以执行前后的 `df` 为准。
 - 保留下来的项都写有原因：`in use`、`active within 24h` 等下一轮自然会处理；`unpushed work and no personal or internal remote` 和 `archive would push risky files` 需要 owner 决定推到哪里，或手动处理那个文件。
 

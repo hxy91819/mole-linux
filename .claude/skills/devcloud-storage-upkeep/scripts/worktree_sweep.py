@@ -21,11 +21,13 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -590,7 +592,93 @@ def push_archive(repo: Repo, commit: str, ref: str, url: str, name: str, stamp: 
     return commit
 
 
-def execute_item(repo: Repo, item: dict, stamp: str):
+def recovery_command_for(repo: Repo, item: dict):
+    path = item["path"]
+    rec = item.get("recovery")
+    if rec:
+        url, ref, sha = rec["url"], rec["ref"], rec["sha"]
+    else:
+        proof = item.get("proof") or ""
+        remote_name, _, ref = proof.partition(":")
+        fetch_url, _ = repo.remotes.get(remote_name, ("", ""))
+        url = transport_url(fetch_url) if fetch_url else remote_name
+        sha = item["head"]
+    return f"git fetch {shlex.quote(url)} {shlex.quote(ref)} && git worktree add {shlex.quote(path)} {shlex.quote(sha)}"
+
+
+class BBEnvironmentCleaner:
+    """Best-effort BB environment cleanup after a worktree has been removed.
+
+    ``bb environment delete <id>`` only cleans up the environment record/attempt
+    files (``removeWorktree`` returns immediately when the target path is already
+    gone and never deletes Git branches or refs), and refuses with 409 when live
+    threads remain. Any BB query or command error fails open after logging."""
+
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self._lock = threading.Lock()
+        self._loaded = False
+        self._by_path = {}
+        self._load_error = None
+
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        with self._lock:
+            if self._loaded:
+                return
+            try:
+                res = run(["bb", "environment", "list", "--json"], timeout=120, check=False)
+                if res.returncode != 0:
+                    self._load_error = failure_text(res.stderr or res.stdout or f"bb environment list exited {res.returncode}")
+                else:
+                    envs = json.loads(res.stdout)
+                    by_path = {}
+                    for env in envs:
+                        if not isinstance(env, dict) or env.get("status") == "destroyed":
+                            continue
+                        env_path = env.get("path")
+                        env_id = env.get("id")
+                        if isinstance(env_path, str) and env_path and isinstance(env_id, str) and env_id:
+                            by_path.setdefault(env_path, []).append(env)
+                    self._by_path = by_path
+            except Exception as exc:
+                self._load_error = failure_text(exc)
+            self._loaded = True
+
+    def process_removed_worktree(self, item: dict):
+        if not self.enabled:
+            return
+        self._ensure_loaded()
+        if self._load_error is not None:
+            item["bb_environment_error"] = self._load_error
+            return
+        with self._lock:
+            matched = list(self._by_path.pop(item["path"], ()))
+        outcomes = []
+        for env in matched:
+            env_id = env["id"]
+            try:
+                res = run(["bb", "environment", "delete", env_id, "--json"], timeout=120, check=False)
+            except Exception as exc:
+                outcomes.append({"id": env_id, "action": "delete", "result": "failed", "reason": failure_text(exc)})
+                continue
+            if res.returncode == 0:
+                outcomes.append({"id": env_id, "action": "delete", "result": "deleted"})
+                continue
+            reason = failure_text(res.stderr or res.stdout or f"exit {res.returncode}")
+            low = reason.lower()
+            refused = "live thread" in low or "cannot be deleted while" in low
+            outcomes.append({
+                "id": env_id,
+                "action": "delete",
+                "result": "refused" if refused else "failed",
+                "reason": reason,
+            })
+        item["bb_environments"] = outcomes
+
+
+def execute_item(repo: Repo, item: dict, stamp: str, bb_envs: BBEnvironmentCleaner | None = None):
     path, head = item["path"], item["head"]
     secret = ignored_secret_block(repo, path)
     if secret:
@@ -615,9 +703,12 @@ def execute_item(repo: Repo, item: dict, stamp: str):
     else:
         git(repo.main, "worktree", "remove", path, timeout=3600)  # refuses if it became dirty
     item["result"] = "removed"
+    item["recovery_command"] = recovery_command_for(repo, item)
+    if bb_envs is not None:
+        bb_envs.process_removed_worktree(item)
 
 
-def sweep_repo(repo: Repo, items, stamp, state_log, idle_seconds, use_bb, deadline):
+def sweep_repo(repo: Repo, items, stamp, state_log, idle_seconds, use_bb, deadline, bb_envs=None):
     with open(os.path.join(repo.common, "worktree-cleanup.lock"), "a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # same lock as the worktree-cleanup tool
@@ -638,7 +729,7 @@ def sweep_repo(repo: Repo, items, stamp, state_log, idle_seconds, use_bb, deadli
                 holder = anchored(anchors, it["path"])
                 if holder:
                     raise Keep(f"in use: {holder}")
-                execute_item(repo, it, stamp)
+                execute_item(repo, it, stamp, bb_envs)
             except ScanIncomplete:
                 it.update(result="kept", reason="process scan incomplete")
             except Keep as k:
@@ -757,9 +848,12 @@ def main(argv=None):
     os.makedirs(args.state_dir, exist_ok=True)
     state_log = os.path.join(args.state_dir, f"worktree-sweep-{stamp}.jsonl")
     if args.execute:
+        bb_envs = BBEnvironmentCleaner(use_bb)
         with cf.ThreadPoolExecutor(4) as pool:
-            list(pool.map(lambda c: sweep_repo(repo_objs[c], todo[c], stamp, state_log, idle_seconds, use_bb, deadline),
-                          [c for c in todo if todo[c]]))
+            list(pool.map(
+                lambda c: sweep_repo(repo_objs[c], todo[c], stamp, state_log, idle_seconds, use_bb, deadline, bb_envs),
+                [c for c in todo if todo[c]],
+            ))
 
     rows = [i for items in plan.values() for i in items]
     failed = any(i.get("result") == "failed" for i in rows)

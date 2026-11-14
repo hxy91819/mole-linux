@@ -38,12 +38,13 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
 「如果是正在用的业务和 Agent 一定不要影响他们使用。这个是底线，我们要清理的那些是没有正在用的。」
 按恢复契约分三类：
 
-- **go-build 每小时只删 2 小时以上没用过的条目；npm、pnpm 不自动清（2026-11-04）**：owner 原话：
+- **go-build 每小时只删 24 小时以上没用过的条目；npm、pnpm 不自动清（2026-11-04 建立，2026-11-14 owner 批准由 2 小时改为 24 小时）**：owner 原话：
   「我觉得有意义啊，可以考虑加上，而且落地为仓库的规则。不然这个点确实会很坑。」原因是缓存键含源码目录：
   lightspace 每个任务都在 `/var/tmp` 新建一份源码副本，各 worktree 路径也不同，旧路径的条目再也不会命中，
   而 Go 自己要等 5 天才删。依据：Go 用到一个条目时，若其 mtime 已超过 1 小时，就刷新为当前时间
-  （`cmd/go/internal/cache` 的 `mtimeInterval`）。mtime 早于 2 小时前的条目，最近 1 小时内一定没被用过，
-  正在跑的编译不会用到它。只删名字匹配 `^[0-9a-f]{64}-[ad]$` 的普通文件；目录、README、trim.txt、
+  （`cmd/go/internal/cache` 的 `mtimeInterval`）。2026-11-14 owner 批准将修剪年龄从 2 小时调整为
+  24 小时（每日检查上限同步从 60 GiB 调为 100 GiB、最老条目阈值改为 1520 分钟），保留日内与隔夜复用的缓存条目，
+  同时清掉超过 24 小时未用的冷条目。只删名字匹配 `^[0-9a-f]{64}-[ad]$` 的普通文件；目录、README、trim.txt、
   testexpire.txt、fuzz 和符号链接不动。脚本 `scripts/go_cache_trim.py`，默认预演、`--execute` 才删。
   npm `_cacache` 与 pnpm store 仍不自动清。原 30/10/20 GiB 整体重置作废。回归：
   `test_old_go_cache_entries_are_deleted`、`test_recent_go_cache_entries_are_kept`、
@@ -83,13 +84,25 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   内容相同的文件 → 整个 worktree 保留；② 归档目标远端在 `ls-remote` 时就失败 → 保留；③ 读取 `/proc`
   出现进程退出以外的错误，或 `docker ps` / `docker inspect` 失败 → 本轮全部保留。仍保留：主 checkout、
   locked、进行中的 git 操作、已填充子模块，以及 WIP 含凭据文件名或 >20 MiB 文件的 worktree。
+- **2026-11-14 owner 批准：worktree 删除时同步处理 BB 环境**：`worktree_sweep.py --execute`
+  每次成功删除一个 worktree 后，在既有 JSONL 日志记录恢复命令
+  `git fetch <url> <ref> && git worktree add <path> <sha>`，并按 `path` 精确全等筛选
+  `bb environment list --json` 中 `status != "destroyed"` 的 BB 环境（父目录、子目录、主 checkout
+  概不匹配）。经核查 BB `environment-git-worktree` 插件源码（`removeWorktree` 在目标目录已不存在时只清理
+  `.completed` 标记并返回，绝不删除任何 Git 分支或 ref），逐个调用 `bb environment delete <id> --json`；
+  若因仍有未归档线程（live threads）等被 BB 拒绝，保留原环境、记录拒绝原因，不重试。若 `bb` 不可用或查询/删除命令失败，
+  fail open：worktree 照常删除，在 JSONL 记录失败信息而不阻塞清理。回归：
+  `test_matching_bb_environment_is_deleted_with_recovery_command_after_worktree_removal`、
+  `test_non_exact_bb_environment_paths_are_untouched`、
+  `test_refused_bb_environment_delete_is_logged_and_not_retried`、
+  `test_bb_failure_does_not_block_worktree_deletion_and_logs_error`。
 - **数据类不自动删**：会话（codex、bb-data）、凭据、在用数据库、命名卷、备份与迁移副本只列给 owner 决定。
 
 执行入口：`$devcloud-storage-upkeep` 的 `scripts/worktree_sweep.py`、`scripts/docker_leftovers.py`、
 `scripts/go_cache_trim.py`，默认预演、`--execute` 执行。回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
 凭据文件保留、进程占用保留、近期活动保留、凭据类 ignored 文件与主 checkout 不同内容则整树保留、
 node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非退出错误整轮保留、docker ps/inspect
-失败整轮保留、busy 锁跳过、retained_volumes 排除；go_cache_trim：`test_old_go_cache_entries_are_deleted`、
+失败整轮保留、删除后同步处理精确匹配 BB 环境与拒绝/故障 fail-open、busy 锁跳过、retained_volumes 排除；go_cache_trim：`test_old_go_cache_entries_are_deleted`、
 `test_recent_go_cache_entries_are_kept`、`test_non_matching_go_cache_names_are_kept`、
 `test_go_cache_symlink_is_kept_and_target_is_untouched`、
 `test_missing_go_cache_readme_deletes_nothing_and_exits_1`、`test_go_cache_dry_run_deletes_nothing`、
