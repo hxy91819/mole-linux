@@ -2,7 +2,7 @@
 
 适用主机：`/data` 挂载于 `/dev/vdb`、`/tmp` 是 `/data/system-tmp` 的 bind 别名的这台 Linux 开发机。首次核实于 2026-10-29；换机器或路径变化后先重新确认。
 
-**2026-11-04 起**：阈值与授权以 [存储规则](../.claude/skills/devcloud-patrol/references/storage-rules.md) 的「owner 2026-11-04 存储维护策略」一节为准（worktree、/tmp、工具缓存、Docker 残留的当前门槛都在那里，本手册不复述数字）；自动化现状见 [本机存储维护落地方案](DEVCLOUD_AUTOMATION.md) 的「当前任务」表。
+**2026-11-04 起**：阈值与授权以 [存储规则](../.claude/skills/devcloud-patrol/references/storage-rules.md) 的「owner 2026-11-04 存储维护策略」一节为准（worktree、/tmp、工具缓存、Docker 残留的当前门槛都在那里，本手册不复述数字）；设计背景、布局和教训见 [存储设计](DEVCLOUD_STORAGE_DESIGN.md)；自动化现状见 [现行任务与复现](DEVCLOUD_AUTOMATION.md) 的「现行任务」表。
 
 这是**手工操作入口和故障排查手册**，不增加自动删除权限。对象规则以 [存储规则](../.claude/skills/devcloud-patrol/references/storage-rules.md) 为准；有单独保留声明的数据库、卷、备份继续保护。已授权范围按现有规则执行，不重复索取许可；未知对象先保留并查归属。
 

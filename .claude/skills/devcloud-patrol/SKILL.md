@@ -6,6 +6,10 @@ disable-model-invocation: true
 
 # DevCloud 服务器巡检
 
+磁盘布局、设计取舍和踩坑背景见 [DEVCLOUD_STORAGE_DESIGN](../../../docs/DEVCLOUD_STORAGE_DESIGN.md)；
+现行存储任务和部署见 [DEVCLOUD_AUTOMATION](../../../docs/DEVCLOUD_AUTOMATION.md)。
+本文只写巡检和逐项处置流程。
+
 这台开发机的磁盘经常被 Docker、worktree、日志和缓存填满；开发过程还会留下绑定在非回环地址上的临时服务——安全扫描已两次点名本机：Vite dev server（5173，CVE-2025-30208 任意文件读取）和 PostgreSQL（5432，弱口令）。这类残留没法靠固定脚本判定生死：同一个端口上，可能是三天前 `nohup` 忘关的孤儿进程，也可能是同事此刻正在用的预览服务。巡检的价值在取证和分类；处置永远逐项过人。
 
 一条铁律贯穿全程：**巡检只读取证；worktree 的自动归档清理由独立每日任务负责，现役入口见存储规则，其余处置逐项过人。**

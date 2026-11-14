@@ -188,15 +188,17 @@ Tag-driven flow via `release.yml` on capital-`V` tag pushes. The full release ru
 
 ## Linux DevCloud Audit Ledger
 
-This checkout is only the ledger contract. After every storage investigation, append
-the run details to `storage-audit.log`, a local working ledger that stays git-ignored.
-Per-target rules learned from DevCloud investigations live in
-`.claude/skills/devcloud-patrol/references/storage-rules.md`, the single rule source:
-read it before classifying or cleaning any concrete target on this machine (Docker
-objects, database volumes, package caches, logs, temp dirs, worktrees), and route full
-patrols through `$devcloud-patrol`. Keep `vision.md` for current product/storage
-direction; do not put one-off capacities, timestamps, deleted paths, or command
-transcripts in this file.
+Read `docs/DEVCLOUD_STORAGE_DESIGN.md` first for the machine's layout, design decisions,
+and cross-round lessons. Current tasks, commands, deployment, and reproduction steps live
+in `docs/DEVCLOUD_AUTOMATION.md`. Before classifying or cleaning any concrete target on
+this machine, read `.claude/skills/devcloud-patrol/references/storage-rules.md`, the single
+rule source, and route full patrols through `$devcloud-patrol`.
+
+After every storage investigation, append the run details to `storage-audit.log`, a
+git-ignored local ledger. It exists only on this machine and does not travel with the
+repository: any lesson that must hold across rounds belongs in the design doc
+(why/layout/lesson) or `storage-rules.md` (rule), not only in the ledger. Do not put
+one-off capacities, timestamps, deleted paths, or command transcripts in this file.
 
 A new rule is promotable only when it answers:
 
