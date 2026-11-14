@@ -5,6 +5,10 @@ description: 本机（Linux DevCloud）数据盘的长期存储维护：查清�
 
 # 本机存储长期维护
 
+设计背景、布局、决策和踩坑原因见 [DEVCLOUD_STORAGE_DESIGN](../../../docs/DEVCLOUD_STORAGE_DESIGN.md)；
+现行任务、部署和复现步骤见 [DEVCLOUD_AUTOMATION](../../../docs/DEVCLOUD_AUTOMATION.md)。
+本文只写操作流程；逐目标能不能清以 storage-rules 为准。
+
 如果是正在用的业务和 Agent 一定不要影响他们使用。这个是底线，我们要清理的那些是没有正在用的。
 
 这台机器的空间问题是**写入速度**问题：增长源每小时写十几 GiB 时，再谨慎的逐项清理也追不上。每次处理按这个顺序：先找出增长源并修生产端，再按恢复契约清理，最后记账。
