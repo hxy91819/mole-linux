@@ -1121,6 +1121,8 @@ class GoCacheTrimTests(unittest.TestCase):
         root = Path(self.temp.name)
         self.cache = root / 'gocache'
         self.cache.mkdir()
+        lint_patch = mock.patch.object(trim, 'lint_cache_directory', lambda: str(root / 'absent-lint'), create=True)
+        lint_patch.start(); self.addCleanup(lint_patch.stop)
         (self.cache / 'README').write_text(README_LINE + 'Do not delete.\n')
         bindir = root / 'bin'
         bindir.mkdir()
@@ -1415,7 +1417,7 @@ def test_tmp_clone_mono2_never_archives_to_github(clone_case):
 @pytest.fixture
 def pnpm_case(tmp_path, monkeypatch):
     p = load_upkeep('pnpm_store_prune')
-    store = tmp_path / 'store'; store.mkdir(); (store / 'cached').write_bytes(b'x' * 8192)
+    store = tmp_path / 'store' / 'v11'; store.mkdir(parents=True); (store / 'cached').write_bytes(b'x' * 8192)
     bindir = tmp_path / 'bin'; bindir.mkdir()
     fake = bindir / 'pnpm'
     fake.write_text(r"""#!/usr/bin/env python3
@@ -1423,8 +1425,12 @@ import os, sys
 from pathlib import Path
 with open(os.environ['PNPM_CALLS'], 'a') as f: f.write(' '.join(sys.argv[1:]) + '\n')
 if os.environ.get('PNPM_FAIL') == sys.argv[-1]: sys.exit(1)
-if sys.argv[1:] == ['store', 'path']: print(os.environ['PNPM_STORE'])
-elif sys.argv[1:] == ['store', 'prune']: Path(os.environ['PNPM_STORE'], 'cached').unlink(missing_ok=True)
+a=sys.argv[1:]
+if a == ['--version']: print('12.0.0'); sys.exit(0)
+if '--store-dir' in a:
+    i=a.index('--store-dir'); a=a[:i]+a[i+2:]
+if a == ['store', 'path']: print(os.environ['PNPM_STORE'])
+elif a == ['store', 'prune']: Path(os.environ['PNPM_STORE'], 'cached').unlink(missing_ok=True)
 else: sys.exit(2)
 """)
     fake.chmod(0o755)
@@ -1468,7 +1474,7 @@ def test_pnpm_failures_are_reported(pnpm_case, monkeypatch, failure, capsys):
     assert capsys.readouterr().err
 
 
-@pytest.mark.parametrize('args,busy', [(['node', '/usr/bin/pnpm.cjs', 'install'], True), (['npm', 'ci'], True), (['yarn'], True), (['pnpm', 'add', 'x'], True), (['pnpm', 'run', 'dev'], False), (['python', 'some-pnpm-install-test.py'], False)])
+@pytest.mark.parametrize('args,busy', [(['node', '/usr/bin/pnpm.cjs', 'install'], True), (['npm', 'ci'], False), (['yarn'], False), (['pnpm', 'add', 'x'], True), (['pnpm', 'run', 'dev'], False), (['python', 'some-pnpm-install-test.py'], False)])
 def test_package_process_classification(args, busy):
     p = load_upkeep('pnpm_store_prune')
     assert p.installing(args) is busy
@@ -1556,7 +1562,7 @@ def test_pnpm_rechecks_processes_after_sizing(pnpm_case, monkeypatch):
 
 def test_pnpm_process_title_is_detected():
     p = load_upkeep('pnpm_store_prune')
-    assert p.installing(['npm install', '', ''])
+    assert not p.installing(['npm install', '', ''])
     assert p.installing(['node', '--no-warnings', '/usr/bin/pnpm.cjs', 'install'])
 
 
@@ -1616,7 +1622,7 @@ def test_pnpm_failure_after_prune_records_after_size(pnpm_case, monkeypatch):
     original = p.ws.run
     def fail_after_deletion(cmd, **kw):
         result = original(cmd, **kw)
-        if cmd == ['pnpm', 'store', 'prune']:
+        if cmd[-2:] == ['store', 'prune']:
             raise subprocess.CalledProcessError(1, cmd, '', 'partial prune failed')
         return result
     monkeypatch.setattr(p.ws, 'run', fail_after_deletion)
@@ -1640,10 +1646,7 @@ def test_tmp_clone_reference_scan_handles_non_git_cache_markers(clone_case, monk
 
 @pytest.mark.parametrize('args', [
     ['pnpm', '--dir', '/project', 'install'],
-    ['npm', '--prefix', '/project', 'ci'],
     ['node', '--require', '/tracer.js', '/usr/bin/pnpm.cjs', 'add', 'dep'],
-    ['node', '/project/.yarn/releases/yarn-4.9.0.cjs', 'install'],
-    ['npm exec playwright'],
 ])
 def test_pnpm_installers_with_flags_and_process_titles(args):
     p = load_upkeep('pnpm_store_prune')
@@ -1849,3 +1852,224 @@ def test_tmp_clone_internal_origin_pushurl_cannot_cross_to_github(clone_case, mo
     monkeypatch.setattr(c.ws, 'git', split)
     row = clone_plan(clone_case, unpublished=True, url='https://git.woa.com/team/internal-project.git')
     assert row['action'] == 'keep' and 'no personal or internal remote' in row['reason']
+
+
+@pytest.mark.parametrize('args,busy', [
+    (['npm', 'install'], False), (['npm exec vite --host 127.0.0.1'], False),
+    (['npx', 'pnpm@9', 'install'], False), (['vite'], False), (['yarn', 'install'], False),
+    (['pnpm', 'exec', 'install'], False), (['pnpm', 'run', 'install'], False),
+    (['pnpm', 'start', 'install'], False), (['pnpm', 'build', 'add'], False),
+    (['node', 'app.js', 'pnpm', 'install'], False),
+    (['node', '/usr/bin/npm-cli.js', 'install'], False),
+    (['pnpm', '--filter', 'install', 'run', 'dev'], False),
+    (['pnpm', '--store-dir', 'install', 'store', 'path'], False),
+    (['pnpm', 'store', 'path'], False), (['pnpm', 'store', 'status'], False),
+    (['pnpm', 'install'], True), (['pnpm', '-r', 'i'], True),
+    (['pnpm', '--dir', '/project', 'add', 'dep'], True),
+    (['pnpm', 'up'], True), (['pnpm', 'remove', 'dep'], True),
+    (['pnpm', 'fetch'], True), (['pnpm', 'import'], True),
+    (['pnpm', 'dlx', 'tool'], True), (['pnpm', 'rebuild'], True),
+    (['pnpm', 'store', 'prune'], True), (['pnpm', 'store', 'add', 'dep'], True),
+    (['node', '--require', '/tracer.js', '/bin/pnpm.cjs', 'install'], True),
+    (['corepack', 'pnpm', '--filter=x', 'install'], True),
+    (['pnpm install'], True),
+])
+def test_pnpm_only_store_writers_block(args, busy):
+    assert load_upkeep('pnpm_store_prune').installing(args) is busy
+
+
+@pytest.fixture
+def multi_store_case(tmp_path, monkeypatch):
+    p = load_upkeep('pnpm_store_prune')
+    root = tmp_path / 'store'
+    for version in ('v3','v10','v11'):
+        (root/version).mkdir(parents=True)
+        (root/version/'cached').write_bytes(b'x'*8192)
+    bindir=tmp_path/'bin';bindir.mkdir();state=tmp_path/'state.json';state.write_text('{}')
+    body=r'''#!/usr/bin/env python3
+import json,os,sys
+from pathlib import Path
+s=json.load(open(os.environ['MULTI_STATE']));a=sys.argv[1:];major=12
+if Path(sys.argv[0]).name=='npx':
+    major=int(a[1].split('@')[1]);a=a[2:]
+versions={9:'v3',10:'v10',12:'v11'}
+s.setdefault('calls',[]).append({'major':major,'args':a});json.dump(s,open(os.environ['MULTI_STATE'],'w'))
+if s.get('unavailable')==major:sys.exit(1)
+if a==['--version']:print(str(major)+'.0.0');sys.exit(0)
+root=Path(os.environ['MULTI_ROOT'])
+if '--store-dir' in a:
+    at=a.index('--store-dir');root=Path(a[at+1]);a=a[:at]+a[at+2:]
+version=versions[major]
+if s.get('mismatch')==major:version='v99'
+if a==['store','path']:print(root/version)
+elif a==['store','prune']:
+    (root/version/'cached').unlink(missing_ok=True)
+    if s.get('prune_failure')==major:sys.exit(1)
+else:sys.exit(2)
+'''
+    for name in ('pnpm','npx'):
+        f=bindir/name;f.write_text(body);f.chmod(0o755)
+    monkeypatch.setattr(p.ws,'ENV',dict(p.ws.ENV,PATH=str(bindir)+':'+os.environ['PATH'],MULTI_ROOT=str(root),MULTI_STATE=str(state)))
+    monkeypatch.setattr(p,'package_process_state',lambda:(1,'idle'))
+    return p,root,state,tmp_path/'logs'
+
+
+def test_pnpm_all_versions_use_same_explicit_root_and_matching_major(multi_store_case):
+    p,root,state,logs=multi_store_case
+    assert p.main(['--execute','--state-dir',str(logs)])==0
+    assert all(not (root/v/'cached').exists() for v in ('v3','v10','v11'))
+    rows=[json.loads(s) for s in next(logs.glob('pnpm*.jsonl')).read_text().splitlines()]
+    assert {r['version']:r['pnpm_major'] for r in rows}=={'v3':9,'v10':10,'v11':12}
+    assert all(r['before_bytes']>r['after_bytes'] and r['result']=='pruned' for r in rows)
+    calls=json.loads(state.read_text())['calls']
+    for c in calls:
+        if c['args'][-2:]==['store','prune']:
+            assert c['args'][:2]==['--store-dir',str(root)]
+
+
+@pytest.mark.parametrize('failure', ['unavailable','mismatch','prune_failure'])
+def test_pnpm_version_failures_preserve_or_log_and_continue(multi_store_case,failure):
+    p,root,state,logs=multi_store_case
+    state.write_text(json.dumps({failure:9}))
+    result=p.main(['--execute','--state-dir',str(logs)])
+    assert result==(1 if failure=='prune_failure' else 0)
+    rows=[json.loads(s) for s in next(logs.glob('pnpm*.jsonl')).read_text().splitlines()]
+    row=next(r for r in rows if r['version']=='v3')
+    assert row['result']==('failed' if failure=='prune_failure' else 'skipped')
+    assert row.get('reason')
+    assert all(not (root/v/'cached').exists() for v in ('v10','v11'))
+    assert (root/'v3'/'cached').exists() is (failure!='prune_failure')
+    assert row['after_bytes'] is not None
+
+
+def test_pnpm_multi_store_dry_run_and_unknown_do_not_prune(multi_store_case,monkeypatch,capsys):
+    p,root,state,logs=multi_store_case
+    assert p.main(['--quiet','--state-dir',str(logs)])==0
+    assert all((root/v/'cached').exists() for v in ('v3','v10','v11'))
+    rows=[json.loads(s) for s in next(logs.glob('pnpm*.jsonl')).read_text().splitlines()]
+    assert {r['version'] for r in rows}=={'v3','v10','v11'}
+    monkeypatch.setattr(p,'package_process_state',lambda:(2,'unknown proc'))
+    assert p.main(['--execute','--quiet','--state-dir',str(logs)])==0
+    assert all((root/v/'cached').exists() for v in ('v3','v10','v11'))
+    assert not capsys.readouterr().out
+
+
+@pytest.fixture
+def lint_case(tmp_path,monkeypatch):
+    p=_load_go_cache_trim()
+    go=tmp_path/'go';go.mkdir();(go/'README').write_text(README_LINE)
+    lint=tmp_path/'lint';lint.mkdir();(lint/'README').write_text('This directory holds cached build artifacts from golangci-lint.\n')
+    link=tmp_path/'golangci-lint';link.symlink_to(lint,target_is_directory=True)
+    monkeypatch.setattr(p,'cache_directory',lambda:str(go))
+    monkeypatch.setattr(p,'lint_cache_directory',lambda:os.path.realpath(link),raising=False)
+    for bucket,age in [('aa',25),('bb',23)]:
+        d=lint/bucket;d.mkdir();f=d/(bucket*32+'-d');f.write_bytes(b'x'*1024)
+        os.utime(f,(time.time()-age*3600,)*2)
+    return p,go,lint
+
+
+def test_golangci_shared_cache_follows_root_symlink_and_preserves_recent(lint_case,capsys):
+    p,go,lint=lint_case
+    assert p.main([])==0
+    assert 'golangci-lint' in capsys.readouterr().out
+    old=lint/'aa'/('aa'*32+'-d');recent=lint/'bb'/('bb'*32+'-d')
+    assert old.exists()
+    assert p.main(['--execute'])==0
+    assert not old.exists() and recent.exists()
+
+
+@pytest.mark.parametrize('bad', ['readme','symlink','non_matching'])
+def test_golangci_invalid_targets_are_preserved(lint_case,bad):
+    p,go,lint=lint_case
+    old=lint/'aa'/('aa'*32+'-d')
+    (lint/'cc').mkdir(); buddy=lint/'cc'/('cc'*32+'-a'); buddy.write_bytes(b'old buddy')
+    os.utime(buddy,(OLD,OLD))
+    if bad=='readme':(lint/'README').write_text('wrong cache\n')
+    elif bad=='symlink':
+        old.unlink();outside=lint.parent/'outside';outside.write_text('keep');old.symlink_to(outside)
+    else:
+        old.rename(old.parent/'notes.txt');old=old.parent/'notes.txt'
+    assert p.main(['--execute','--quiet'])==(1 if bad=='readme' else 0)
+    assert old.exists()
+    assert buddy.exists() is (bad=='readme')
+
+
+def test_pnpm_writer_executable_path_can_contain_spaces():
+    assert load_upkeep('pnpm_store_prune').installing(['/tools with space/pnpm','install'])
+
+
+def test_npm_process_title_is_ignored_even_with_unmatched_quotes():
+    assert not load_upkeep('pnpm_store_prune').installing(["npm exec vite --define='unterminated"])
+
+
+def test_pnpm_process_parse_error_is_unknown(monkeypatch):
+    p=load_upkeep('pnpm_store_prune')
+    monkeypatch.setattr(p.os,'listdir',lambda _:['123'])
+    monkeypatch.setattr(p,'installing',mock.Mock(side_effect=ValueError('bad title')))
+    with mock.patch('builtins.open',mock.mock_open(read_data=b'pnpm\0install\0')):
+        assert p.package_process_state()[0]==2
+
+
+def test_pnpm_old_stores_are_pruned_when_current_version_directory_is_absent(multi_store_case):
+    p,root,state,logs=multi_store_case
+    shutil.rmtree(root/'v11')
+    assert p.main(['--execute','--state-dir',str(logs)])==0
+    assert all(not (root/v/'cached').exists() for v in ('v3','v10'))
+    rows=[json.loads(s) for s in next(logs.glob('pnpm*.jsonl')).read_text().splitlines()]
+    assert {r['version'] for r in rows}=={'v3','v10'}
+
+
+@pytest.mark.parametrize('args', [
+    ['pnpm','--npmrc-auth-file','/auth','install'],
+    ['pnpm','--https-proxy','http://proxy','fetch'],
+])
+def test_pnpm_native_rc_option_operands_do_not_hide_store_writer(args):
+    assert load_upkeep('pnpm_store_prune').installing(args)
+
+
+@pytest.mark.parametrize('args,busy', [
+    *[(['pnpm', command], True) for command in
+      ('ci', 'clean-install', 'install-clean', 'ic', 'install-test', 'it', 'pipeline', 'create')],
+    *[(['pnpm', wrapper, 'install'], True) for wrapper in ('recursive', 'multi', 'm')],
+    *[(['pnpm', wrapper, 'run', 'install'], False) for wrapper in ('recursive', 'multi', 'm')],
+    (['pnpm', 'recursive', '--filter', 'install', 'exec', 'vite'], False),
+    (['pnpm', 'recursive', '--filter', 'run', 'install'], True),
+    (['pnpx', 'vite'], True), (['pnx', 'vite'], True),
+    (['node', '/usr/bin/pnpx.cjs', 'vite'], True),
+    (['pnpx vite'], True), (['corepack', 'pnpx', 'vite'], True),
+    (['pnpm', 'pnpx', 'vite'], True), (['pnpm', 'pnx', 'vite'], True),
+])
+def test_pnpm_writer_aliases_and_recursive_script_consumers(args, busy):
+    assert load_upkeep('pnpm_store_prune').installing(args) is busy
+
+
+@pytest.mark.parametrize('flag,value', [
+    ('--node-linker', 'hoisted'), ('--lockfile-dir', '/tmp/lock'),
+    ('--cpu', 'x64'), ('--os', 'linux'), ('--libc', 'glibc'),
+    ('--fetch-timeout', '10000'), ('--fetch-warn-timeout-ms', '1000'),
+    ('--fetch-min-speed-ki-bps', '10'), ('--user-agent', 'install'),
+    ('--pnpr-server', 'http://localhost'), ('--allow-build', 'sharp'),
+    ('--merge-git-branch-lockfiles-branch-pattern', 'main'),
+])
+def test_pnpm_value_options_before_command_preserve_writer_and_consumer(flag, value):
+    p = load_upkeep('pnpm_store_prune')
+    assert p.installing(['pnpm', flag, value, 'install'])
+    assert not p.installing(['pnpm', flag, value, 'run', 'install'])
+
+
+@pytest.mark.parametrize('args,busy', [
+    (['pnpm', '--', 'install'], True), (['pnpm', '--', 'run', 'install'], False),
+    (['node', '--', '/usr/bin/pnpm.cjs', 'install'], True),
+    (['node', '--env-file', '/tmp/env', '/usr/bin/pnpm.cjs', 'install'], True),
+    (['node', '--title', 'install', '/usr/bin/pnpm.cjs', 'install'], True),
+    (['node', '--title', 'install', '/usr/bin/pnpm.cjs', 'run', 'install'], False),
+])
+def test_pnpm_node_options_and_option_terminator(args, busy):
+    assert load_upkeep('pnpm_store_prune').installing(args) is busy
+
+
+@pytest.mark.parametrize('args', [
+    ['pnpm', alias] for alias in ('rb', 'uni', 'ln', 'dislink', 'prune')
+] + [['pnpm', 'pm', 'install']])
+def test_pnpm_verified_remaining_writer_aliases(args):
+    assert load_upkeep('pnpm_store_prune').installing(args)

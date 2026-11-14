@@ -38,7 +38,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
 「如果是正在用的业务和 Agent 一定不要影响他们使用。这个是底线，我们要清理的那些是没有正在用的。」
 按恢复契约分三类：
 
-- **go-build 每小时只删 24 小时以上没用过的条目；npm、pnpm 不自动清（2026-11-04 建立，2026-11-14 owner 批准由 2 小时改为 24 小时）**：owner 原话：
+- **go-build 与 golangci-lint 每小时只删 24 小时以上没用过的条目（2026-11-04 建立，2026-11-14 扩展共享 lint 缓存）**：owner 原话：
   「我觉得有意义啊，可以考虑加上，而且落地为仓库的规则。不然这个点确实会很坑。」原因是缓存键含源码目录：
   lightspace 每个任务都在 `/var/tmp` 新建一份源码副本，各 worktree 路径也不同，旧路径的条目再也不会命中，
   而 Go 自己要等 5 天才删。依据：Go 用到一个条目时，若其 mtime 已超过 1 小时，就刷新为当前时间
@@ -46,7 +46,11 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   24 小时（每日检查上限同步从 60 GiB 调为 100 GiB、最老条目阈值改为 1520 分钟），保留日内与隔夜复用的缓存条目，
   同时清掉超过 24 小时未用的冷条目。只删名字匹配 `^[0-9a-f]{64}-[ad]$` 的普通文件；目录、README、trim.txt、
   testexpire.txt、fuzz 和符号链接不动。脚本 `scripts/go_cache_trim.py`，默认预演、`--execute` 才删。
-  npm `_cacache` 与 pnpm store 仍不自动清。原 30/10/20 GiB 整体重置作废。回归：
+  Go 根取 `go env GOCACHE` 的 realpath；lint 根取 `readlink -f /root/.cache/golangci-lint`。
+  README 第一行分别必须为 `This directory holds cached build artifacts from the Go build system.` 和
+  `This directory holds cached build artifacts from golangci-lint.`，不符则该缓存不删并报错。
+  两者复用同一 24h、哈希普通文件、桶和末端复查规则。pnpm 每周 owner prune 见下条；npm 既有策略不变。
+  原 30/10/20 GiB 整体重置作废。回归：
   `test_old_go_cache_entries_are_deleted`、`test_recent_go_cache_entries_are_kept`、
   `test_non_matching_go_cache_names_are_kept`、`test_go_cache_symlink_is_kept_and_target_is_untouched`、
   `test_missing_go_cache_readme_deletes_nothing_and_exits_1`、`test_go_cache_dry_run_deletes_nothing`、
@@ -84,22 +88,42 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   内容相同的文件 → 整个 worktree 保留；② 归档目标远端在 `ls-remote` 时就失败 → 保留；③ 读取 `/proc`
   出现进程退出以外的错误，或 `docker ps` / `docker inspect` 失败 → 本轮全部保留。仍保留：主 checkout、
   locked、进行中的 git 操作、已填充子模块，以及 WIP 含凭据文件名或 >20 MiB 文件的 worktree。
-- **2026-11-14 owner 批准：worktree 删除时同步处理 BB 环境**：`worktree_sweep.py --execute`
-  每次成功删除一个 worktree 后，在既有 JSONL 日志记录恢复命令
-  `git fetch <url> <ref> && git worktree add <path> <sha>`，并按 `path` 精确全等筛选
-  `bb environment list --json` 中 `status != "destroyed"` 的 BB 环境（父目录、子目录、主 checkout
-  概不匹配）。经核查 BB `environment-git-worktree` 插件源码（`removeWorktree` 在目标目录已不存在时只清理
-  `.completed` 标记并返回，绝不删除任何 Git 分支或 ref），逐个调用 `bb environment delete <id> --json`；
-  若因仍有未归档线程（live threads）等被 BB 拒绝，保留原环境、记录拒绝原因，不重试。若 `bb` 不可用或查询/删除命令失败，
-  fail open：worktree 照常删除，在 JSONL 记录失败信息而不阻塞清理。回归：
-  `test_matching_bb_environment_is_deleted_with_recovery_command_after_worktree_removal`、
-  `test_non_exact_bb_environment_paths_are_untouched`、
-  `test_refused_bb_environment_delete_is_logged_and_not_retried`、
-  `test_bb_failure_does_not_block_worktree_deletion_and_logs_error`。
+- **2026-11-14 owner 批准：worktree 删除及每轮补扫 BB 环境**：删除成功后仍记录 SHA、归档 ref 和恢复命令
+  `git fetch <url> <ref> && git worktree add <path> <sha>`，删除 hook 只匹配 `path` 精确全等的未销毁环境。
+  每轮 `--execute` 还枚举全部 `status != destroyed`、路径已不存在的环境，调用
+  `bb environment delete <id> --json`。每轮每 ID 仅尝试一次；有未归档线程等被拒时保留、记录原因、不重试、
+  不令脚本失败。线程归档后由后续轮次自然清理。dangling symlink 不算路径不存在；权限未知则不删该环境。
+  BB 查询或删除故障继续 fail-open 记账，不阻断已授权的 worktree 删除。经核查插件，路径不存在时只清环境记录及
+  attempt 标记，绝不删除 Git 分支/ref。预演不调用 delete。
+- **2026-11-14 owner 批准：tmp 独立 clone 每天 06:45 清理**：`tmp_clone_sweep.py` 只处理
+  `/data/system-tmp`（即 `/tmp`）及 `/var/tmp` 的顶层独立 clone（`.git` 为真实目录，非 linked worktree）。
+  必须同时满足：无 `/proc` cwd/exe/fd/maps 引用、无容器挂载、无未销毁 BB 环境路径落在其中，探针未知即保留；
+  除 `.git` 外每个条目最新 mtime 已满 24h；status 含全部 untracked 为空、无 stash、worktree list 仅自身、无嵌套 `.git`；
+  `/data/code` 及两 tmp 根的其他仓库（含 bare）无 remote URL 或 objects/info/alternates 引用；ignored 无凭据类文件。
+  每个本地分支、HEAD、tag 均经实时 `git ls-remote` 证明；在待删 clone 内的本地 bare remote 不算恢复副本。
+  缺失对象复用 worktree 归档器推同主机个人命名空间或内部 origin 的 `archive/tmp-clone/*`，精确核验 object SHA；
+  tag 用同前缀 tag ref，fetch/push URL 分离时以核验过的 push URL 为准。绝不 force push，mono2 不推 GitHub；
+  无可推位置、归档失败或只能压缩内容而不能保存原历史时保留。本批网络查询与归档结束后完整刷新引用，
+  随后重核占用及本地全条件，中间不再发网络请求。只删物理根内的该目录，fd-based 删除不跟随符号链接；
+  每删一个立即写 JSONL（URL、HEAD、归档 ref、bytes），保留项也记录原因。默认预演、`--execute` 才删。
+- **2026-11-14 owner 批准：pnpm store 每周日 05:30 owner prune**：`pnpm_store_prune.py` 在
+  `/data/code/mole-linux` 用 `pnpm store path` 得到当前版本路径，再取共同 store 根（当前 `/data/.pnpm-store`）。
+  逐个存在的版本目录执行对应 pnpm 的 `--store-dir <共同根> store prune`；禁止把 `vN` 目录再当 store 根。
+  本机实测选用 pnpm 9 → v3、pnpm 10 → v10、pnpm 12 → v11；工具通过现有 pnpm 或 `npx --yes pnpm@<major>`
+  获取，先核版本及同一显式根下的 `store path` 精确匹配；工具不可得、格式未知或路径不符则跳过该版本并记原因。
+  仅可能写 store 的 pnpm 子命令阻塞：install/i/ci/install-test、add/update/up/remove/fetch/import/dlx/rebuild、
+  create/pipeline、store add/prune 等及其已核实别名（含 pnpx/pnx）；recursive/multi/m/pm 按内层命令判断。
+  正确消费 pnpm/Node 前置取值选项与 `--`，不把选项值或脚本参数误当写命令；
+  pnpm run/exec/start/脚本、npm、npx、yarn、vite 不阻塞，pnpm 子进程按自身命令判断。`/proc` 未知仍跳过，
+  每次 prune 前再查一次。只调用 owner 命令，不直接递归删 store。逐版本 JSONL 记录前后字节及结果；真实 prune
+  失败记账并继续其余版本，最终非零。默认预演、`--execute` 执行、`--quiet` 无动作静默。
+- **共享缓存不是线程遗留**：`/data/bb-data/thread-storage/.shared-cache/` 是 lightspace 建立的共享 Go 和
+  golangci-lint 缓存，`/root/.cache/go-build` 与 `/root/.cache/golangci-lint` 的 realpath 指向其中。
+  只能由 `go_cache_trim.py` 按上述 24h 规则修剪；不得当作线程遗留删除或误报为待清线程目录。
 - **数据类不自动删**：会话（codex、bb-data）、凭据、在用数据库、命名卷、备份与迁移副本只列给 owner 决定。
 
 执行入口：`$devcloud-storage-upkeep` 的 `scripts/worktree_sweep.py`、`scripts/docker_leftovers.py`、
-`scripts/go_cache_trim.py`，默认预演、`--execute` 执行。回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
+`scripts/go_cache_trim.py`、`scripts/tmp_clone_sweep.py`、`scripts/pnpm_store_prune.py`，默认预演、`--execute` 执行。回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
 凭据文件保留、进程占用保留、近期活动保留、凭据类 ignored 文件与主 checkout 不同内容则整树保留、
 node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非退出错误整轮保留、docker ps/inspect
 失败整轮保留、删除后同步处理精确匹配 BB 环境与拒绝/故障 fail-open、busy 锁跳过、retained_volumes 排除；go_cache_trim：`test_old_go_cache_entries_are_deleted`、
@@ -456,13 +480,13 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 - **opencraft 本地 smoke（`/tmp/oc-local-smoke-20261024/runs/<时间>-<pid>-<hash>/`）→ opencraft**：
   每次运行留下一份构建和 npm 产物，10-24 到 11-04 共 260 次、14.5 GiB。容器目录一直有新的运行写入，
   clean-tmp 永远不会把它当成候选；修法在生产端，只保留最近几次运行。
-- **`/tmp` 下带 `.git` 目录的独立 clone（非 worktree，约 39 个、约 17 GiB）→ 创建它的任务**：
-  两个清理器（clean-tmp、worktree_sweep）都不处理这类树，只能由创建任务自己收尾。
+- **`/tmp` 下带 `.git` 目录的独立 clone（非 worktree）→ 创建它的任务**：
+  现由每日 tmp_clone_sweep 按 owner 策略节处理，不再仅依靠创建任务收尾。
 
 ## 包缓存
 
 - `/data/.pnpm-store` 这类 package store 是 owner 管理的缓存，不是通用递归
-  删除目标；确认没有活跃包任务后，优先 `pnpm store prune`。
+  删除目标；按 owner 策略节逐版本调用 `pnpm store prune`，仅 pnpm store 写入命令阻塞，unknown 跳过；npm 和脚本进程不阻塞。
 
 ## Python 站点包
 
@@ -477,13 +501,14 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 ## 临时目录与 worktree
 
 - **owner 2026-11-14 批准**：`/tmp` 即 `/data/system-tmp` 的 bind mount（数据盘），
-  `/var/tmp` 是系统盘普通目录；两根沿用同一整项闲置 3 天规则，自动清理由
+  `/var/tmp` 是系统盘普通目录；两根普通项整树闲置 3 天、结构缓存满 24h，自动清理由
   每日北京时间 03:30 cron 执行（crontab `# devcloud-clean-tmp` 行）：外层 timeout 1790 秒，
   顺序执行 `/usr/bin/python3 -B <执行器> clean-tmp --path <固定根> --execute --age-days 3 --json`，
-  先 `/var/tmp` 再 `/data/system-tmp`；每根另有 timeout 875 秒、kill-after 10 秒，两根最多 1770 秒。
+  先 `/var/tmp`（内部预算 300 秒、timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒、timeout 1435 秒），
+  均 kill-after 10 秒，外层仍为 1790 秒。
   同一命令去掉 `--execute` 即预览，不接受其他路径。
-  `systemd-private-*`（及已有 `systemd-*`）始终跳过。保留期 3 天。唯一执行器为固定部署版
-  `/data/tools/devcloud-maintenance/releases/7ca528d7c5f3f004/bin/devcloud.py`；上一版
+  `systemd-private-*`（及已有 `systemd-*`）始终跳过。普通项保留期 3 天。唯一执行器为固定部署版
+  `/data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/bin/devcloud.py`；上一版 `7ca528d7c5f3f004` 及
   `df3e2b353d8e1c72`（仅 /tmp）、`f1e330c325c73fd0` 与 `1c2d71d3ab21cc79` 保留作回滚；后续升级先验收新快照，再同步 cron 版本路径与每日 DSH 检查，
   不执行共享工作区。
 - **systemd-tmpfiles 自 2026-11-04 起不再按年龄清理 `/tmp`**：`/etc/tmpfiles.d/tmp.conf` 为
@@ -530,16 +555,24 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
   证据未知则拒绝。内部有新文件、仓库、凭据、备份、数据库、socket、symlink、
   硬链接、挂载或外部可写文件的树保留。Mole 保护与用户 whitelist 同时约束
   原路径、/tmp 别名和删除入口，不允许隔离路径绕开保护。
-- 扫描预算 240 秒/单树 5 秒；不设候选数量上限，按大小排序处理，每根整轮预算 840 秒（含扫描）
-  用完为止，剩余项递延到下一轮，每项开始前预留 120 秒。读取 /proc 证据时进程正好退出的，
-  对同一 PID 最多重查 3 次（间隔约 100 ms）：原进程已退出、成为僵尸或 starttime 变了就继续；
-  同一进程一直存活、证据仍不全才拒绝。
-  单实例锁覆盖整轮；隔离后再核对对象引用与完整指纹，Mole dry-run 和最终
-  sink guard 均通过后删除；失败尝试恢复，原名已占用时保留原件并报告位置。
-  遗留隔离项会阻止下一轮执行，只可人工核实，不能当过期缓存清理。
+- **结构缓存按整目录闲置 24h**：仅两批准根的非符号链接直接物理子项可执行。普通项仍为 3 天；
+  精确匹配的 Go build cache、pnpm store、Node compile cache 以树内最新普通文件 mtime 判 24h，不用根 mtime。
+  Go 要求固定 README 首行、完整 00–ff 桶、对应哈希的 -a/-d 产物；pnpm 要求版本目录及 files、index/metadata
+  布局（v3 内嵌 *-index.json，v11 可为 SQLite index.db），校验桶、文件、已知元数据；Node 要求官方
+  版本–架构–V8 tag–uid 目录与 8 位十六进制文件。识别不出走原规则；混入仓库、凭据、未知内容或非空
+  pnpm 部分安装树则保留。符号链接、socket、硬链接、foreign owner、外部可写内容、挂载、inotify 继续保留。
+- **批量 /proc 快照与吞吐**：每批最多 128 项共用一次完整 PID/starttime/引用快照，未知整批拒绝。
+  owner 2026-11-14 明确授权：隔离后和 Mole 最终 sink 逐项只增量检查新增或 starttime 变化的 PID；
+  既有 PID 的可变引用不重扫。所有新增探针 unknown 仍拒绝；每项删除前重核结构、年龄、物理身份与完整指纹，
+  仍经 Mole dry-run 和最终 guard。最多 8 项并发；取消信号停止排队、终止 Mole 子进程组、恢复在途隔离项再退出，
+  遗留隔离项阻止下一轮。完整计划扫描上限 240 秒，单普通树 5 秒、结构缓存树 60 秒；不设数量上限，余项递延。
+  读取 /proc 时进程退出窗口错误只在有界复核证实消失、僵尸或 PID 重用时视为退出，证据仍不全则拒绝。
+- tmp 独立 clone 由每日 06:45 的 `tmp_clone_sweep.py` 处理，完整恢复条件见 owner 策略节；
+  worktree 清理每轮另补扫缺失 BB 环境，pnpm 每周日 05:30 逐版本 owner prune，均沿用该节规则。
+  `/data/bb-data/thread-storage/.shared-cache/` 是共享缓存，不在本段普通临时项或线程遗留范围。
 - 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted 事件与每根各一条
   summary 分开，`path` 区分两个根；错误日志为同名 `.stderr.log`。summary 记录两盘前后容量和
-  部分失败，失败非零。logrotate 每日检查，保留 14 份/最长 30 天、5 MiB
+  部分失败，失败非零；summary 增记 cache_roots（路径、类型、allocated bytes、最新文件 mtime）及 deleted_bytes。logrotate 每日检查，保留 14 份/最长 30 天、5 MiB
   检查阈值，不截断活跃日志。回归：`tests/test_devcloud_cleanup.py`；本机
   挂载与真实 Mole 路由另以专属测试文件验收，结果入 `storage-audit.log`。
 - 每日 DSH 检查只读两根 summary、比较容量并解释增长，必要时预览同一执行器；
