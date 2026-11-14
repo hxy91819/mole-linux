@@ -25,9 +25,10 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 TMP_ROOT = Path('/data/system-tmp')
@@ -38,13 +39,20 @@ PROC_ROOT = Path('/proc')
 STATE = Path('/data/metrics/devcloud-maintenance')
 LOG = Path('/data/metrics/devcloud-clean-tmp.log')
 REPO = Path(__file__).resolve().parent.parent
-# Host measurements: complete scans ~66-90s; guarded items ~2.4-6s each.
-# Cron runs the two roots sequentially: 2 * 840s < its 1790s TERM envelope.
+# Host measurement (2026-11-14): one guarded file 7.35s, dominated by repeated /proc scans.
+# Sequential cron budgets: /var/tmp 300s + /data/system-tmp 1400s, within 1790s.
 SCAN_SECONDS = 240
-RUN_SECONDS = 840
+RUN_SECONDS = 1400
+VAR_RUN_SECONDS = 300
 # Leave time for the existing per-item probes, Mole calls and restoration.
 ITEM_RUN_RESERVE_SECONDS = 120
 ITEM_SECONDS = 5
+CACHE_SECONDS = 60
+BATCH_SIZE = 128
+DELETE_WORKERS = 8
+CACHE_AGE_SECONDS = 86400
+CANCELLED = threading.Event()
+GO_README = b"This directory holds cached build artifacts from the Go build system.\n"
 # Mole 策略阶段逐个候选调用 validate_path_for_deletion（约 25ms）与
 # should_protect_path（约 17ms），单项约 50ms。单进程顺序跑 ~6.7k 候选会撞上原先
 # 硬编码的 30s 上限，整轮 fail-closed——这正是 /tmp 清理连续 4 天 deleted=0 的根因。
@@ -76,6 +84,8 @@ class Refused(RuntimeError):
 
 
 def checkpoint(deadline):
+    if CANCELLED.is_set():
+        raise InterruptedError('cleanup cancelled; restore staged items')
     if time.monotonic() >= deadline:
         raise TimeoutError('time budget exhausted; incomplete scan is not executable')
 
@@ -207,9 +217,14 @@ def mount_aliases(root, mounts):
     return aliases, mounted_children
 
 
-def process_snapshot(root, deadline):
-    """Read every live process; unreadable evidence refuses the entire scan."""
+def process_snapshot(root, deadline, known=None):
+    """Read live processes, skipping only PID/starttime pairs in a complete batch.
+
+    New/reused PIDs get the full tri-state probe even at the final staged sink.
+    Any unreadable identity or live evidence refuses; no partial snapshot escapes.
+    """
     reserved, watches, processes = set(), set(), []
+    identities = {}
     namespaces = {}
     ancestors = {os.getpid()}
     pid = os.getppid()
@@ -228,6 +243,8 @@ def process_snapshot(root, deadline):
             checkpoint(deadline)
             try:
                 before = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                if known is not None and known.get(proc.name) == before[19]:
+                    break
                 if before[0] == 'Z' or int(before[6]) & 0x200000:
                     break
                 if original_start is not None and before[19] != original_start:
@@ -272,11 +289,12 @@ def process_snapshot(root, deadline):
                 after = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
                 if before[19] != after[19]:
                     break  # The original process no longer holds references.
+                identities[proc.name] = before[19]
                 if via:
                     processes.append({'pid': int(proc.name), 'via': sorted(via),
                                       'cmdline': (proc / 'comm').read_text().strip()})
                 break
-            except (FileNotFoundError, ProcessLookupError):
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
                 try:
                     current = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
                     if current[0] == 'Z' or (original_start is not None and current[19] != original_start):
@@ -285,18 +303,108 @@ def process_snapshot(root, deadline):
                         raise Refused(f'incomplete evidence for live PID {proc.name}')
                 except (FileNotFoundError, ProcessLookupError):
                     break
-                # Exiting processes can lose /proc evidence before becoming zombies.
+                # Exiting or execing processes can temporarily lose /proc access
+                # (including EACCES while non-dumpable) before becoming zombies.
                 # Retry the complete probe, bounded by both count and scan deadline.
                 checkpoint(deadline)
                 time.sleep(min(0.1, max(0, deadline - time.monotonic())))
                 checkpoint(deadline)
             except (OSError, ValueError, KeyError, IndexError) as error:
                 raise Refused(f'cannot inspect PID {proc.name}: {type(error).__name__}') from error
-    return {'reserved': reserved, 'watches': watches, 'processes': processes}
+    return {'reserved': reserved, 'watches': watches, 'processes': processes, 'identities': identities}
 
 
-def tree_snapshot(path, cutoff, watches, deadline):
-    digest, size, entries = hashlib.sha256(), 0, 0
+def cache_kind(path):
+    """Recognize owner layouts, never task-specific directory names. No symlinks."""
+    if not stat.S_ISDIR(path.lstat().st_mode):
+        return None
+    with os.scandir(path) as children:
+        entries = {child.name: child for child in children}
+    dirs = {name for name, child in entries.items() if child.is_dir(follow_symlinks=False)}
+    buckets = {f'{n:02x}' for n in range(256)}
+    if dirs == buckets and set(entries) <= buckets | {'README', 'trim.txt'}:
+        readme = entries.get('README')
+        if readme and readme.is_file(follow_symlinks=False):
+            with open(path / 'README', 'rb') as stream:
+                if stream.readline(256) == GO_README:
+                    return 'go-build'
+    if entries and dirs == set(entries) and all(re.fullmatch(r'v[0-9]+', n) for n in dirs):
+        # v3 keeps its index beside content as *-index.json; newer versions split it.
+        valid = True
+        for name in dirs:
+            version = path / name
+            files = version / 'files'
+            if not files.is_dir() or files.is_symlink():
+                valid = False
+                break
+            if not any((version / n).is_dir() and not (version / n).is_symlink()
+                       for n in ('index', 'metadata')):
+                embedded = name == 'v3' and any(files.glob('[0-9a-f][0-9a-f]/*-index.json'))
+                database = version / 'index.db'
+                db_metadata = False
+                if name == 'v11' and database.is_file() and not database.is_symlink():
+                    with database.open('rb') as stream:
+                        db_metadata = stream.read(16) == b'SQLite format 3\0'
+                if not (embedded or db_metadata):
+                    valid = False
+                    break
+        if valid:
+            return 'pnpm-store'
+    if entries and dirs == set(entries) and all(
+            re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+-[a-z0-9_]+-[0-9a-f]{8}-[0-9]+', n) for n in dirs):
+        found = False
+        for name in dirs:
+            with os.scandir(path / name) as children:
+                for child in children:
+                    if not child.is_file(follow_symlinks=False) or not re.fullmatch('[0-9a-f]{8}', child.name):
+                        return None
+                    found = True
+        if found:
+            return 'node-compile'
+    return None
+
+
+def cache_member(kind, relative, mode):
+    """Keep mixed/authored data out of a recognized Go/Node cache."""
+    parts = Path(relative).parts
+    if relative == '.':
+        return True
+    if kind == 'go-build':
+        if len(parts) == 1:
+            return (parts[0] in ('README', 'trim.txt') and stat.S_ISREG(mode)
+                    or re.fullmatch('[0-9a-f]{2}', parts[0]) and stat.S_ISDIR(mode))
+        return (len(parts) == 2 and stat.S_ISREG(mode)
+                and re.fullmatch(parts[0] + r'[0-9a-f]{62}-[ad]', parts[1]))
+    if kind == 'node-compile':
+        return (len(parts) == 1 and stat.S_ISDIR(mode)
+                or len(parts) == 2 and stat.S_ISREG(mode) and re.fullmatch('[0-9a-f]{8}', parts[1]))
+    if kind == 'pnpm-store':
+        if len(parts) == 1:
+            return stat.S_ISDIR(mode)
+        section = parts[1]
+        if len(parts) == 2:
+            if section in ('index.db', 'index.db-wal', 'index.db-shm'):
+                return parts[0] == 'v11' and stat.S_ISREG(mode)
+            return (stat.S_ISDIR(mode) and (section in ('files', 'index', 'metadata', 'projects', 'tmp', 'partial')
+                    or re.fullmatch(r'(?:file|https?|git)\+[^/]+', section)))
+        if section in ('files', 'index', 'metadata'):
+            if len(parts) == 3:
+                return bool(re.fullmatch('[0-9a-f]{2}', parts[2]) and stat.S_ISDIR(mode))
+            if len(parts) != 4 or not stat.S_ISREG(mode):
+                return False
+            if section == 'files':
+                return bool(re.fullmatch(r'[0-9a-f]{126}(?:-exec|-index\.json)?', parts[3]))
+            return bool(re.fullmatch(r'[0-9a-f]{62}-.+\.json', parts[3]))
+        if section == 'projects':
+            return len(parts) == 3 and stat.S_ISREG(mode) and bool(re.fullmatch('[0-9a-f]{32}', parts[2]))
+        # Unknown partial installs or unpacked source trees are retained.
+        return (len(parts) == 3 and parts[2] == 'integrity.json' and stat.S_ISREG(mode)
+                and bool(re.fullmatch(r'(?:file|https?|git)\+[^/]+', section)))
+    return False
+
+
+def tree_snapshot(path, cutoff, watches, deadline, cache_type=None):
+    digest, size, entries, latest = hashlib.sha256(), 0, 0, 0.0
     device = path.lstat().st_dev
     stack = [path]
     while stack:
@@ -310,9 +418,15 @@ def tree_snapshot(path, cutoff, watches, deadline):
             raise Refused('symlink, socket or special file')
         if s.st_uid != 0 or s.st_mode & 0o022 or (stat.S_ISREG(s.st_mode) and s.st_nlink != 1):
             raise Refused('foreign owner, writable tree or shared file')
-        if item.name in PERSISTENT_NAMES or item.name.endswith(PERSISTENT_SUFFIXES):
+        if cache_type and not cache_member(cache_type, relative, s.st_mode):
+            raise Refused('mixed cache layout')
+        owner_database = (cache_type == 'pnpm-store' and len(Path(relative).parts) == 2
+                          and item.name in ('index.db', 'index.db-wal', 'index.db-shm'))
+        if (item.name in PERSISTENT_NAMES or item.name.endswith(PERSISTENT_SUFFIXES)) and not owner_database:
             raise Refused('repository or persistent state')
-        if s.st_mtime > cutoff:
+        if stat.S_ISREG(s.st_mode):
+            latest = max(latest, s.st_mtime)
+        if s.st_mtime > cutoff and (not cache_type or stat.S_ISREG(s.st_mode)):
             raise Refused('recent descendant')
         key = (os.major(s.st_dev) << 20 | os.minor(s.st_dev), s.st_ino)
         if key in watches:
@@ -325,7 +439,10 @@ def tree_snapshot(path, cutoff, watches, deadline):
         if stat.S_ISDIR(s.st_mode):
             with os.scandir(item) as children:
                 stack.extend(sorted((Path(child.path) for child in children), reverse=True))
-    return {'fingerprint': digest.hexdigest(), 'bytes': size, 'entries': entries}
+    result = {'fingerprint': digest.hexdigest(), 'bytes': size, 'entries': entries}
+    if cache_type:
+        result.update(cache_type=cache_type, latest_file_mtime=latest)
+    return result
 
 
 def build_plan(root, cutoff, deadline):
@@ -333,26 +450,35 @@ def build_plan(root, cutoff, deadline):
     plan, skipped = [], Counter()
     with os.scandir(root) as children:
         names = sorted(child.name for child in children)
-    for name in names:
+    def inspect(name):
         checkpoint(deadline)
         if (name in PROTECTED_NAMES or name.startswith(PROTECTED_PREFIXES)
                 or name.startswith('systemd-') or (name.startswith('.X') and name.endswith('-lock'))):
-            skipped['protected name'] += 1
-            continue
+            return None, 'protected name'
         if name in live['reserved']:
-            skipped['live or mount reference'] += 1
-            continue
+            return None, 'live or mount reference'
         try:
-            snapshot = tree_snapshot(root / name, cutoff, live['watches'],
-                                     min(deadline, time.monotonic() + ITEM_SECONDS))
-            plan.append({'name': name, **snapshot})
+            kind = cache_kind(root / name)
+            snapshot = tree_snapshot(root / name, time.time() - CACHE_AGE_SECONDS if kind else cutoff,
+                                     live['watches'], min(deadline, time.monotonic() +
+                                                         (CACHE_SECONDS if kind else ITEM_SECONDS)), kind)
+            return {'name': name, **snapshot}, None
         except Refused as error:
-            skipped[str(error)] += 1
+            return None, str(error)
         except TimeoutError:
             checkpoint(deadline)
-            skipped['slow tree retained'] += 1
+            return None, 'slow tree retained'
         except FileNotFoundError:
-            skipped['disappeared'] += 1
+            return None, 'disappeared'
+
+    with ThreadPoolExecutor(max_workers=DELETE_WORKERS) as pool:
+        # Bound queued work as well as active work; never materialize a partial scan.
+        for offset in range(0, len(names), BATCH_SIZE):
+            for row, reason in pool.map(inspect, names[offset:offset + BATCH_SIZE]):
+                if row is not None:
+                    plan.append(row)
+                else:
+                    skipped[reason] += 1
     checkpoint(deadline)
     allowed = policy_candidates(root, [row['name'] for row in plan], deadline)
     skipped['Mole protection or whitelist'] += len(plan) - len(allowed)
@@ -446,17 +572,21 @@ def final_guard(receipt):
         raise Refused('invalid staged name')
     root = VAR_TMP_ROOT if receipt.parent.parent == VAR_STATE else TMP_ROOT
     if (record.get('source') != str(root / record['name'])
-            or not math.isfinite(record['cutoff']) or record['cutoff'] > time.time() - 3 * 86400):
+            or not math.isfinite(record['cutoff'])
+            or record['cutoff'] > time.time() - (CACHE_AGE_SECONDS if record.get('cache_type') else 3 * 86400)):
         raise Refused('receipt is outside the approved path or retention policy')
     validate_root(root)
     item = receipt.parent / record['name']
     if item.parent != receipt.parent or item.name != record['name']:
         raise Refused('invalid staged item')
-    deadline = time.monotonic() + 20
-    live = process_snapshot(item, deadline)
+    deadline = time.monotonic() + (CACHE_SECONDS if record.get("cache_type") else 20)
+    live = process_snapshot(item, deadline, record.get('process_identities'))
     if live['reserved']:
         raise Refused('staged item acquired a process or mount reference')
-    snapshot = tree_snapshot(item, record['cutoff'], live['watches'], deadline)
+    kind = record.get('cache_type')
+    if kind and cache_kind(item) != kind:
+        raise Refused('staged cache layout changed')
+    snapshot = tree_snapshot(item, record['cutoff'], live['watches'], deadline, kind)
     if snapshot['fingerprint'] != record['fingerprint']:
         raise Refused('staged contents changed')
 
@@ -482,7 +612,14 @@ mole_delete "$4" false
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, env=mole_environment(preview), start_new_session=True)
     try:
-        stdout, stderr = child.communicate(timeout=seconds)
+        child_deadline = time.monotonic() + seconds
+        while True:
+            checkpoint(child_deadline)
+            try:
+                stdout, stderr = child.communicate(timeout=min(0.2, child_deadline - time.monotonic()))
+                break
+            except subprocess.TimeoutExpired:
+                continue
     except BaseException:
         try:
             os.killpg(child.pid, signal.SIGTERM)
@@ -507,26 +644,34 @@ def rename_exclusive(source, destination):
         raise OSError(error, os.strerror(error))
 
 
-def execute_item(root, candidate, cutoff, deadline):
+def execute_item(root, candidate, cutoff, deadline, batch_live=None):
     checkpoint(deadline)
     validate_root(root)
-    live = process_snapshot(root, deadline)
+    live = batch_live if batch_live is not None else process_snapshot(root, deadline)
     name = candidate['name']
     if name in live['reserved']:
         raise Refused('candidate acquired a live reference')
+    kind = candidate.get('cache_type')
+    if kind:
+        cutoff = time.time() - CACHE_AGE_SECONDS
+        if cache_kind(root / name) != kind:
+            raise Refused('cache layout changed since preview')
     current = tree_snapshot(root / name, cutoff, live['watches'],
-                            min(deadline, time.monotonic() + ITEM_SECONDS))
-    if current != {key: candidate[key] for key in ('fingerprint', 'bytes', 'entries')}:
+                            min(deadline, time.monotonic() + (CACHE_SECONDS if kind else ITEM_SECONDS)), kind)
+    if any(current[key] != candidate[key] for key in ('fingerprint', 'bytes', 'entries')):
         raise Refused('candidate changed since preview')
     stage = Path(tempfile.mkdtemp(prefix='item-', dir=state_for(root)))
     item, receipt = stage / name, stage / 'receipt.json'
     if name == receipt.name:
         stage.rmdir()
         raise Refused('reserved receipt name')
-    record = {**candidate, 'cutoff': cutoff, 'source': str(root / name)}
+    record = {**candidate, 'cutoff': cutoff, 'source': str(root / name),
+              'process_identities': live.get('identities')}
     try:
         write_receipt(receipt, record)
-        append_log({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'intent', **record, 'path': str(root / name), 'staged': str(item)})
+        append_log({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'intent',
+                    **{key: value for key, value in record.items() if key != 'process_identities'},
+                    'path': str(root / name), 'staged': str(item)})
         # 根目录 cwd 不代表每个子项在用；隔离移除旧入口，再检查旧对象的实际引用。
         rename_exclusive(root / name, item)
         final_guard(receipt)
@@ -577,6 +722,7 @@ def _main(argv=None):
             raise Refused('age must be finite and >= 3 days; display limit must be nonnegative')
         root = validate_root(options.path)
         summary['path'] = str(root)
+        run_seconds = min(RUN_SECONDS, VAR_RUN_SECONDS) if root == VAR_TMP_ROOT else RUN_SECONDS
         state = state_for(root)
         if options.execute:
             trusted(state.parent)
@@ -600,23 +746,60 @@ def _main(argv=None):
         summary.update(scan='complete', candidates=len(selected), eligible=len(plan),
                        deferred=len(plan) - len(selected), skipped=skipped,
                        candidate_bytes=sum(row['bytes'] for row in selected),
-                       sample=[row['name'] for row in selected[:options.limit]])
+                       sample=[row['name'] for row in selected[:options.limit]],
+                       cache_roots=[{'path': str(root / row['name']),
+                                     **{key: row[key] for key in ('cache_type', 'bytes', 'latest_file_mtime')}}
+                                    for row in selected if row.get('cache_type')])
         if options.execute:
-            for index, candidate in enumerate(selected):
-                if started + RUN_SECONDS - time.monotonic() < ITEM_RUN_RESERVE_SECONDS:
-                    summary.update(deferred=len(selected) - index, deferred_reason='execution budget')
-                    break
-                try:
-                    execute_item(root, candidate, cutoff, started + RUN_SECONDS)
-                    summary['deleted'] += 1
-                    append_log({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'deleted',
-                                'path': str(root / candidate['name']), 'bytes': candidate['bytes']})
-                except Exception as error:
-                    summary['failed'] += 1
-                    summary['deferred'] = len(selected) - index - 1
-                    summary['error'] = str(error)
-                    code = 1
-                    break
+            def remove(candidate, live):
+                checkpoint(started + run_seconds)
+                if started + run_seconds - time.monotonic() < ITEM_RUN_RESERVE_SECONDS:
+                    return False
+                execute_item(root, candidate, cutoff, started + run_seconds, live)
+                append_log({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'deleted',
+                            'path': str(root / candidate['name']), 'bytes': candidate['bytes'],
+                            'cache_type': candidate.get('cache_type')})
+                return True
+
+            with ThreadPoolExecutor(max_workers=DELETE_WORKERS) as pool:
+                for offset in range(0, len(selected), BATCH_SIZE):
+                    if started + run_seconds - time.monotonic() < ITEM_RUN_RESERVE_SECONDS:
+                        break
+                    # A complete, fresh scan per bounded batch. Never use a partial snapshot.
+                    live = process_snapshot(root, started + run_seconds)
+                    batch = selected[offset:offset + BATCH_SIZE]
+                    futures = [pool.submit(remove, candidate, live) for candidate in batch]
+                    cancellation = None
+                    try:
+                        wait(futures)
+                    except InterruptedError as error:
+                        CANCELLED.set()
+                        cancellation = error
+                        for future in futures:
+                            future.cancel()
+                        # Workers kill their Mole process group and restore isolated items.
+                        wait(futures)
+                    for future, candidate in zip(futures, batch):
+                        if future.cancelled():
+                            continue
+                        try:
+                            if future.result():
+                                summary['deleted'] += 1
+                                summary['deleted_bytes'] = summary.get('deleted_bytes', 0) + candidate['bytes']
+                        except InterruptedError as error:
+                            cancellation = error
+                        except Exception as error:
+                            summary['failed'] += 1
+                            summary['error'] = str(error)
+                            code = 1
+                    if cancellation is not None:
+                        summary['deferred'] = len(selected) - summary['deleted'] - summary['failed']
+                        raise cancellation
+                    if code:
+                        break
+            summary['deferred'] = len(selected) - summary['deleted'] - summary['failed']
+            if summary['deferred'] and not code:
+                summary['deferred_reason'] = 'execution budget'
     except Exception as error:
         code = 2
         summary.update(error=str(error), scan=summary.get('scan', 'incomplete'))
@@ -652,7 +835,12 @@ def _main(argv=None):
 
 
 def main(argv=None):
+    CANCELLED.clear()
+
     def interrupted(signum, _frame):
+        if CANCELLED.is_set():
+            return  # A second TERM must not interrupt restoration or child reaping.
+        CANCELLED.set()
         raise InterruptedError(f'cleanup cancelled by signal {signum}')
 
     previous = {sig: signal.signal(sig, interrupted) for sig in (signal.SIGTERM, signal.SIGINT)}
@@ -661,6 +849,7 @@ def main(argv=None):
     finally:
         for sig, handler in previous.items():
             signal.signal(sig, handler)
+        CANCELLED.clear()
 
 
 if __name__ == '__main__':
