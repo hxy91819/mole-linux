@@ -7,7 +7,7 @@ files or calls Docker prune, package-manager cleanup, or database maintenance
 by itself.
 
 The one exception is `clean-tmp`, a bounded age-based cleanup for the /tmp
-bind mount on this host (owner-approved policy: E2E debris otherwise
+bind mount and /var/tmp on this host (owner-approved policy: E2E debris otherwise
 accumulates forever). It stays dry-run by default, refuses protected roots,
 and re-scans live process state immediately before deleting.
 """

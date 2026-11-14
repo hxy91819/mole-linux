@@ -441,20 +441,23 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 ## 临时目录与 worktree
 
-- `/tmp` 即 `/data/system-tmp` 的 bind mount（数据盘），自动清理由
+- **owner 2026-11-14 批准**：`/tmp` 即 `/data/system-tmp` 的 bind mount（数据盘），
+  `/var/tmp` 是系统盘普通目录；两根沿用同一整项闲置 3 天规则，自动清理由
   每日北京时间 03:30 cron 执行（crontab `# devcloud-clean-tmp` 行）：外层 timeout 1790 秒，
-  `/usr/bin/python3 -B <执行器> clean-tmp --execute --age-days 3 --json`；同一命令去掉 `--execute` 即预览。
-  保留期 3 天。唯一执行器为固定部署版
-  `/data/tools/devcloud-maintenance/releases/df3e2b353d8e1c72/bin/devcloud.py`；上一版
-  `f1e330c325c73fd0` 与 `1c2d71d3ab21cc79` 保留作回滚；后续升级先验收新快照，再同步每日/每周版本路径，
-  不执行共享工作区。每周复盘任务已同步到该路径。
+  顺序执行 `/usr/bin/python3 -B <执行器> clean-tmp --path <固定根> --execute --age-days 3 --json`，
+  先 `/var/tmp` 再 `/data/system-tmp`；每根另有 timeout 875 秒、kill-after 10 秒，两根最多 1770 秒。
+  同一命令去掉 `--execute` 即预览，不接受其他路径。
+  `systemd-private-*`（及已有 `systemd-*`）始终跳过。保留期 3 天。唯一执行器为固定部署版
+  `/data/tools/devcloud-maintenance/releases/7ca528d7c5f3f004/bin/devcloud.py`；上一版
+  `df3e2b353d8e1c72`（仅 /tmp）、`f1e330c325c73fd0` 与 `1c2d71d3ab21cc79` 保留作回滚；后续升级先验收新快照，再同步 cron 版本路径与每日 DSH 检查，
+  不执行共享工作区。
 - **systemd-tmpfiles 自 2026-11-04 起不再按年龄清理 `/tmp`**：`/etc/tmpfiles.d/tmp.conf` 为
   `q /tmp 0700 root root -`（age 一栏为 `-`）。原 3d 规则逐个文件删除，曾把闲置 worktree 里的已跟踪
   文件删掉（32 个 /tmp worktree 中 7 个受损）；遇到孤立 FIFO 时还会卡死，10-30 起整个 tmpfiles 清理
   因此停过 4 天 20 小时。活体探针：`systemd-tmpfiles --cat-config | grep -E '^q /tmp '`。
 - 升级必须新建快照：目录名 = `manifest.json` 规范化内容的 sha256 前 16 位，全部文件逐项
   记录 sha256 与 mode，目录/文件置只读；验收 = 清单复算 + 真实 preview，再改 cron 与
-  每周 BB 任务里的版本路径（两处都要改，改完 `grep releases/` 核对）。
+  每日 DSH 检查覆盖的根（改完回读 cron 和检查任务核对）。
   回归：`tests/test_devcloud_cleanup.py::test_policy_shards_cover_every_candidate_exactly_once`
   与 `::test_policy_shard_refusal_discards_the_whole_candidate_set`。
 - **历史｜2026-11-04 分片吞吐验证**：本次不可变快照的 43 个 payload 只改变
@@ -485,25 +488,30 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
   永远排不进来。只能分片并行（`POLICY_SHARDS`），任一分支片失败或超时必须整轮 fail-closed，
   不得接受部分结果。
 - 清理器要求数据盘和别名身份正确，根及祖先为 root 所有且不对其他用户可写。
+  `/var/tmp` 是唯一例外：根本身允许 sticky 写权限，祖先仍须可信，必须在系统盘且不是挂载点；
+  所有候选仍须 root 所有且不对其他用户可写。隔离区分别为
+  `/data/metrics/devcloud-maintenance/` 和 `/var/lib/devcloud-maintenance/`，均在源文件系统且祖先可信。
   完整扫描检查 cwd/exe/fd/maps、绝对 argv、各 mount namespace 和 inotify；
   证据未知则拒绝。内部有新文件、仓库、凭据、备份、数据库、socket、symlink、
   硬链接、挂载或外部可写文件的树保留。Mole 保护与用户 whitelist 同时约束
   原路径、/tmp 别名和删除入口，不允许隔离路径绕开保护。
-- 扫描预算 240 秒/单树 5 秒；不设候选数量上限，按大小排序处理，执行预算 1740 秒
+- 扫描预算 240 秒/单树 5 秒；不设候选数量上限，按大小排序处理，每根整轮预算 840 秒（含扫描）
   用完为止，剩余项递延到下一轮，每项开始前预留 120 秒。读取 /proc 证据时进程正好退出的，
   对同一 PID 最多重查 3 次（间隔约 100 ms）：原进程已退出、成为僵尸或 starttime 变了就继续；
   同一进程一直存活、证据仍不全才拒绝。
   单实例锁覆盖整轮；隔离后再核对对象引用与完整指纹，Mole dry-run 和最终
   sink guard 均通过后删除；失败尝试恢复，原名已占用时保留原件并报告位置。
   遗留隔离项会阻止下一轮执行，只可人工核实，不能当过期缓存清理。
-- 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted 事件与唯一
-  summary 分开；错误日志为同名 `.stderr.log`。summary 记录两盘前后容量和
+- 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted 事件与每根各一条
+  summary 分开，`path` 区分两个根；错误日志为同名 `.stderr.log`。summary 记录两盘前后容量和
   部分失败，失败非零。logrotate 每日检查，保留 14 份/最长 30 天、5 MiB
   检查阈值，不截断活跃日志。回归：`tests/test_devcloud_cleanup.py`；本机
   挂载与真实 Mole 路由另以专属测试文件验收，结果入 `storage-audit.log`。
-- 每周 BB 任务只读每日 summary、比较容量并解释增长，必要时预览同一执行器；
+- 每日 DSH 检查只读两根 summary、比较容量并解释增长，必要时预览同一执行器；
   没有第二套 14 天删除流程，也不执行迁移。系统盘实际使用率达到 70% 时
-  突出报告；/tmp 清理只释放数据盘，不能声称达到系统盘降占用目标。
+  突出报告；/tmp 清理释放数据盘，/var/tmp 清理释放系统盘。
+  `/etc/tmpfiles.d/tmp.conf` 继续遮蔽系统默认 `/var/tmp` 30 天规则，禁止恢复逐文件年龄清理。
+  每日 DSH 检查第 3 项分别核对两个根最近一次 03:30 后的 summary，均需 complete/ok、failed=0。
 - `/data/tmp` 和其他测试产物需要结合 owner、持久数据及活动证据逐项审查；
   年龄和无进程引用不足以授权删除；目录叫 `tmp` 不构成可弃证据。
 

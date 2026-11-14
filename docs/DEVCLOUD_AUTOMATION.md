@@ -4,15 +4,15 @@
 
 定时任务现状以 `bb automation list` / `bb automation show` 为准，下表为撰写时快照。三个脚本任务运行
 `/data/tools/devcloud-storage-upkeep/releases/<16 位快照哈希>/` 下的不可变副本，文档不写死版本号；
-/tmp 清理使用独立快照 `df3e2b353d8e1c72`。
+/tmp 与 /var/tmp 清理使用独立快照 `7ca528d7c5f3f004`。
 
 | 任务 | 时间 | 入口 | 范围 | 状态 |
 | --- | --- | --- | --- | --- |
 | 存储：Docker 残留（每小时） | 每小时第 7 分钟 | BB 脚本任务：`docker_leftovers.py --execute --quiet`（storage-upkeep 快照） | 满 1 小时的匿名测试 DB 卷、满 24 小时的悬空镜像、满 72 小时的 BuildKit 缓存；持 fork-maintenance run.lock 非阻塞 flock，拿不到即跳过，删卷前排除 retained_volumes | 启用 |
 | 存储：worktree 清理（每天） | 每天 06:30 | BB 脚本任务：`worktree_sweep.py --execute --quiet --budget-minutes 12`（storage-upkeep 快照） | 无人用且闲置满 24 小时的附加 worktree：已在远端直接删，否则归档核验后删 | 启用 |
 | 存储：Go 缓存修剪（每小时） | 每小时第 37 分钟 | BB 脚本任务：`go_cache_trim.py --execute --quiet`（storage-upkeep 快照） | go-build 里 2 小时以上没用过的条目；Go 只在条目 mtime 超过 1 小时时才刷新它，所以正在跑的构建用不到被删的条目。npm、pnpm 不自动清 | 启用 |
-| 存储：每日 DSH 检查 | 每天 07:30 | BB agent 任务 `auto_5gacevqssoe`（acp-dsh，DeepSeek V4.1 Flash），只读 | 核对三个脚本任务的定时运行、Go 缓存修剪、03:30 的 /tmp 清理、systemd-tmpfiles 和 / 与 /data 的可用空间（都 ≥150 GiB）；全部符合不出声，不符合时合成一条消息发给协调线程 thr_tikzbd34dg。协调线程换了要同步改这个任务的 prompt | 启用 |
-| /tmp 清理 | 每天 03:30 | crontab `# devcloud-clean-tmp`：`clean-tmp --execute --age-days 3 --json`（外层 timeout 1790 秒） | /tmp 满 3 天候选：扫描预算 240 秒、单树 5 秒、不限数量按大小排序、执行预算 1740 秒用完为止 | 启用 |
+| 存储：每日 DSH 检查 | 每天 07:30 | BB agent 任务 `auto_5gacevqssoe`（acp-dsh，DeepSeek V4.1 Flash），只读 | 核对三个脚本任务的定时运行、Go 缓存修剪、03:30 的 /tmp 与 /var/tmp 清理、systemd-tmpfiles 和 / 与 /data 的可用空间（都 ≥150 GiB）；全部符合不出声，不符合时合成一条消息发给协调线程 thr_tikzbd34dg。协调线程换了要同步改这个任务的 prompt | 启用 |
+| /tmp 与 /var/tmp 清理 | 每天 03:30 | crontab `# devcloud-clean-tmp`：`clean-tmp --path <固定根> --execute --age-days 3 --json`（外层 timeout 1790 秒，先 /var/tmp 再 /data/system-tmp，每根 timeout 875 秒、kill-after 10 秒） | 两根整项闲置满 3 天：每根扫描预算 240 秒、单树 5 秒、不限数量按大小排序、每根整轮预算 840 秒（含扫描），余项递延；跳过 systemd-private-* | 启用 |
 2026-11-05 owner 决定，存储自动化统一使用上表这套配置。已删除：`auto_aburimdwdjg`（每周系统盘容量复盘，系统盘容量改由每日 DSH 检查覆盖）、`auto_caovoqtwj9e`（每周 DB 存储巡检与安全清理）、`auto_cvheqhfkaf4`（空间清理独立检查，原已暂停），以及项目 proj_bdg8tywu4a 的 `auto_o3pwesztbpg`（fork-maintenance 09:00 闲置工作区清理）。删除前的完整配置存档在 `/root/.local/state/devcloud-storage-upkeep/retired-automations-20261105.json`。下列 systemd 定时器不属于这套存储维护，继续保留：`safe-system-cleanup.timer`（周日 05:00 清 DNF 缓存和归档 journal）、`clean-openclaw-residue.timer`（每小时清 OpenClaw 卸载残留）、`html-preview-gc.timer` 和 `codebuddy-logrotate.timer`（生产端自带的过期清理与日志轮转）。
 
 systemd-tmpfiles 自 2026-11-04 起不再清理 `/tmp`（`/etc/tmpfiles.d/tmp.conf` 为 `q /tmp 0700 root root -`）：
@@ -68,23 +68,24 @@ systemd-tmpfiles 自 2026-11-04 起不再清理 `/tmp`（`/etc/tmpfiles.d/tmp.co
 
 `bin/devcloud.py clean-tmp` 路由到内部 `bin/devcloud_tmp.py`。参数与原入口兼容，默认只预览；执行边界为：
 
-- 只接受 `/data/system-tmp` 和验证过的 `/tmp` bind 别名，要求数据盘正确挂载、临时根及祖先为 root 所有且不可被其他用户写入。
+- 只接受 `/data/system-tmp`、验证过的 `/tmp` bind 别名和固定系统盘根 `/var/tmp`。数据盘须正确挂载；根及祖先须 root 所有且不可被其他用户写入，唯 `/var/tmp` 根允许 sticky 写权限且不得是挂载点；候选仍不可被其他用户写入。始终跳过 `systemd-private-*`（及已有 `systemd-*`）。systemd-tmpfiles 的 `/var/tmp` 30 天规则继续被覆盖，不恢复逐文件年龄清理。
 - 检查 cwd/exe/fd/maps、绝对路径参数、各进程挂载命名空间和 inotify；进程证据不可读时拒绝整个扫描，挂载、监听和 socket 保留。
 - 父目录旧但内部有新文件时保留；不完整或超时的扫描不产生可执行候选。
 - 预览与执行都检查 Mole 保护名单和用户 whitelist，覆盖原路径及 `/tmp` 别名。保留仓库、凭据、数据库、备份、符号链接、特殊文件、共享硬链接和可被其他用户修改的树。
-- 每次完整扫描最多 240 秒，单树最多 5 秒；不设候选数量上限，按大小排序处理，整轮执行预算 1740 秒用完为止，剩余项递延到下一轮，每项开始前预留 120 秒。保留期 3 天，cron 外层 timeout 1790 秒兜底。读取 /proc 证据时进程正好退出的，对同一 PID 最多重查 3 次，证据仍不全才拒绝。
-- 单实例锁覆盖扫描和删除。候选先移到数据盘私有隔离区，再检查实际对象的引用和完整树指纹，通过 Mole dry-run 及最终删除边界复查后交给 `mole_delete`。失败尝试恢复原名；原名被占用时保留隔离原件并报告位置，后续任务停止等待检查。
-- 退出 0 表示完整成功/预览，1 表示部分执行失败，2 表示拒绝或证据未知；执行只写一条最终 summary，保留独立 intent/deleted 事件及 Mole 操作日志。
+- 每次完整扫描最多 240 秒，单树最多 5 秒；不设候选数量上限，按大小排序处理，每根整轮预算 840 秒（含扫描）用完为止，剩余项递延到下一轮，每项开始前预留 120 秒。保留期 3 天，cron 外层 timeout 1790 秒兜底。读取 /proc 证据时进程正好退出的，对同一 PID 最多重查 3 次，证据仍不全才拒绝。
+- 单实例锁覆盖扫描和删除。候选先移到源文件系统的私有隔离区（/tmp 用 `/data/metrics/devcloud-maintenance/`，/var/tmp 用 `/var/lib/devcloud-maintenance/`），再检查实际对象的引用和完整树指纹，通过 Mole dry-run 及最终删除边界复查后交给 `mole_delete`。失败尝试恢复原名；原名被占用时保留隔离原件并报告位置，后续任务停止等待检查。
+- 退出 0 表示完整成功/预览，1 表示部分执行失败，2 表示拒绝或证据未知；每根执行只写一条最终 summary，以 `path` 区分，保留独立 intent/deleted 事件及 Mole 操作日志。
 
-本次部署：`/data/tools/devcloud-maintenance/releases/df3e2b353d8e1c72/`（2026-11-04 起每日使用；上一版 `f1e330c325c73fd0` 与 `1c2d71d3ab21cc79` 保留作回滚），包含执行器及配套 Mole `lib/`，全部文件均有 SHA-256 清单；快照目录名即清单内容的 sha256 前 16 位，可由 `manifest.json` 复算。cron 与每周 BB 任务直接引用该版本和系统 `/usr/bin/python3 -B`，不执行共享工作区或可变 current 链接。后续升级需新建快照、验证后更新既有任务中的版本路径；不自动拉取源码。
+本次部署：`/data/tools/devcloud-maintenance/releases/7ca528d7c5f3f004/`（2026-11-14 扩展 /var/tmp；上一版 `df3e2b353d8e1c72` 及 `f1e330c325c73fd0` 与 `1c2d71d3ab21cc79` 保留作回滚），包含执行器及配套 Mole `lib/`，全部文件均有 SHA-256 清单；快照目录名即清单内容的 sha256 前 16 位，可由 `manifest.json` 复算。cron 直接引用该版本和系统 `/usr/bin/python3 -B`，每日 DSH 检查读取两根 summary，不执行共享工作区或可变 current 链接。后续升级需新建快照、验证后更新 cron 版本路径并回读 DSH 检查范围；不自动拉取源码。
 
 ```bash
-/usr/bin/python3 -B /data/tools/devcloud-maintenance/releases/df3e2b353d8e1c72/bin/devcloud.py clean-tmp --age-days 3 --json
+/usr/bin/python3 -B /data/tools/devcloud-maintenance/releases/7ca528d7c5f3f004/bin/devcloud.py clean-tmp --path /var/tmp --age-days 3 --json
+/usr/bin/python3 -B /data/tools/devcloud-maintenance/releases/7ca528d7c5f3f004/bin/devcloud.py clean-tmp --path /data/system-tmp --age-days 3 --json
 # 已授权的手工执行：同一命令增加 --execute
 /usr/bin/python3 -B -m unittest discover -s tests -p test_devcloud_cleanup.py -v
 ```
 
-每日 JSONL：`/data/metrics/devcloud-clean-tmp.log`；启动/异常 stderr：`/data/metrics/devcloud-clean-tmp.stderr.log`；锁和待恢复原件：`/data/metrics/devcloud-maintenance/`。summary 包含两盘前后实际使用率、可用字节、候选数量/字节、删除数、跳过原因、失败原因、耗时和系统盘 70% 报告标记。`/tmp` 删除字节是数据盘上的候选块大小，不能声称释放了系统盘空间，也不能把并发造成的 df 差值全算作回收量。
+每日 JSONL：`/data/metrics/devcloud-clean-tmp.log`；启动/异常 stderr：`/data/metrics/devcloud-clean-tmp.stderr.log`；锁和待恢复原件：`/data/metrics/devcloud-maintenance/` 与 `/var/lib/devcloud-maintenance/`。summary 按 `path` 分根，包含两盘前后实际使用率、可用字节、候选数量/字节、删除数、跳过原因、失败原因、耗时和系统盘 70% 报告标记。`/tmp` 删除字节属于数据盘，`/var/tmp` 属于系统盘；不能把并发造成的 df 差值全算作回收量。每日 DSH 检查第 3 项分别核对两根最近一次 03:30 后的 summary，均需 complete/ok、failed=0。
 
 已有 `logrotate.timer` 每日检查两个日志，配置为每日轮转、检查时超过 5 MiB 提前轮转、保留 14 份/最长 30 天，压缩旧文件；不截断活跃日志。周任务读取 summary 和轮转日志，核查失败/漏跑并输出容量复盘；必要时只预览同一清理器，已撤掉独立的 14 天删除规则。
 
