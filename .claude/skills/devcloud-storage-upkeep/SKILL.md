@@ -15,7 +15,7 @@ description: 本机（Linux DevCloud）数据盘的长期存储维护：查清�
 
 | 类别 | 例子 | 处置 |
 |---|---|---|
-| 可重建缓存 | go-build、npm `_cacache`、pnpm store、Docker 悬空镜像和 BuildKit、无主匿名测试 DB 卷 | go-build 每小时只删 2 小时以上没用过的条目；npm、pnpm 不自动清。Docker 残留仍由 `scripts/docker_leftovers.py` 每小时清 |
+| 可重建缓存 | go-build、npm `_cacache`、pnpm store、Docker 悬空/旧标签镜像和 BuildKit、无主匿名测试 DB 卷 | go-build 每小时只删 2 小时以上没用过的条目；npm、pnpm 不自动清。Docker 残留由 `scripts/docker_leftovers.py` 每小时清：2026-11-14 owner 批准无容器引用、Created >30 天且仓库有更新镜像的旧标签；仓库最新及 owner 保护标签保留；BuildKit 在 72h prune 外限总量 10GB，完整判据见 storage-rules 的 owner 策略节 |
 | Worktree | 附加 worktree（主 checkout 永远不动） | 没人用且闲置满 24 小时：已在远端就删，否则先推 `archive/worktree/*` 再删：`scripts/worktree_sweep.py` |
 | 数据 | 会话（`/data/codex`、`/data/bb-data`）、凭据、在用数据库、命名卷、备份与迁移副本 | 不自动删；列出大小和归属，交 owner 决定 |
 
