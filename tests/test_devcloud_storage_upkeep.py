@@ -27,6 +27,8 @@ SPEC.loader.exec_module(m)
 
 _REAL_STORAGE_RUN = subprocess.run
 _REAL_STORAGE_POPEN = subprocess.Popen
+DOCKER_DF_STUB = '\n'.join(json.dumps({'Type': name, 'Size': '0B'}) for name in
+    ('Images', 'Containers', 'Local Volumes', 'Build Cache'))
 
 OLD = time.time() - 3 * 86400
 
@@ -2289,12 +2291,13 @@ def test_growth_failed_measurement_is_unknown_without_bytes(monkeypatch, failure
 
 def test_growth_discovery_measures_children_not_data_aggregate(tmp_path, monkeypatch):
     g = load_upkeep('storage_growth_measure')
-    listings = {'/data': ['code', 'system-tmp'], '/data/system-tmp': ['clone', 'cache'], '/root/.bb': ['logs', 'plugins']}
+    listings = {'/data': ['code', 'system-tmp', 'bb-data', 'docker'], '/data/system-tmp': ['clone', 'cache'], '/root/.bb': ['logs', 'plugins']}
     monkeypatch.setattr(g.Path, 'iterdir', lambda p: [p / name for name in listings[str(p)]])
     roots, errors = g.discover()
     assert not errors and '/data' not in roots and '/root/.bb' not in roots
     assert {'/data/code', '/data/system-tmp/clone', '/root/.bb/plugins',
-            '/var/tmp', '/root/.cache', '/data/bb-data/thread-storage'} <= set(roots)
+            '/var/tmp', '/root/.cache', '/data/bb-data'} <= set(roots)
+    assert '/data/docker' not in roots
 
 
 def test_growth_compare_top5_ownership_and_unknown_exclusion():
@@ -2328,7 +2331,9 @@ def test_growth_main_compares_previous_persists_top5_and_alerts(tmp_path, monkey
     g = load_upkeep('storage_growth_measure')
     monkeypatch.setattr(g, 'OUT', tmp_path)
     monkeypatch.setattr(g, 'discover', lambda: (['/data/itfs', '/new'], []))
-    monkeypatch.setattr(g, 'measure', lambda root, deadline: {'root': root, 'status': 'ok', 'bytes': 30 * g.GIB})
+    monkeypatch.setattr(g, 'measure', lambda root, deadline: (
+        {'root': root, 'status': 'ok', 'output': DOCKER_DF_STUB} if root == 'docker system df'
+        else {'root': root, 'status': 'ok', 'bytes': 30 * g.GIB}))
     monkeypatch.setattr(g.time, 'time', lambda: 86401)
     (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': [
         {'root': root, 'status': 'ok', 'bytes': 0} for root in ('/data/itfs', '/new')]}))
@@ -2355,7 +2360,8 @@ def test_growth_overall_budget_bounds_queued_roots(tmp_path, monkeypatch):
     assert g.main([]) == 0
     assert time.monotonic() - start < 1
     result = json.loads((tmp_path / 'latest.json').read_text())
-    assert result['unknown_count'] == 21 and not result['comparisons']
+    assert result['unknown_count'] == 24 and not result['comparisons']
+    assert result['data_top_unknown'][0]['root'] == '/data/docker'
     assert any(row.get('error') == 'total budget exhausted' for row in result['rows'])
 
 
@@ -2449,10 +2455,14 @@ def test_growth_plain_files_use_allocated_blocks_without_du(tmp_path, monkeypatc
 
 def test_growth_critical_roots_start_before_large_tmp_inventory(monkeypatch):
     g = load_upkeep('storage_growth_measure')
-    listings = {'/data': ['code'], '/root/.bb': ['logs'], '/data/system-tmp': [f'file-{i}' for i in range(10000)]}
+    listings = {'/data': ['code', 'bb-data', 'docker'], '/root/.bb': ['logs'], '/data/system-tmp': [f'file-{i}' for i in range(10000)]}
     monkeypatch.setattr(g.Path, 'iterdir', lambda p: [p / name for name in listings[str(p)]])
     roots, _ = g.discover()
-    assert roots[:5] == ['/var/tmp', '/root/.cache', '/data/bb-data/thread-storage', '/data/code', '/root/.bb/logs']
+    tmp_start = min(i for i, root in enumerate(roots) if root.startswith('/data/system-tmp/'))
+    assert all(roots.index(root) < tmp_start for root in
+               ('/data/code', '/data/bb-data', '/var/tmp', '/root/.cache', '/root/.bb/logs'))
+    assert roots.index('/data/code') < roots.index('/var/tmp')
+    assert '/data/docker' not in roots
     assert len(roots) == 10005
 
 
@@ -2472,7 +2482,7 @@ def test_growth_alert_daily_thresholds_preserve_small_growth_in_top5(tmp_path, m
     monkeypatch.setattr(g, 'discover', lambda: ([root], []))
     monkeypatch.setattr(g, 'fingerprints', lambda: [(root, source_owner)])
     monkeypatch.setattr(g, 'measure', lambda name, deadline: (
-        {'root': name, 'status': 'ok', 'output': 'docker stub'} if name == 'docker system df'
+        {'root': name, 'status': 'ok', 'output': DOCKER_DF_STUB} if name == 'docker system df'
         else {'root': name, 'status': 'ok', 'bytes': baseline + daily}))
     monkeypatch.setattr(g.time, 'time', lambda: 86401)
     (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': [
@@ -2516,3 +2526,124 @@ def test_growth_copied_snapshot_uses_own_fingerprints_after_workspace_changes(tm
     assert g.owner('/test/path', g.fingerprints()) == 'snapshot-owner'
     decoy.unlink()
     assert g.owner('/test/path', g.fingerprints()) == 'snapshot-owner'
+
+
+def test_growth_v3_parent_and_shared_cache_growth_are_observe_only(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    roots = ['/data/bb-data', '/data/bb-data/thread-storage',
+             '/data/bb-data/thread-storage/.shared-cache/go-build',
+             '/data/bb-data/thread-storage/.shared-cache/golangci-lint']
+    rows = [{'root': root, 'status': 'ok', 'bytes': 50 * g.GIB} for root in roots]
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: (roots, []))
+    monkeypatch.setattr(g, 'collect', lambda names, deadline: rows, raising=False)
+    monkeypatch.setattr(g, 'measure', lambda name, deadline: {'root': name, 'status': 'ok', 'bytes': 50 * g.GIB})
+    monkeypatch.setattr(g.time, 'time', lambda: 86401)
+    (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': [
+        {'root': root, 'status': 'ok', 'bytes': 0} for root in roots]}))
+    assert g.main([]) == 0
+    result = json.loads((tmp_path / 'latest.json').read_text())
+    assert not result['alerts']
+    assert len(result['top5']) == 4
+    assert all(row['alert_excluded'] for row in result['comparisons'])
+
+
+def test_growth_v3_large_roots_have_enough_budget_and_idle_io(monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    monkeypatch.setattr(g.os, 'lstat', lambda _: mock.Mock(st_mode=0o40700))
+    def run(cmd, **kw):
+        if kw['timeout'] < 120:
+            raise subprocess.TimeoutExpired('large-root-stub', kw['timeout'])
+        assert cmd[:2] == ['ionice', '-c3']
+        return subprocess.CompletedProcess(cmd, 0, '12345\t/data/code\n', '')
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    assert g.measure('/data/code', time.monotonic() + 200)['status'] == 'ok'
+
+
+def test_growth_v3_thread_storage_partition_is_complete():
+    g = load_upkeep('storage_growth_measure')
+    base = '/data/bb-data'
+    ts = base + '/thread-storage'
+    records = {base: 224, ts: 220, ts + '/thr_a': 50, ts + '/thr_b': 30,
+               ts + '/thr_file': 5, ts + '/leftover': 20, ts + '/plain': 7,
+               ts + '/.shared-cache': 104, ts + '/.shared-cache/go-build': 80,
+               ts + '/.shared-cache/golangci-lint': 20, ts + '/.shared-cache/extra': 2}
+    output = ''.join(f'{size}\t{root}\0' for root, size in records.items())
+    rows = {row['root']: row for row in g.split_bb_output(output, {'thr_a', 'thr_b'})}
+    assert rows[ts + '/.shared-cache/go-build']['bytes'] == 80
+    assert rows[ts + '/.shared-cache/golangci-lint']['bytes'] == 20
+    assert rows['bb:threads']['bytes'] == 80
+    assert rows['bb:threads']['entries'] == 2
+    assert rows['bb:non-thread']['bytes'] == 40  # leftovers, direct files, shared extras and metadata
+    assert sum(rows[root]['bytes'] for root in ('bb:threads', 'bb:non-thread',
+        ts + '/.shared-cache/go-build', ts + '/.shared-cache/golangci-lint')) == rows[ts]['bytes']
+
+
+def test_growth_v3_docker_categories_are_numeric_and_comparable():
+    g = load_upkeep('storage_growth_measure')
+    data = '\n'.join(json.dumps({'Type': kind, 'Size': size}) for kind, size in [
+        ('Images', '31.44GB'), ('Containers', '1.059GB'),
+        ('Local Volumes', '6.829GB'), ('Build Cache', '8.558GB')])
+    rows = g.split_docker_output({'root': 'docker system df', 'status': 'ok', 'output': data})
+    sizes = {row['root']: row['bytes'] for row in rows}
+    assert sizes == {'docker:images': 31440000000, 'docker:containers': 1059000000,
+                     'docker:volumes': 6829000000, 'docker:build-cache': 8558000000}
+    before = {'ts': 1, 'rows': [{**row, 'bytes': row['bytes'] - 100} for row in rows]}
+    for row in rows:
+        row['owner'] = 'Docker'
+    compared, _ = g.compare(rows, before, 86401)
+    assert len(compared) == 4 and all(row['daily_bytes'] == 100 for row in compared)
+
+
+def test_growth_v3_components_alert_without_parent_or_go_cache_duplicates(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    values = {g.BB_DATA: 102, g.BB_STORAGE: 101, g.GO_CACHE: 40,
+              g.LINT_CACHE: 20, 'bb:threads': 21, 'bb:non-thread': 20 + 1 / g.GIB}
+    rows = [{'root': root, 'status': 'ok', 'bytes': round(size * g.GIB)} for root, size in values.items()]
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: ([g.BB_DATA], []))
+    monkeypatch.setattr(g, 'collect', lambda names, deadline: rows)
+    monkeypatch.setattr(g.time, 'time', lambda: 86401)
+    (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': [
+        {'root': root, 'status': 'ok', 'bytes': 0} for root in values]}))
+    assert g.main([]) == 0
+    data = json.loads((tmp_path / 'latest.json').read_text())
+    assert {row['root'] for row in data['alerts']} == {'bb:threads', 'bb:non-thread'}
+    assert {row['owner'] for row in data['alerts']} == {'BB thread directories', 'BB root non-thread entries'}
+    assert {g.BB_DATA, g.BB_STORAGE, g.GO_CACHE} <= {row['root'] for row in data['top5']}
+
+
+@pytest.mark.parametrize('mode', ['timeout', 'failure'])
+def test_growth_v3_failed_bb_walk_never_compares_partial_components(monkeypatch, mode):
+    g = load_upkeep('storage_growth_measure')
+    failure = mock.Mock(side_effect=subprocess.TimeoutExpired('bb-du-stub', 1)) if mode == 'timeout' else mock.Mock(
+        return_value=subprocess.CompletedProcess([], 1, '999\t/data/bb-data\0', 'permission denied'))
+    monkeypatch.setattr(g.subprocess, 'run', failure)
+    rows = g.measure_bb_data(time.monotonic() + 1)
+    assert {row['root'] for row in rows} == set(g.BB_ROOTS)
+    assert all(row['status'] == 'unknown' and 'bytes' not in row for row in rows)
+    assert failure.call_count == 1
+
+
+def test_growth_v3_docker_missing_or_invalid_categories_are_not_zero():
+    g = load_upkeep('storage_growth_measure')
+    rows = g.split_docker_output({'root': 'docker system df', 'status': 'ok',
+                                  'output': json.dumps({'Type': 'Images', 'Size': '1GB'})})
+    assert next(row for row in rows if row['root'] == 'docker:images')['bytes'] == 1000000000
+    assert all(row['status'] == 'unknown' and 'bytes' not in row
+               for row in rows if row['root'] != 'docker:images')
+    broken = g.split_docker_output({'root': 'docker system df', 'status': 'ok', 'output': 'not JSON'})
+    assert len(broken) == 4 and all(row['status'] == 'unknown' and 'bytes' not in row for row in broken)
+
+
+def test_growth_v3_lists_unknown_data_top_roots_separately(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: (['/data/code', '/var/tmp'], []))
+    monkeypatch.setattr(g, 'collect', lambda roots, deadline: [
+        {'root': root, 'status': 'unknown', 'error': 'probe stub failed'} for root in ('/data/code', '/var/tmp')])
+    assert g.main([]) == 0
+    data = json.loads((tmp_path / 'latest.json').read_text())
+    assert data['unknown_count'] == 2
+    assert [row['root'] for row in data['data_top_unknown']] == ['/data/code']
+    assert not data['comparisons']

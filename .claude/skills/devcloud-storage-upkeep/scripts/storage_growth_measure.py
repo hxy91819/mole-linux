@@ -3,6 +3,8 @@
 import argparse
 import concurrent.futures
 import fnmatch
+from decimal import Decimal
+import re
 import json
 import os
 from pathlib import Path
@@ -12,24 +14,50 @@ import time
 
 OUT = Path(os.environ.get('MOLE_GROWTH_METRICS', '/var/lib/devcloud-storage-upkeep/metrics'))
 RULES = Path(__file__).resolve().with_name('storage_growth_fingerprints.md')
-PER_ROOT_SECONDS = 60
-TOTAL_SECONDS = 180
+PER_ROOT_SECONDS = 780
+TOTAL_SECONDS = 840
 WORKERS = 8
 RETENTION_SECONDS = 30 * 86400
 GIB = 1024 ** 3
 
+BB_DATA = '/data/bb-data'
+BB_STORAGE = BB_DATA + '/thread-storage'
+GO_CACHE = BB_STORAGE + '/.shared-cache/go-build'
+LINT_CACHE = BB_STORAGE + '/.shared-cache/golangci-lint'
+BB_ROOTS = (BB_DATA, BB_STORAGE, GO_CACHE, LINT_CACHE, 'bb:threads', 'bb:non-thread')
+DOCKER_TYPES = {'Images': 'docker:images', 'Containers': 'docker:containers',
+                'Local Volumes': 'docker:volumes', 'Build Cache': 'docker:build-cache'}
+
+
+def unknown(root, error):
+    return {'root': root, 'status': 'unknown', 'error': str(error)}
+
+
+def alert_exclusion(root):
+    if root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage'):
+        return 'parent aggregate; alert on components'
+    if root in (GO_CACHE, LINT_CACHE):
+        return 'shared Go cache; daily check 2 owns size and age limits'
+    return None
+
 
 def discover():
-    # Schedule core roots before the potentially tens of thousands of tmp entries.
-    roots = ['/var/tmp', '/root/.cache', '/data/bb-data/thread-storage']
-    unknown = []
-    for parent in ('/data', '/root/.bb', '/data/system-tmp'):
+    roots, errors = [], []
+    try:
+        data = [str(p) for p in sorted(Path('/data').iterdir()) if str(p) != '/data/docker']
+        first = ('/data/code', '/data/system-tmp', BB_DATA)
+        roots.extend([root for root in first if root in data])
+        roots.extend(root for root in data if root not in first)
+    except OSError as error:
+        errors.append(unknown('/data', f'discovery: {error}'))
+    roots.extend(('/var/tmp', '/root/.cache'))
+    # The large /data roots get workers before secondary roots and tmp entries.
+    for parent in ('/root/.bb', '/data/system-tmp'):
         try:
             roots.extend(str(p) for p in sorted(Path(parent).iterdir()))
         except OSError as error:
-            unknown.append({'root': parent, 'status': 'unknown', 'error': f'discovery: {error}'})
-    # Parents and descendants are independently useful; never sum overlapping rows.
-    return list(dict.fromkeys(roots)), unknown
+            errors.append(unknown(parent, f'discovery: {error}'))
+    return list(dict.fromkeys(roots)), errors
 
 
 
@@ -51,28 +79,136 @@ def owner(root, rules):
     return next((name for pattern, name in rules if fnmatch.fnmatchcase(root, pattern)), 'unknown')
 
 
-def measure(root, deadline):
+def probe(root, command, deadline):
     budget = min(PER_ROOT_SECONDS, deadline - time.monotonic())
     if budget <= 0:
-        return {'root': root, 'status': 'unknown', 'error': 'total budget exhausted'}
-    cmd = ['docker', 'system', 'df'] if root == 'docker system df' else ['du', '-sx', '-B1', '--', root]
+        return unknown(root, 'total budget exhausted')
+    started = time.monotonic()
     try:
-        if root != 'docker system df':
-            metadata = os.lstat(root)
-            if not stat.S_ISDIR(metadata.st_mode):
-                # du's allocated-byte contract for one file/link, without a fork.
-                return {'root': root, 'status': 'ok', 'bytes': metadata.st_blocks * 512}
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=budget)
+        result = subprocess.run(['ionice', '-c3', *command], capture_output=True,
+                                text=True, timeout=budget)
         if result.returncode:
-            return {'root': root, 'status': 'unknown', 'error': result.stderr[-2000:] or f'exit {result.returncode}'}
-        if root == 'docker system df':
-            return {'root': root, 'status': 'ok', 'output': result.stdout[-20000:]}
-        size = int(result.stdout.split()[0])
-        if size < 0:
-            raise ValueError('negative size')
-        return {'root': root, 'status': 'ok', 'bytes': size}
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError) as error:
-        return {'root': root, 'status': 'unknown', 'error': str(error)}
+            row = unknown(root, result.stderr[-2000:] or f'exit {result.returncode}')
+        else:
+            row = {'root': root, 'status': 'ok', 'output': result.stdout}
+    except (OSError, subprocess.SubprocessError) as error:
+        row = unknown(root, error)
+    row['elapsed_seconds'] = round(time.monotonic() - started, 3)
+    return row
+
+
+def measure(root, deadline):
+    if deadline <= time.monotonic():
+        return unknown(root, 'total budget exhausted')
+    if root == 'docker system df':
+        return probe(root, ['docker', 'system', 'df', '--format', '{{json .}}'], deadline)
+    try:
+        metadata = os.lstat(root)
+        if not stat.S_ISDIR(metadata.st_mode):
+            return {'root': root, 'status': 'ok', 'bytes': metadata.st_blocks * 512}
+        row = probe(root, ['du', '-sx', '-B1', '--', root], deadline)
+        if row['status'] == 'ok':
+            size = int(row.pop('output').split()[0])
+            if size < 0:
+                raise ValueError('negative size')
+            row['bytes'] = size
+        return row
+    except (OSError, ValueError, IndexError) as error:
+        return unknown(root, error)
+
+
+def split_bb_output(output, thread_dirs):
+    sizes = {}
+    for record in output.split('\0'):
+        if not record:
+            continue
+        size, separator, path = record.partition('\t')
+        if not separator or int(size) < 0:
+            raise ValueError('invalid du record')
+        sizes[path] = int(size)
+    total = sizes[BB_STORAGE]
+    direct = {path: size for path, size in sizes.items() if str(Path(path).parent) == BB_STORAGE}
+    shared = BB_STORAGE + '/.shared-cache'
+    shared_children = {path: size for path, size in sizes.items() if str(Path(path).parent) == shared}
+    threads = {path: size for path, size in direct.items() if Path(path).name in thread_dirs}
+    other = sum(size for path, size in direct.items() if path not in threads and path != shared)
+    other += sum(size for path, size in shared_children.items() if path not in (GO_CACHE, LINT_CACHE))
+    # Include directory metadata so the four components account for the entire root.
+    other += total - sum(direct.values())
+    other += sizes.get(shared, 0) - sum(shared_children.values())
+    values = {BB_DATA: sizes[BB_DATA], BB_STORAGE: total,
+              GO_CACHE: sizes.get(GO_CACHE, 0), LINT_CACHE: sizes.get(LINT_CACHE, 0),
+              'bb:threads': sum(threads.values()), 'bb:non-thread': other}
+    if any(value < 0 for value in values.values()):
+        raise ValueError('inconsistent thread-storage totals')
+    rows = [{'root': root, 'status': 'ok', 'bytes': size} for root, size in values.items()]
+    for row in rows:
+        if row['root'] == 'bb:threads':
+            row.update(path=BB_STORAGE, entries=len(threads))
+        elif row['root'] == 'bb:non-thread':
+            row.update(path=BB_STORAGE, entries=sum(path not in threads and path != shared for path in direct))
+    return rows
+
+
+def measure_bb_data(deadline):
+    # One physical walk supplies both parents and all four components.
+    row = probe(BB_DATA, ['du', '-ax', '-B1', '--max-depth=3', '--null', '--', BB_DATA], deadline)
+    if row['status'] != 'ok':
+        return [unknown(root, row['error']) for root in BB_ROOTS]
+    try:
+        with os.scandir(BB_STORAGE) as entries:
+            threads = {entry.name for entry in entries
+                       if entry.name.startswith('thr_') and entry.is_dir(follow_symlinks=False)}
+        rows = split_bb_output(row['output'], threads)
+        for item in rows:
+            item['elapsed_seconds'] = row['elapsed_seconds']
+        return rows
+    except (OSError, ValueError, KeyError) as error:
+        return [unknown(root, error) for root in BB_ROOTS]
+
+
+def docker_bytes(value):
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*([kKMGTPE]?i?B)', value)
+    if not match:
+        raise ValueError(f'invalid Docker size: {value}')
+    unit = match[2]
+    powers = {'B': 0, 'KB': 1, 'MB': 2, 'GB': 3, 'TB': 4, 'PB': 5, 'EB': 6}
+    power = powers[unit.replace('i', '').upper()]
+    return int(Decimal(match[1]) * (1024 if 'i' in unit else 1000) ** power)
+
+
+def split_docker_output(row):
+    if row['status'] != 'ok':
+        return [unknown(root, row['error']) for root in DOCKER_TYPES.values()]
+    try:
+        data = [json.loads(line) for line in row['output'].splitlines() if line.strip()]
+        by_type = {item['Type']: item for item in data}
+        rows = []
+        for kind, root in DOCKER_TYPES.items():
+            if kind not in by_type:
+                rows.append(unknown(root, f'Docker category missing: {kind}'))
+                continue
+            item = by_type[kind]
+            result = {'root': root, 'status': 'ok', 'bytes': docker_bytes(item['Size'])}
+            for name in ('TotalCount', 'Active'):
+                if name in item:
+                    result[name] = int(item[name])
+            rows.append(result)
+        return rows
+    except (ValueError, KeyError, TypeError) as error:
+        return [unknown(root, error) for root in DOCKER_TYPES.values()]
+
+
+def measure_job(root, deadline):
+    if root == BB_DATA:
+        return measure_bb_data(deadline)
+    row = measure(root, deadline)
+    return split_docker_output(row) if root == 'docker system df' else [row]
+
+
+def collect(roots, deadline):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        return [row for group in pool.map(lambda root: measure_job(root, deadline), roots) for row in group]
 
 
 def compare(rows, previous, now):
@@ -85,6 +221,7 @@ def compare(rows, previous, now):
                 or 'bytes' not in row or 'bytes' not in old):
             continue
         compared.append({'root': row['root'], 'owner': row['owner'],
+                         'alert_excluded': row.get('alert_excluded'),
                          'delta_bytes': row['bytes'] - old['bytes'],
                          'daily_bytes': round((row['bytes'] - old['bytes']) * 86400 / interval)})
     positive = sorted((r for r in compared if r['delta_bytes'] > 0),
@@ -118,15 +255,22 @@ def main(argv=None):
     roots, rows = discover()
     rules = fingerprints()
     previous = json.loads((OUT / 'latest.json').read_text()) if (OUT / 'latest.json').exists() else {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        rows += list(pool.map(lambda root: measure(root, deadline), ['docker system df', *roots]))
+    rows += collect(['docker system df', *roots], deadline)
     for row in rows:
         row['owner'] = owner(row['root'], rules)
+        row['alert_excluded'] = alert_exclusion(row['root'])
     now = time.time()
     comparisons, top5 = compare(rows, previous, now)
-    alerts = [r for r in comparisons if r['delta_bytes'] > 0 and
+    alerts = [r for r in comparisons if not r['alert_excluded'] and r['delta_bytes'] > 0 and
               (r['daily_bytes'] >= GIB if r['owner'] == 'unknown' else r['daily_bytes'] > 20 * GIB)]
-    out = {'ts': now, 'previous_ts': previous.get('ts'),
+    top_unknown = [row for row in rows if row['status'] == 'unknown' and
+                   (row['root'] == '/data' or
+                    (row['root'].startswith('/data/') and row['root'].count('/') == 2))]
+    docker_unknown = [row for row in rows if row['root'] in DOCKER_TYPES.values() and row['status'] == 'unknown']
+    if docker_unknown:
+        top_unknown.append({'root': '/data/docker', 'error': 'Docker category measurements incomplete',
+                            'categories': docker_unknown})
+    out = {'schema_version': 2, 'data_top_unknown': top_unknown, 'ts': now, 'previous_ts': previous.get('ts'),
            'interval_seconds': now - previous['ts'] if previous else None,
            'elapsed_seconds': round(time.monotonic() - started, 3),
            'rows': rows, 'comparisons': comparisons, 'top5': top5, 'alerts': alerts,
@@ -136,7 +280,7 @@ def main(argv=None):
     atomic_write(OUT / 'latest.json', out)
     retain(OUT, now)
     print(f"growth: roots={len(rows)} unknown={out['unknown_count']} "
-          f"elapsed={out['elapsed_seconds']}s compared={len(comparisons)} top5={len(top5)} alerts={len(alerts)}")
+          f"data_top_unknown={len(top_unknown)} elapsed={out['elapsed_seconds']}s compared={len(comparisons)} top5={len(top5)} alerts={len(alerts)}")
     return 0
 
 

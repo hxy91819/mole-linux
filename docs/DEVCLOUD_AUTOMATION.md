@@ -9,12 +9,12 @@
 
 ## 1. 现行任务
 
-水位与增长两个任务使用独立快照 `30dfc0e97234b2cc`，不改变下列五个清理任务的快照：
+水位与增长两个任务使用独立快照 `e2b953cd674c0e86`，不改变下列五个清理任务的快照：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
 | 水位刹车 | `auto_idedelow-3g` | `0,15,30,45 * * * *` | `/usr/bin/python3 -I <snap>/storage_watermark_brake.py` | 120 秒 |
-| 增长计量 | `auto_u4kos3to-di` | `0 7 * * *` | `/usr/bin/python3 -I <snap>/storage_growth_measure.py` | 240 秒 |
+| 增长计量 | `auto_u4kos3to-di` | `0 7 * * *` | `/usr/bin/python3 -I <snap>/storage_growth_measure.py` | 900 秒 |
 
 均用 bash 启动脚本 exec 上述命令，工作目录 `/var/tmp`。水位只调用既有任务：/data 对应
 Docker、Go、worktree、tmp clone、pnpm、clean-tmp `/data/system-tmp`，/ 对应 clean-tmp `/var/tmp`。
@@ -23,15 +23,31 @@ Docker、Go、worktree、tmp clone、pnpm、clean-tmp `/data/system-tmp`，/ 对
 状态在系统盘 `/var/lib/devcloud-storage-upkeep/watermark.json`，清理派发后、通知之前保存，
 通知失败不丢冷却（该次仍非零退出）。
 
-增长逐个计量 `/data` 顶层、`/data/system-tmp` 顶层、`/root/.bb` 下各项，另测 `/var/tmp`、
-`/root/.cache`、`/data/bb-data/thread-storage`、`docker system df`；8 并发，每根 60 秒、全轮 180 秒。
-重点根优先于 `/data/system-tmp` 清单排队；普通文件和符号链接直接读 `lstat.st_blocks * 512`，
-与单文件 du 的实占字节契约一致，避免数万次 fork；目录才运行 du。
-指标写 `/var/lib/devcloud-storage-upkeep/metrics`，`latest.json` 与带 UTC 时间的历史文件；只保留 30 天。
-`rows` 含已测 bytes 或 unknown/error；`comparisons` 只含前后有效根；`top5` 按间隔折算日增，
-`owner` 来自随快照发布的路径指纹表；`alerts` 仅收录 unknown 来源折算日增 ≥1 GiB、
-已登记来源折算日增 >20 GiB 的根，较小正增长仍保留在 Top5。
-父子根可能重叠，不能相加；第一次无可比样本时 Top5 为空。每日检查读取这些字段。
+增长优先安排 `/data` 顶层各目录（`code`、`system-tmp`、`bb-data` 最先），再测
+`/var/tmp`、`/root/.cache`、`/root/.bb` 各项，`system-tmp` 的逐项条目最后。
+所有外部计量命令用 `ionice -c3`；8 并发，单根最多 780 秒，全轮最多 840 秒，BB 任务超时 900 秒。
+07:00 启动，最迟约 07:15 终止，早于 07:30 检查；不靠延后每日检查解决测量超时。
+
+`/data/bb-data` 一次 du 物理遍历（深度3输出，递归尺寸仍完整）同时产生父根及 thread-storage 四项：
+
+| 指标根 | 归属 | 增长告警 |
+|---|---|---|
+| `.shared-cache/go-build`（完整路径） | shared Go build cache | 不参与；每日检查第2项核大小与年龄 |
+| `.shared-cache/golangci-lint`（完整路径） | shared golangci-lint cache | 不参与；每日检查第2项核大小与年龄 |
+| `bb:threads` | BB thread directories，`thr_*` 真实目录合计 | >20 GiB/天 |
+| `bb:non-thread` | BB根非线程条目；含共享缓存其余项与目录元数据 | >20 GiB/天 |
+
+`/data/bb-data`、thread-storage 父根仍可进入 Top5，`alert_excluded` 标明只观察，不重复报警。
+不再 du `/data/docker`；`docker system df --format '{{json .}}'` 一次取得镜像、容器、卷、
+构建缓存四类 Size，转为数值 bytes，分别以 `docker:images`、`docker:containers`、
+`docker:volumes`、`docker:build-cache` 比较。缺类、失败或超时标 unknown，不推成0。
+
+普通文件和符号链接直接读 `lstat.st_blocks * 512`，只有目录运行 du。
+指标写 `/var/lib/devcloud-storage-upkeep/metrics`，最新 `schema_version=2`，历史仅保留30天。
+`data_top_unknown` 单列 /data 顶层未测项（Docker分类不全也映射到 /data/docker）；
+`rows` 含已测 bytes 或 unknown/error；`comparisons` 只含前后有效根；`top5` 按实际间隔折算日增。
+`owner` 来自随快照发布的路径指纹表；除上述排除项，`alerts` 收录 unknown 日增 ≥1 GiB、
+已登记来源日增 >20 GiB；较小正增长仍在 Top5。父子根不求和，新分项首次出现只建基线，不当0比较。
 
 预演和只读复现：
 
@@ -123,7 +139,7 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 ```cron
 # devcloud-clean-tmp: ordinary entries 3d; structural caches idle 24h (owner-approved 2026-11-14)
-30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/30dfc0e97234b2cc/clean_tmp_runner.py # devcloud-clean-tmp
+30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/e2b953cd674c0e86/clean_tmp_runner.py # devcloud-clean-tmp
 ```
 
 - 先 `/var/tmp`（内部预算 300 秒，timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒，
