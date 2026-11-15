@@ -129,7 +129,9 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 ### 水位刹车与增长归因（2026-11-14）
 
-每 15 分钟读取 `/` 与 `/data` 的 `statvfs` 可用字节；低于 150 GiB 预警、低于 50 GiB 危险。首次越线、warning→danger 升级或两小时冷却结束后再次触发才通知；冷却期静默，恢复正常后重新越线视为首次。运行中或查询未知的任务跳过并在触发简报注明；clean-tmp 与 cron 共用 `clean_tmp_runner.py`，非阻塞锁由后台执行链持有到结束，两盘同时越线合并为同一 worker 顺序执行两根；新入口用 `-I`，旧执行器仍用 `-B`（同目录依赖）。路径、timeout、预算与 JSONL 记账只有一个入口。派发后先保存冷却再通知，通知失败仍非零退出。`--dry-run` 仅打印计划，不写状态、不调用 BB 或包装器。真实触发 stdout 输出一行摘要，正常/冷却完全静默。每日 07:00 以 8 并发逐根计量 `/data` 顶层、`/data/system-tmp` 顶层、`/root/.bb` 各项，另测 `/var/tmp`、`/root/.cache`、`/data/bb-data/thread-storage` 和 `docker system df`；重点根和 BB 项先于 tmp 项排队；普通文件/符号链接直接读 lstat 的已分配块数，只有目录 fork du。每根最多 60 秒、全轮最多 180 秒。超时/失败为未测，不当作 0 或参与比较；与上次结果比较，按实际间隔折算日增 Top5，重叠根不求和。只保留最近 30 天指标。每日检查仅在 unknown 来源单根折算日增 ≥1 GiB，或已登记来源单根折算日增 >20 GiB 时通知协调线程；较小正增长仍列入 Top5。
+每 15 分钟读取 `/` 与 `/data` 的 `statvfs` 可用字节；低于 150 GiB 预警、低于 50 GiB 危险。首次越线、warning→danger 升级或两小时冷却结束后再次触发才通知；冷却期静默，恢复正常后重新越线视为首次。运行中或查询未知的任务跳过并在触发简报注明；clean-tmp 与 cron 共用 `clean_tmp_runner.py`，非阻塞锁由后台执行链持有到结束，两盘同时越线合并为同一 worker 顺序执行两根；新入口用 `-I`，旧执行器仍用 `-B`（同目录依赖）。路径、timeout、预算与 JSONL 记账只有一个入口。派发后先保存冷却再通知，通知失败仍非零退出。`--dry-run` 仅打印计划，不写状态、不调用 BB 或包装器。真实触发 stdout 输出一行摘要，正常/冷却完全静默。每日07:00按/data顶层优先、system-tmp逐项最后，以8并发、ionice空闲级计量；单根最多780秒、全轮840秒，BB超时900秒，须在07:30检查前结束。/data/docker不du，改Docker system df分类数值比较（镜像、容器、卷、构建缓存）；/data顶层未测根单列data_top_unknown。超时/失败/缺类不当0比较，历史保留30天。
+
+thread-storage由一次物理du遍历拆成共享go-build、共享golangci-lint、thr_*真实目录合计（bb:threads）、非线程条目合计（bb:non-thread）；后者排除两共享Go缓存，包含共享缓存其他项与目录元数据。各项按下表登记归属。/data/bb-data与thread-storage父根只进Top5、不重复报警；两共享Go缓存也只观察，由每日检查第2项核≤100GiB与无超过1520分钟的哈希条目。其余分项沿用unknown日增≥1GiB、已登记日增>20GiB告警；小增长保留Top5，新分项首轮只建基线。
 
 - 同一对象跨扫描批次出现时，先按路径/物理身份合并；单独运行的`du`不跨调用去重硬链接，
   路径实占相加不能称文件系统物理下界或独占可回收量。登记worktree按目标device区分主checkout、
@@ -263,6 +265,14 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | `/data/itfs` | itfs |
 | `/data/.pnpm-store` | pnpm store |
 | `/data/codex` | Codex sessions |
+| `/data/bb-data/thread-storage/.shared-cache/go-build` | shared Go build cache |
+| `/data/bb-data/thread-storage/.shared-cache/golangci-lint` | shared golangci-lint cache |
+| `bb:threads` | BB thread directories |
+| `bb:non-thread` | BB root non-thread entries |
+| `docker:images` | Docker images |
+| `docker:containers` | Docker containers |
+| `docker:volumes` | Docker volumes |
+| `docker:build-cache` | Docker build cache |
 | `/data/bb-data` | BB |
 | `/data/bb-data/thread-storage` | BB thread storage |
 | `/root/.bb/*` | BB |

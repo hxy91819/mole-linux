@@ -23,11 +23,16 @@
    - auto_idedelow-3g（水位刹车，每 15 分钟）：25 分钟。
    - auto_u4kos3to-di（增长计量，每天 07:00）：25 小时。
    有不正常的运行时，用同样的 `--output <runId>` 取那次运行的输出作为证据。
-2. Go 缓存确实在被修剪。先用 `GOCACHE_REAL=$(readlink -f "$(go env GOCACHE)")` 解析真实目录；`du -sx -B1 "$GOCACHE_REAL"` 不超过 107374182400（100 GiB）；`find "$GOCACHE_REAL" -mindepth 2 -maxdepth 2 -type f -name '*-[ad]' -mmin +1520 -print -quit` 没有输出。修剪每小时删掉 24 小时没用过的条目，不该留下超过 1520 分钟的条目。
+2. 两个共享 Go 缓存确实在被修剪。分别解析真实目录：`readlink -f "$(go env GOCACHE)"` 与 `readlink -f /root/.cache/golangci-lint`。对每个真实根，`du -sx -B1 "<真实根>"` 都不超过 107374182400（100 GiB）；`find "<真实根>" -mindepth 2 -maxdepth 2 -type f -name '*-[ad]' -mmin +1520 -print -quit` 没有输出。每小时修剪24小时没用过的条目，两根均不该留下超过1520分钟的哈希条目；分别列出大小与最老条目检查结果。
 3. /tmp 与 /var/tmp 清理（cron 每天 03:30）。`/data/metrics/devcloud-clean-tmp.log` 每行一个 JSON。分别按 `path` 为 `/data/system-tmp` 和 `/var/tmp`，找 `ts` 晚于最近一次 03:30 的第一条 `"event": "summary"`；两根各自都必须存在，`status` 为 `ok`，`failed` 为 0，`scan` 为 `complete`。缺任一根的 summary 都算不符合。`deferred` 大于 0 是预算递延，属于正常。再看 `/data/metrics/devcloud-clean-tmp.stderr.log` 的修改时间：晚于最近一次 03:30 就算不符合，并贴出它的末尾 20 行。
 4. systemd-tmpfiles 不再按年龄清 /tmp。`/etc/tmpfiles.d/tmp.conf` 里 `/tmp` 那一行的第 6 列（年龄）是 `-`；`systemctl show systemd-tmpfiles-clean.service -p Result --value` 输出 `success`。
 5. 两块盘的容量。`df -B1 --output=avail /data` 和 `df -B1 --output=avail /`（系统盘）的可用字节都不少于 161061273600（150 GiB）。
-6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`ts` 距 NOW 不超过 25 小时，逐项列出 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`，并列 `unknown_count`，未测根按原因汇总，最多列 5 个路径示例。按当前计量任务指向快照内的 `storage_growth_fingerprints.md`（发布时取自 storage-rules「已知来源指纹／增长计量的路径指纹」）核对归属；unknown 不猜测项目。`comparisons` 只允许前后两次均为 ok 且有 bytes 的根；未测不得当 0，不叠加父子根。`alerts` 中未登记来源（owner=unknown）的单根折算日增不少于 1073741824（1 GiB），或已登记来源的单根折算日增超过 21474836480（20 GiB），算不符合并通知协调线程；指标过期或缺失也算不符合；首次基线没有前次样本时说明尚无比较，不把缺少基线当作零增长。
+6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`schema_version` 为2，`ts` 距 NOW 不超过25小时；07:00计量任务必须已经结束，单根预算780秒、全轮840秒、任务超时900秒，应在07:30前完成。
+   - 列 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`。归属按当前计量任务指向快照内的 `storage_growth_fingerprints.md` 核对，unknown 不猜测项目；父子根不相加。
+   - 单列 thread-storage 四项的 bytes、归属与可用的日增：`.shared-cache/go-build`、`.shared-cache/golangci-lint`（两项为完整路径）、`bb:threads`（thr_*真实目录合计）、`bb:non-thread`（非线程条目，排除前两项，含共享缓存其余项与目录元数据）。父根 `/data/bb-data`、`/data/bb-data/thread-storage` 只观察Top5，不重复报警；两共享Go缓存由第2项大小/年龄兜底，不参与20GiB/天告警。排除原因在 `alert_excluded`。
+   - Docker四类必须有数值 bytes：`docker:images`、`docker:containers`、`docker:volumes`、`docker:build-cache`；来自Docker system df，不再用du /data/docker。分类缺失、失败、超时均不得当0。
+   - `data_top_unknown` 必须为空；非空时逐一列根、原因并算不符合。其余未测根列 `unknown_count`，按原因汇总，最多5个路径示例。`comparisons` 只允许前后两次都ok且有bytes的根；新增分项首轮说明只建基线，不把缺前次当0。
+   - 只对非排除项检查 `alerts`：unknown单根折算日增 ≥1073741824（1 GiB），已登记来源 >21474836480（20 GiB）才算不符合并通知协调线程；小增长仍可列Top5。指标过期、缺失、关键分项未测或07:30时任务仍未完成也算不符合。
 
 ## 结果
 

@@ -5,6 +5,14 @@
 | `/data/itfs` | itfs |
 | `/data/.pnpm-store` | pnpm store |
 | `/data/codex` | Codex sessions |
+| `/data/bb-data/thread-storage/.shared-cache/go-build` | shared Go build cache |
+| `/data/bb-data/thread-storage/.shared-cache/golangci-lint` | shared golangci-lint cache |
+| `bb:threads` | BB thread directories |
+| `bb:non-thread` | BB root non-thread entries |
+| `docker:images` | Docker images |
+| `docker:containers` | Docker containers |
+| `docker:volumes` | Docker volumes |
+| `docker:build-cache` | Docker build cache |
 | `/data/bb-data` | BB |
 | `/data/bb-data/thread-storage` | BB thread storage |
 | `/root/.bb/*` | BB |
