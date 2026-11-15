@@ -2341,7 +2341,9 @@ def test_growth_main_compares_previous_persists_top5_and_alerts(tmp_path, monkey
     result = json.loads((tmp_path / 'latest.json').read_text())
     assert len(result['top5']) == 2 and result['unknown_count'] == 0
     assert {row['owner'] for row in result['top5']} == {'itfs', 'unknown'}
-    assert len(result['alerts']) == 2 and result['interval_seconds'] == 86400
+    assert [row['root'] for row in result['alerts']] == ['/data/itfs']
+    assert result['interval_seconds'] == 86400
+    assert next(row for row in result['rows'] if row['root'] == '/new')['growth_status'] == 'insufficient_samples'
 
 
 def test_growth_overall_budget_bounds_queued_roots(tmp_path, monkeypatch):
@@ -2468,8 +2470,8 @@ def test_growth_critical_roots_start_before_large_tmp_inventory(monkeypatch):
 
 @pytest.mark.parametrize('source_owner,daily,expected', [
     ('unknown', -1, False), ('unknown', 0, False), ('unknown', 1, False),
-    ('unknown', 1024 ** 3 - 1, False), ('unknown', 1024 ** 3, True),
-    ('unknown', 1024 ** 3 + 1, True), ('unknown', 21 * 1024 ** 3, True),
+    ('unknown', 1024 ** 3 - 1, False), ('unknown', 1024 ** 3, False),
+    ('unknown', 1024 ** 3 + 1, False), ('unknown', 21 * 1024 ** 3, False),
     ('registered', -1, False), ('registered', 0, False),
     ('registered', 1024 ** 3, False), ('registered', 20 * 1024 ** 3 - 1, False),
     ('registered', 20 * 1024 ** 3, False), ('registered', 20 * 1024 ** 3 + 1, True),
@@ -2490,7 +2492,7 @@ def test_growth_alert_daily_thresholds_preserve_small_growth_in_top5(tmp_path, m
     assert g.main([]) == 0
     result = json.loads((tmp_path / 'latest.json').read_text())
     assert bool(result['alerts']) is expected
-    assert result['comparisons'][0]['daily_bytes'] == daily
+    assert next(row for row in result['comparisons'] if row['root'] == root)['daily_bytes'] == daily
     if daily > 0:
         assert result['top5'][0]['root'] == root
         assert result['top5'][0]['daily_bytes'] == daily
@@ -2647,3 +2649,131 @@ def test_growth_v3_lists_unknown_data_top_roots_separately(tmp_path, monkeypatch
     assert data['unknown_count'] == 2
     assert [row['root'] for row in data['data_top_unknown']] == ['/data/code']
     assert not data['comparisons']
+
+
+def test_growth_v4_unknown_short_history_is_not_an_alert(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    root = '/unregistered/source'
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: ([root], []))
+    monkeypatch.setattr(g, 'collect', lambda names, deadline: [{'root': root, 'status': 'ok', 'bytes': 10 * g.GIB}])
+    monkeypatch.setattr(g.time, 'time', lambda: 86401)
+    (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': [
+        {'root': root, 'status': 'ok', 'bytes': 0}]}))
+    assert g.main([]) == 0
+    data = json.loads((tmp_path / 'latest.json').read_text())
+    assert not data['alerts']
+    assert data['rows'][0]['growth_status'] == 'insufficient_samples'
+    assert data['rows'][0]['history_samples'] == 2
+    assert data['history_sample_count'] == 2 and data['insufficient_history_count'] == 1
+
+
+def test_growth_v4_new_children_enter_top5_but_not_alerts(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    root = '/new/large-directory'
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: ([root], []))
+    monkeypatch.setattr(g, 'collect', lambda names, deadline: [{'root': root, 'status': 'ok', 'bytes': 40 * g.GIB}])
+    monkeypatch.setattr(g.time, 'time', lambda: 86401)
+    (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': []}))
+    assert g.main([]) == 0
+    data = json.loads((tmp_path / 'latest.json').read_text())
+    assert data['top5'][0]['root'] == root
+    assert data['top5'][0]['delta_bytes'] == 40 * g.GIB
+    assert data['top5'][0]['baseline'] == 'new'
+    assert not data['alerts']
+
+
+def test_growth_v4_parent_roots_are_observe_only():
+    g = load_upkeep('storage_growth_measure')
+    assert all(g.alert_exclusion(root) for root in ('/data/code', '/data/system-tmp', '/root/.cache'))
+
+
+@pytest.mark.parametrize('older,middle,current,expected,status', [
+    (0, 1, 3, True, 'continuous_threshold_met'),
+    (1, 2, 4, True, 'continuous_threshold_met'),
+    (0, 1, 3 - 1 / 1024 ** 3, False, 'below_continuous_threshold'),
+    (1, 2, 3, False, 'below_continuous_threshold'),
+    (0, 0, 4, False, 'not_continuous_growth'),
+    (0, 4, 3, False, 'not_continuous_growth'),
+    (5, 1, 4, False, 'not_continuous_growth'),
+    (4, 3, 2, False, 'not_continuous_growth'),
+])
+def test_growth_v4_unknown_requires_three_rising_samples_and_three_gib(tmp_path, monkeypatch, older, middle, current, expected, status):
+    g = load_upkeep('storage_growth_measure')
+    root = '/unregistered/persistent'
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: ([root], []))
+    monkeypatch.setattr(g, 'collect', lambda names, deadline: [
+        {'root': root, 'status': 'ok', 'bytes': round(current * g.GIB)}])
+    monkeypatch.setattr(g.time, 'time', lambda: 172801)
+    for name, ts, size in [('latest.json', 86401, middle), ('older.json', 1, older)]:
+        (tmp_path / name).write_text(json.dumps({'ts': ts, 'rows': [
+            {'root': root, 'status': 'ok', 'bytes': round(size * g.GIB)}]}))
+    assert g.main([]) == 0
+    data = json.loads((tmp_path / 'latest.json').read_text())
+    assert bool(data['alerts']) is expected
+    assert data['rows'][0]['history_samples'] == 3
+    assert data['rows'][0]['growth_status'] == status
+    assert data['rows'][0]['growth_total_bytes'] == round(current * g.GIB) - round(older * g.GIB)
+
+
+def test_growth_v4_history_deduplicates_latest_and_selects_by_sample_time(tmp_path):
+    g = load_upkeep('storage_growth_measure')
+    for name, ts, size in [('a.json', 200, 1), ('latest.json', 200, 2),
+                           ('z.json', 100, 0), ('future.json', 400, 99)]:
+        (tmp_path / name).write_text(json.dumps({'ts': ts, 'rows': [{'bytes': size}]}))
+    history = g.load_history(tmp_path, 300)
+    assert [sample['ts'] for sample in history] == [200, 100]
+    assert history[0]['rows'][0]['bytes'] == 2
+
+
+@pytest.mark.parametrize('middle', [None, {'status': 'unknown', 'error': 'timeout'}])
+def test_growth_v4_unknown_gap_does_not_backfill_older_samples(middle):
+    g = load_upkeep('storage_growth_measure')
+    root = '/unregistered/root'
+    row = {'root': root, 'owner': 'unknown', 'status': 'ok', 'bytes': 5 * g.GIB, 'alert_excluded': None}
+    history = [{'ts': 2, 'rows': [] if middle is None else [{'root': root, **middle}]},
+               {'ts': 1, 'rows': [{'root': root, 'status': 'ok', 'bytes': 0}]}]
+    g.assess_growth([row], history)
+    assert row['growth_status'] == 'insufficient_samples' and row['history_samples'] == 1
+    assert row['growth_total_bytes'] is None
+
+
+def test_growth_v4_registered_new_child_is_top5_only(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    root = '/registered/new-directory'
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    monkeypatch.setattr(g, 'discover', lambda: ([root], []))
+    monkeypatch.setattr(g, 'fingerprints', lambda: [(root, 'registered')])
+    monkeypatch.setattr(g, 'collect', lambda names, deadline: [{'root': root, 'status': 'ok', 'bytes': 40 * g.GIB}])
+    monkeypatch.setattr(g.time, 'time', lambda: 86401)
+    (tmp_path / 'latest.json').write_text(json.dumps({'ts': 1, 'rows': []}))
+    assert g.main([]) == 0
+    data = json.loads((tmp_path / 'latest.json').read_text())
+    assert data['top5'][0]['daily_bytes'] == 40 * g.GIB and data['top5'][0]['baseline'] == 'new'
+    assert not data['alerts']
+
+
+@pytest.mark.parametrize('root', ['/data/code', '/root/.cache'])
+def test_growth_v4_child_measurements_share_one_physical_walk(monkeypatch, root):
+    g = load_upkeep('storage_growth_measure')
+    output = f'150\t{root}/child with space\0' + f'140\t{root}/child with space/nested\0' + f'46\t{root}/file\0' + f'200\t{root}\0'
+    calls = []
+    def run(cmd, **kw):
+        calls.append(cmd)
+        assert cmd[:2] == ['ionice', '-c3']
+        assert '--max-depth=1' in cmd and '--null' in cmd
+        return subprocess.CompletedProcess(cmd, 0, output, '')
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    rows = g.measure_job(root, time.monotonic() + 1)
+    assert len(calls) == 1
+    assert {row['root']: row['bytes'] for row in rows} == {root: 200, root + '/child with space': 150, root + '/file': 46}
+
+
+def test_growth_v4_first_sample_marks_new_top5_without_inventing_daily_rate():
+    g = load_upkeep('storage_growth_measure')
+    rows = [{'root': '/new', 'owner': 'unknown', 'status': 'ok', 'bytes': 10}]
+    compared, top = g.compare(rows, {}, 100)
+    assert top[0]['baseline'] == 'new' and top[0]['delta_bytes'] == 10
+    assert top[0]['daily_bytes'] is None

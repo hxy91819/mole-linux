@@ -25,6 +25,7 @@ BB_STORAGE = BB_DATA + '/thread-storage'
 GO_CACHE = BB_STORAGE + '/.shared-cache/go-build'
 LINT_CACHE = BB_STORAGE + '/.shared-cache/golangci-lint'
 BB_ROOTS = (BB_DATA, BB_STORAGE, GO_CACHE, LINT_CACHE, 'bb:threads', 'bb:non-thread')
+CHILD_ROOTS = ('/data/code', '/root/.cache')
 DOCKER_TYPES = {'Images': 'docker:images', 'Containers': 'docker:containers',
                 'Local Volumes': 'docker:volumes', 'Build Cache': 'docker:build-cache'}
 
@@ -34,7 +35,7 @@ def unknown(root, error):
 
 
 def alert_exclusion(root):
-    if root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage'):
+    if root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage', '/data/system-tmp', *CHILD_ROOTS):
         return 'parent aggregate; alert on components'
     if root in (GO_CACHE, LINT_CACHE):
         return 'shared Go cache; daily check 2 owns size and age limits'
@@ -117,7 +118,7 @@ def measure(root, deadline):
         return unknown(root, error)
 
 
-def split_bb_output(output, thread_dirs):
+def du_sizes(output):
     sizes = {}
     for record in output.split('\0'):
         if not record:
@@ -126,6 +127,28 @@ def split_bb_output(output, thread_dirs):
         if not separator or int(size) < 0:
             raise ValueError('invalid du record')
         sizes[path] = int(size)
+    return sizes
+
+
+def measure_children(root, deadline):
+    # Reporting depth only: du still walks descendants once and deduplicates inodes.
+    row = probe(root, ['du', '-ax', '-B1', '--max-depth=1', '--null', '--', root], deadline)
+    if row['status'] != 'ok':
+        return [unknown(root, row['error'])]
+    try:
+        sizes = du_sizes(row['output'])
+        if root not in sizes:
+            raise ValueError('du parent summary missing')
+        return [{'root': path, 'status': 'ok', 'bytes': size,
+                 'parent': root if path != root else None,
+                 'elapsed_seconds': row['elapsed_seconds']}
+                for path, size in sizes.items() if path == root or str(Path(path).parent) == root]
+    except (ValueError, KeyError) as error:
+        return [unknown(root, error)]
+
+
+def split_bb_output(output, thread_dirs):
+    sizes = du_sizes(output)
     total = sizes[BB_STORAGE]
     direct = {path: size for path, size in sizes.items() if str(Path(path).parent) == BB_STORAGE}
     shared = BB_STORAGE + '/.shared-cache'
@@ -200,6 +223,8 @@ def split_docker_output(row):
 
 
 def measure_job(root, deadline):
+    if root in CHILD_ROOTS:
+        return measure_children(root, deadline)
     if root == BB_DATA:
         return measure_bb_data(deadline)
     row = measure(root, deadline)
@@ -211,22 +236,82 @@ def collect(roots, deadline):
         return [row for group in pool.map(lambda root: measure_job(root, deadline), roots) for row in group]
 
 
+def load_history(directory, before_ts):
+    # Select by sample time rather than mtime/name; latest and its dated copy are one sample.
+    newest = {}
+    paths = sorted(directory.glob('*.json'), key=lambda p: p.name == 'latest.json')
+    for path in paths:
+        sample = json.loads(path.read_text())
+        stamp = sample['ts']
+        if stamp >= before_ts or stamp < before_ts - RETENTION_SECONDS:
+            continue
+        newest[stamp] = sample
+        if len(newest) > 2:
+            del newest[min(newest)]
+    return [newest[stamp] for stamp in sorted(newest, reverse=True)]
+
+
+def assess_growth(rows, history):
+    prior = [{row['root']: row for row in sample.get('rows', [])} for sample in history[:2]]
+    for row in rows:
+        values = []
+        for item in [row, *(sample.get(row['root'], {}) for sample in prior)]:
+            if item.get('status') != 'ok' or 'bytes' not in item:
+                break
+            values.append(item['bytes'])
+        row['history_samples'] = len(values)
+        row['growth_total_bytes'] = values[0] - values[-1] if len(values) == 3 else None
+        if row.get('alert_excluded'):
+            result = 'excluded'
+        elif not values:
+            result = 'unmeasured'
+        elif row['owner'] != 'unknown':
+            result = 'daily_checked' if len(values) >= 2 else 'insufficient_samples'
+        elif len(values) < 3:
+            result = 'insufficient_samples'
+        elif not values[2] < values[1] < values[0]:
+            result = 'not_continuous_growth'
+        elif row['growth_total_bytes'] < 3 * GIB:
+            result = 'below_continuous_threshold'
+        else:
+            result = 'continuous_threshold_met'
+        row['growth_status'] = result
+
+
 def compare(rows, previous, now):
     before = {row['root']: row for row in previous.get('rows', [])}
     interval = now - previous.get('ts', now)
     compared = []
     for row in rows:
-        old = before.get(row['root'], {})
-        if (interval <= 0 or row['status'] != 'ok' or old.get('status') != 'ok'
-                or 'bytes' not in row or 'bytes' not in old):
+        if row['status'] != 'ok' or 'bytes' not in row:
             continue
+        old = before.get(row['root'])
+        new = old is None
+        # An explicit failed measurement remains unknown, never a synthetic zero.
+        if not new and (interval <= 0 or old.get('status') != 'ok' or 'bytes' not in old):
+            continue
+        old_bytes = 0 if new else old['bytes']
+        delta = row['bytes'] - old_bytes
         compared.append({'root': row['root'], 'owner': row['owner'],
                          'alert_excluded': row.get('alert_excluded'),
-                         'delta_bytes': row['bytes'] - old['bytes'],
-                         'daily_bytes': round((row['bytes'] - old['bytes']) * 86400 / interval)})
+                         'baseline': 'new' if new else 'measured', 'previous_bytes': old_bytes,
+                         'history_samples': row.get('history_samples'),
+                         'growth_status': row.get('growth_status'),
+                         'growth_total_bytes': row.get('growth_total_bytes'),
+                         'delta_bytes': delta,
+                         'daily_bytes': round(delta * 86400 / interval) if interval > 0 else None})
     positive = sorted((r for r in compared if r['delta_bytes'] > 0),
-                      key=lambda row: (-row['daily_bytes'], row['root']))
+                      key=lambda row: (-(row['daily_bytes'] if row['daily_bytes'] is not None
+                                        else row['delta_bytes']), row['root']))
     return compared, positive[:5]
+
+
+def is_alert(row):
+    if row['alert_excluded'] or row['baseline'] != 'measured' or row['delta_bytes'] <= 0:
+        return False
+    if row['owner'] == 'unknown':
+        return row['growth_status'] == 'continuous_threshold_met'
+    return row['daily_bytes'] is not None and row['daily_bytes'] > 20 * GIB
 
 
 def atomic_write(path, payload):
@@ -254,15 +339,16 @@ def main(argv=None):
     deadline = started + TOTAL_SECONDS
     roots, rows = discover()
     rules = fingerprints()
-    previous = json.loads((OUT / 'latest.json').read_text()) if (OUT / 'latest.json').exists() else {}
+    history = load_history(OUT, time.time())
+    previous = history[0] if history else {}
     rows += collect(['docker system df', *roots], deadline)
     for row in rows:
         row['owner'] = owner(row['root'], rules)
         row['alert_excluded'] = alert_exclusion(row['root'])
     now = time.time()
+    assess_growth(rows, history)
     comparisons, top5 = compare(rows, previous, now)
-    alerts = [r for r in comparisons if not r['alert_excluded'] and r['delta_bytes'] > 0 and
-              (r['daily_bytes'] >= GIB if r['owner'] == 'unknown' else r['daily_bytes'] > 20 * GIB)]
+    alerts = [row for row in comparisons if is_alert(row)]
     top_unknown = [row for row in rows if row['status'] == 'unknown' and
                    (row['root'] == '/data' or
                     (row['root'].startswith('/data/') and row['root'].count('/') == 2))]
@@ -270,7 +356,11 @@ def main(argv=None):
     if docker_unknown:
         top_unknown.append({'root': '/data/docker', 'error': 'Docker category measurements incomplete',
                             'categories': docker_unknown})
-    out = {'schema_version': 2, 'data_top_unknown': top_unknown, 'ts': now, 'previous_ts': previous.get('ts'),
+    out = {'schema_version': 3, 'history_sample_count': 1 + len(history),
+           'history_ts': [sample['ts'] for sample in history],
+           'insufficient_history_count': sum(
+               row['owner'] == 'unknown' and row['growth_status'] == 'insufficient_samples' for row in rows),
+           'data_top_unknown': top_unknown, 'ts': now, 'previous_ts': previous.get('ts'),
            'interval_seconds': now - previous['ts'] if previous else None,
            'elapsed_seconds': round(time.monotonic() - started, 3),
            'rows': rows, 'comparisons': comparisons, 'top5': top5, 'alerts': alerts,

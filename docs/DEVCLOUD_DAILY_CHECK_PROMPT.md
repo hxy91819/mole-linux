@@ -27,12 +27,12 @@
 3. /tmp 与 /var/tmp 清理（cron 每天 03:30）。`/data/metrics/devcloud-clean-tmp.log` 每行一个 JSON。分别按 `path` 为 `/data/system-tmp` 和 `/var/tmp`，找 `ts` 晚于最近一次 03:30 的第一条 `"event": "summary"`；两根各自都必须存在，`status` 为 `ok`，`failed` 为 0，`scan` 为 `complete`。缺任一根的 summary 都算不符合。`deferred` 大于 0 是预算递延，属于正常。再看 `/data/metrics/devcloud-clean-tmp.stderr.log` 的修改时间：晚于最近一次 03:30 就算不符合，并贴出它的末尾 20 行。
 4. systemd-tmpfiles 不再按年龄清 /tmp。`/etc/tmpfiles.d/tmp.conf` 里 `/tmp` 那一行的第 6 列（年龄）是 `-`；`systemctl show systemd-tmpfiles-clean.service -p Result --value` 输出 `success`。
 5. 两块盘的容量。`df -B1 --output=avail /data` 和 `df -B1 --output=avail /`（系统盘）的可用字节都不少于 161061273600（150 GiB）。
-6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`schema_version` 为2，`ts` 距 NOW 不超过25小时；07:00计量任务必须已经结束，单根预算780秒、全轮840秒、任务超时900秒，应在07:30前完成。
+6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`schema_version` 为3，`ts` 距 NOW 不超过25小时；07:00计量任务必须已经结束，单根预算780秒、全轮840秒、任务超时900秒，应在07:30前完成。
    - 列 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`。归属按当前计量任务指向快照内的 `storage_growth_fingerprints.md` 核对，unknown 不猜测项目；父子根不相加。
-   - 单列 thread-storage 四项的 bytes、归属与可用的日增：`.shared-cache/go-build`、`.shared-cache/golangci-lint`（两项为完整路径）、`bb:threads`（thr_*真实目录合计）、`bb:non-thread`（非线程条目，排除前两项，含共享缓存其余项与目录元数据）。父根 `/data/bb-data`、`/data/bb-data/thread-storage` 只观察Top5，不重复报警；两共享Go缓存由第2项大小/年龄兜底，不参与20GiB/天告警。排除原因在 `alert_excluded`。
+   - 单列 thread-storage 四项的 bytes、归属与可用的日增：`.shared-cache/go-build`、`.shared-cache/golangci-lint`（两项为完整路径）、`bb:threads`（thr_*真实目录合计）、`bb:non-thread`（非线程条目，排除前两项，含共享缓存其余项与目录元数据）。父根 `/data/bb-data`、`/data/bb-data/thread-storage`、`/data/system-tmp`、`/data/code`、`/root/.cache` 只观察Top5，不重复报警；code/cache按直接子项展示，父子根不叠加；两共享Go缓存由第2项大小/年龄兜底，不参与20GiB/天告警。排除原因在 `alert_excluded`。
    - Docker四类必须有数值 bytes：`docker:images`、`docker:containers`、`docker:volumes`、`docker:build-cache`；来自Docker system df，不再用du /data/docker。分类缺失、失败、超时均不得当0。
-   - `data_top_unknown` 必须为空；非空时逐一列根、原因并算不符合。其余未测根列 `unknown_count`，按原因汇总，最多5个路径示例。`comparisons` 只允许前后两次都ok且有bytes的根；新增分项首轮说明只建基线，不把缺前次当0。
-   - 只对非排除项检查 `alerts`：unknown单根折算日增 ≥1073741824（1 GiB），已登记来源 >21474836480（20 GiB）才算不符合并通知协调线程；小增长仍可列Top5。指标过期、缺失、关键分项未测或07:30时任务仍未完成也算不符合。
+   - `data_top_unknown` 必须为空；非空时逐一列根、原因并算不符合。其余未测根列 `unknown_count`，按原因汇总，最多5个路径示例。`comparisons` 的真实比较要求前后都ok且有bytes；前次缺项的新指标允许0作合成基线进入Top5，但必须显示 `baseline=new`，不表示目录当天新建，且不参与告警。前次明确unknown仍不得当0。首次没有时间间隔时daily_bytes为null，不虚构日增。
+   - 只对非排除项且有真实历史的指标检查 `alerts`：unknown必须最近三个独立样本（本次＋前两次）均有效、严格递增，累计 `growth_total_bytes` ≥3221225472（3 GiB），才算不符合并通知协调线程；已登记来源仍按本次和前次两个有效样本的单日 >21474836480（20 GiB）判断。检查 `history_samples` 与 `growth_status`，unknown不足三个连续有效样本应明示insufficient_samples而不判；缺项或未测不能向更早样本补凑，latest和其时间文件不能算两份。列 `insufficient_history_count`。小增长仍可列Top5。指标过期、缺失、关键分项未测或07:30时任务仍未完成也算不符合。
 
 ## 结果
 
