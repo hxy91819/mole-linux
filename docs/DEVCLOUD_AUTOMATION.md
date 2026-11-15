@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位与增长两个任务使用独立快照 `e2b953cd674c0e86`，不改变下列五个清理任务的快照：
+水位与增长两个任务使用独立快照 `7afa1113ccf6f9f3`，不改变下列五个清理任务的快照：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -37,17 +37,23 @@ Docker、Go、worktree、tmp clone、pnpm、clean-tmp `/data/system-tmp`，/ 对
 | `bb:threads` | BB thread directories，`thr_*` 真实目录合计 | >20 GiB/天 |
 | `bb:non-thread` | BB根非线程条目；含共享缓存其余项与目录元数据 | >20 GiB/天 |
 
-`/data/bb-data`、thread-storage 父根仍可进入 Top5，`alert_excluded` 标明只观察，不重复报警。
+`/data/code`、`/root/.cache` 各用一次物理 du 遍历输出父根与直接子项；只增加输出深度，
+不对每个子目录重新遍历，硬链接仍由同一次du去重。它们与 `/data/system-tmp`、两个BB父根
+只进Top5、不告警，`alert_excluded` 标明聚合原因。未登记子目录保持unknown，不凭名字猜归属。
 不再 du `/data/docker`；`docker system df --format '{{json .}}'` 一次取得镜像、容器、卷、
-构建缓存四类 Size，转为数值 bytes，分别以 `docker:images`、`docker:containers`、
-`docker:volumes`、`docker:build-cache` 比较。缺类、失败或超时标 unknown，不推成0。
+构建缓存四类 Size，转为数值 bytes，以 `docker:images`、`docker:containers`、
+`docker:volumes`、`docker:build-cache` 比较。缺类、失败或超时标unknown，不推成0。
 
-普通文件和符号链接直接读 `lstat.st_blocks * 512`，只有目录运行 du。
-指标写 `/var/lib/devcloud-storage-upkeep/metrics`，最新 `schema_version=2`，历史仅保留30天。
-`data_top_unknown` 单列 /data 顶层未测项（Docker分类不全也映射到 /data/docker）；
-`rows` 含已测 bytes 或 unknown/error；`comparisons` 只含前后有效根；`top5` 按实际间隔折算日增。
-`owner` 来自随快照发布的路径指纹表；除上述排除项，`alerts` 收录 unknown 日增 ≥1 GiB、
-已登记来源日增 >20 GiB；较小正增长仍在 Top5。父子根不求和，新分项首次出现只建基线，不当0比较。
+指标写 `/var/lib/devcloud-storage-upkeep/metrics`，`schema_version=3`，历史保留30天。
+最近样本按内容ts选取，latest与其带时间文件去重；unknown告警必须本次加前两次三样本均有效、
+大小严格递增，且本次减最早样本累计 ≥3 GiB。缺项或未测不跳过补凑，不足时
+`growth_status=insufficient_samples`，`history_samples` 写当前连续有效样本数，
+`insufficient_history_count` 汇总未满足历史要求的unknown项。已登记来源仍按单日 >20 GiB。
+
+前次没有指标的新子项以0为合成基线进入Top5，`baseline=new`，不参与任何告警；
+这表示新指标，不证明目录本身新建。全局首次没有时间间隔时daily_bytes为null，按原始增量排名。
+前次明确unknown的项仍不参与比较，不能用合成0替代失败测量。
+`data_top_unknown` 单列/data顶层未测项（Docker分类不全也映射到/data/docker）；父子根不相加。
 
 预演和只读复现：
 
@@ -139,7 +145,7 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 ```cron
 # devcloud-clean-tmp: ordinary entries 3d; structural caches idle 24h (owner-approved 2026-11-14)
-30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/e2b953cd674c0e86/clean_tmp_runner.py # devcloud-clean-tmp
+30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/7afa1113ccf6f9f3/clean_tmp_runner.py # devcloud-clean-tmp
 ```
 
 - 先 `/var/tmp`（内部预算 300 秒，timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒，

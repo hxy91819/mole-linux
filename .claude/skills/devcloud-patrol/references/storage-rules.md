@@ -131,7 +131,7 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 每 15 分钟读取 `/` 与 `/data` 的 `statvfs` 可用字节；低于 150 GiB 预警、低于 50 GiB 危险。首次越线、warning→danger 升级或两小时冷却结束后再次触发才通知；冷却期静默，恢复正常后重新越线视为首次。运行中或查询未知的任务跳过并在触发简报注明；clean-tmp 与 cron 共用 `clean_tmp_runner.py`，非阻塞锁由后台执行链持有到结束，两盘同时越线合并为同一 worker 顺序执行两根；新入口用 `-I`，旧执行器仍用 `-B`（同目录依赖）。路径、timeout、预算与 JSONL 记账只有一个入口。派发后先保存冷却再通知，通知失败仍非零退出。`--dry-run` 仅打印计划，不写状态、不调用 BB 或包装器。真实触发 stdout 输出一行摘要，正常/冷却完全静默。每日07:00按/data顶层优先、system-tmp逐项最后，以8并发、ionice空闲级计量；单根最多780秒、全轮840秒，BB超时900秒，须在07:30检查前结束。/data/docker不du，改Docker system df分类数值比较（镜像、容器、卷、构建缓存）；/data顶层未测根单列data_top_unknown。超时/失败/缺类不当0比较，历史保留30天。
 
-thread-storage由一次物理du遍历拆成共享go-build、共享golangci-lint、thr_*真实目录合计（bb:threads）、非线程条目合计（bb:non-thread）；后者排除两共享Go缓存，包含共享缓存其他项与目录元数据。各项按下表登记归属。/data/bb-data与thread-storage父根只进Top5、不重复报警；两共享Go缓存也只观察，由每日检查第2项核≤100GiB与无超过1520分钟的哈希条目。其余分项沿用unknown日增≥1GiB、已登记日增>20GiB告警；小增长保留Top5，新分项首轮只建基线。
+thread-storage由一次物理du遍历拆成共享go-build、共享golangci-lint、thr_*真实目录合计（bb:threads）、非线程条目合计（bb:non-thread）；后者排除两共享Go缓存，包含共享缓存其他项与目录元数据。各项按下表登记归属。/data/bb-data、thread-storage、/data/system-tmp、/data/code与/root/.cache父根只进Top5、不重复报警；/data/code和/root/.cache单次du遍历输出直接子项，增加观察粒度但不重复遍历；两共享Go缓存也只观察，由每日检查第2项核≤100GiB与无超过1520分钟的哈希条目。unknown分项只在本次与前两次三样本有效、严格递增、累计≥3GiB时告警；缺测/缺项中断连续性，不足三样本明示insufficient_samples。已登记分项仍按单日>20GiB告警。前次无指标的新子项以0作合成基线进Top5并标baseline=new，告警只用真实历史，不把前次unknown改成0。
 
 - 同一对象跨扫描批次出现时，先按路径/物理身份合并；单独运行的`du`不跨调用去重硬链接，
   路径实占相加不能称文件系统物理下界或独占可回收量。登记worktree按目标device区分主checkout、
