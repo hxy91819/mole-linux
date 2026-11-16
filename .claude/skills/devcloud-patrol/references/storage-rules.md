@@ -133,6 +133,8 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 
 thread-storage由一次物理du遍历拆成共享go-build、共享golangci-lint、thr_*真实目录合计（bb:threads）、非线程条目合计（bb:non-thread）；后者排除两共享Go缓存，包含共享缓存其他项与目录元数据。各项按下表登记归属。/data/bb-data、thread-storage、/data/system-tmp、/data/code与/root/.cache父根只进Top5、不重复报警；/data/code和/root/.cache单次du遍历输出直接子项，增加观察粒度但不重复遍历；两共享Go缓存也只观察，由每日检查第2项核≤100GiB与无超过1520分钟的哈希条目。unknown分项只在本次与前两次三样本有效、严格递增、累计≥3GiB时告警；缺测/缺项中断连续性，不足三样本明示insufficient_samples。已登记分项仍按单日>20GiB告警。前次无指标的新子项以0作合成基线进Top5并标baseline=new，告警只用真实历史，不把前次unknown改成0。
 
+计量du固定LC_ALL=C；非零退出仅在stdout有本根合法总量、stderr每行全为条目消失（No such file or directory）时记ok，附vanished诊断行数与最多5条vanished_examples，不作为每日检查不符合。分项遍历只在扫描父根附备注，不重复计数。混有权限/I/O等错误、无本根合法总量、信号退出或超时仍记unknown；此例外只用于只读计量，不用于清理候选扫描。
+
 - 同一对象跨扫描批次出现时，先按路径/物理身份合并；单独运行的`du`不跨调用去重硬链接，
   路径实占相加不能称文件系统物理下界或独占可回收量。登记worktree按目标device区分主checkout、
   附加worktree及异盘，再与output/ops/tmp父scope去重。未完成扫描是unknown，不是recent；
