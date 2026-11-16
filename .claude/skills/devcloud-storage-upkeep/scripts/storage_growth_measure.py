@@ -80,6 +80,31 @@ def owner(root, rules):
     return next((name for pattern, name in rules if fnmatch.fnmatchcase(root, pattern)), 'unknown')
 
 
+def vanished_du_notes(root, command, result):
+    if not command or command[0] != 'du' or result.returncode <= 0:
+        return None
+    lines = result.stderr.splitlines()
+    pattern = r'du: cannot (?:access|read directory|stat) .+: No such file or directory'
+    if not lines or any(re.fullmatch(pattern, line) is None for line in lines):
+        return None
+    try:
+        if '--null' in command or '-0' in command:
+            totals = du_sizes(result.stdout)
+            if root not in totals:
+                return None
+        else:
+            size, separator, path = result.stdout.rstrip('\n').partition('\t')
+            if not separator or path != root or re.fullmatch(r'[0-9]+', size) is None:
+                return None
+    except ValueError:
+        return None
+    return {'vanished': len(lines), 'vanished_examples': lines[:5]}
+
+
+def du_notes(row):
+    return {key: row[key] for key in ('vanished', 'vanished_examples') if key in row}
+
+
 def probe(root, command, deadline):
     budget = min(PER_ROOT_SECONDS, deadline - time.monotonic())
     if budget <= 0:
@@ -87,11 +112,13 @@ def probe(root, command, deadline):
     started = time.monotonic()
     try:
         result = subprocess.run(['ionice', '-c3', *command], capture_output=True,
-                                text=True, timeout=budget)
-        if result.returncode:
+                                text=True, timeout=budget,
+                                env={**os.environ, 'LC_ALL': 'C'} if command[0] == 'du' else None)
+        notes = vanished_du_notes(root, command, result) if result.returncode else None
+        if result.returncode and notes is None:
             row = unknown(root, result.stderr[-2000:] or f'exit {result.returncode}')
         else:
-            row = {'root': root, 'status': 'ok', 'output': result.stdout}
+            row = {'root': root, 'status': 'ok', 'output': result.stdout, **(notes or {})}
     except (OSError, subprocess.SubprocessError) as error:
         row = unknown(root, error)
     row['elapsed_seconds'] = round(time.monotonic() - started, 3)
@@ -124,7 +151,7 @@ def du_sizes(output):
         if not record:
             continue
         size, separator, path = record.partition('\t')
-        if not separator or int(size) < 0:
+        if not separator or re.fullmatch(r'[0-9]+', size) is None:
             raise ValueError('invalid du record')
         sizes[path] = int(size)
     return sizes
@@ -141,7 +168,8 @@ def measure_children(root, deadline):
             raise ValueError('du parent summary missing')
         return [{'root': path, 'status': 'ok', 'bytes': size,
                  'parent': root if path != root else None,
-                 'elapsed_seconds': row['elapsed_seconds']}
+                 'elapsed_seconds': row['elapsed_seconds'],
+                 **(du_notes(row) if path == root else {})}
                 for path, size in sizes.items() if path == root or str(Path(path).parent) == root]
     except (ValueError, KeyError) as error:
         return [unknown(root, error)]
@@ -185,6 +213,8 @@ def measure_bb_data(deadline):
         rows = split_bb_output(row['output'], threads)
         for item in rows:
             item['elapsed_seconds'] = row['elapsed_seconds']
+            if item['root'] == BB_DATA:
+                item.update(du_notes(row))
         return rows
     except (OSError, ValueError, KeyError) as error:
         return [unknown(root, error) for root in BB_ROOTS]

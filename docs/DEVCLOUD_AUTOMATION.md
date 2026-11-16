@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位与增长两个任务使用独立快照 `7afa1113ccf6f9f3`，不改变下列五个清理任务的快照：
+水位与增长两个任务使用独立快照 `56806e44ddcbe176`，不改变下列五个清理任务的快照：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -54,6 +54,12 @@ Docker、Go、worktree、tmp clone、pnpm、clean-tmp `/data/system-tmp`，/ 对
 这表示新指标，不证明目录本身新建。全局首次没有时间间隔时daily_bytes为null，按原始增量排名。
 前次明确unknown的项仍不参与比较，不能用合成0替代失败测量。
 `data_top_unknown` 单列/data顶层未测项（Docker分类不全也映射到/data/docker）；父子根不相加。
+
+du以 `LC_ALL=C` 运行。非零退出时，仅当stdout有本根合法总量、stderr每行均为
+条目消失（`No such file or directory`）才保留 `status=ok`；附 `vanished` 诊断行数与
+最多5条 `vanished_examples`。子项随临时目录消失是正常并发变化，不算每日检查不符合。
+code/cache/BB的分项输出只在实际扫描父根附备注，避免重复计数。
+混有权限、I/O等其他错误、无本根合法总量、信号退出或超时仍记unknown。
 
 预演和只读复现：
 
@@ -145,7 +151,7 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 ```cron
 # devcloud-clean-tmp: ordinary entries 3d; structural caches idle 24h (owner-approved 2026-11-14)
-30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/7afa1113ccf6f9f3/clean_tmp_runner.py # devcloud-clean-tmp
+30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/56806e44ddcbe176/clean_tmp_runner.py # devcloud-clean-tmp
 ```
 
 - 先 `/var/tmp`（内部预算 300 秒，timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒，

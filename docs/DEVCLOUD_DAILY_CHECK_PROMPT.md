@@ -31,6 +31,7 @@
    - 列 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`。归属按当前计量任务指向快照内的 `storage_growth_fingerprints.md` 核对，unknown 不猜测项目；父子根不相加。
    - 单列 thread-storage 四项的 bytes、归属与可用的日增：`.shared-cache/go-build`、`.shared-cache/golangci-lint`（两项为完整路径）、`bb:threads`（thr_*真实目录合计）、`bb:non-thread`（非线程条目，排除前两项，含共享缓存其余项与目录元数据）。父根 `/data/bb-data`、`/data/bb-data/thread-storage`、`/data/system-tmp`、`/data/code`、`/root/.cache` 只观察Top5，不重复报警；code/cache按直接子项展示，父子根不叠加；两共享Go缓存由第2项大小/年龄兜底，不参与20GiB/天告警。排除原因在 `alert_excluded`。
    - Docker四类必须有数值 bytes：`docker:images`、`docker:containers`、`docker:volumes`、`docker:build-cache`；来自Docker system df，不再用du /data/docker。分类缺失、失败、超时均不得当0。
+   - `status=ok` 且带 `vanished` 的根表示du有本根合法总量、stderr全为条目消失（No such file or directory）；列诊断行数 `vanished` 与最多5条 `vanished_examples`，此情况不算不符合。分项扫描只在扫描父根附这些字段，避免重复计数；混有权限/I/O等错误、无本根合法总量或超时仍记unknown。
    - `data_top_unknown` 必须为空；非空时逐一列根、原因并算不符合。其余未测根列 `unknown_count`，按原因汇总，最多5个路径示例。`comparisons` 的真实比较要求前后都ok且有bytes；前次缺项的新指标允许0作合成基线进入Top5，但必须显示 `baseline=new`，不表示目录当天新建，且不参与告警。前次明确unknown仍不得当0。首次没有时间间隔时daily_bytes为null，不虚构日增。
    - 只对非排除项且有真实历史的指标检查 `alerts`：unknown必须最近三个独立样本（本次＋前两次）均有效、严格递增，累计 `growth_total_bytes` ≥3221225472（3 GiB），才算不符合并通知协调线程；已登记来源仍按本次和前次两个有效样本的单日 >21474836480（20 GiB）判断。检查 `history_samples` 与 `growth_status`，unknown不足三个连续有效样本应明示insufficient_samples而不判；缺项或未测不能向更早样本补凑，latest和其时间文件不能算两份。列 `insufficient_history_count`。小增长仍可列Top5。指标过期、缺失、关键分项未测或07:30时任务仍未完成也算不符合。
 

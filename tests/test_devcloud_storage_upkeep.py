@@ -2777,3 +2777,91 @@ def test_growth_v4_first_sample_marks_new_top5_without_inventing_daily_rate():
     compared, top = g.compare(rows, {}, 100)
     assert top[0]['baseline'] == 'new' and top[0]['delta_bytes'] == 10
     assert top[0]['daily_bytes'] is None
+
+
+@pytest.mark.parametrize('stderr,stdout,expected', [
+    ("du: cannot access '/data/system-tmp/gone': No such file or directory\n", '12345\t/data/system-tmp\n', 'ok'),
+    ("du: cannot access '/data/system-tmp/gone': No such file or directory\ndu: cannot read directory '/data/system-tmp/private': Permission denied\n", '12345\t/data/system-tmp\n', 'unknown'),
+    ("du: cannot access '/data/system-tmp/gone': No such file or directory\n", '', 'unknown'),
+])
+def test_growth_v5_du_vanished_requires_valid_total_and_only_vanished_errors(monkeypatch, stderr, stdout, expected):
+    g = load_upkeep('storage_growth_measure')
+    monkeypatch.setattr(g.os, 'lstat', lambda _: mock.Mock(st_mode=0o40700))
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], 1, stdout, stderr))
+    row = g.measure('/data/system-tmp', time.monotonic() + 1)
+    assert row['status'] == expected
+    if expected == 'ok':
+        assert row['bytes'] == 12345 and row['vanished'] == 1
+        assert row['vanished_examples'] == [stderr.strip()]
+    else:
+        assert 'bytes' not in row
+
+
+def test_growth_v5_vanished_count_keeps_at_most_five_examples(monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    lines = [f"du: cannot access '/data/system-tmp/gone-{i}': No such file or directory" for i in range(7)]
+    def run(cmd, **kw):
+        assert kw['env']['LC_ALL'] == 'C'
+        return subprocess.CompletedProcess(cmd, 1, '12345\t/data/system-tmp\n', '\n'.join(lines) + '\n')
+    monkeypatch.setattr(g.os, 'lstat', lambda _: mock.Mock(st_mode=0o40700))
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    row = g.measure('/data/system-tmp', time.monotonic() + 1)
+    assert row['status'] == 'ok' and row['vanished'] == 7
+    assert row['vanished_examples'] == lines[:5]
+
+
+@pytest.mark.parametrize('root', ['/data/code', '/root/.cache'])
+def test_growth_v5_null_du_preserves_vanished_on_scan_parent(monkeypatch, root):
+    g = load_upkeep('storage_growth_measure')
+    output = f'50\t{root}/child\0' + f'54\t{root}\0'
+    error = f"du: cannot read directory '{root}/gone': No such file or directory\n"
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], 1, output, error))
+    rows = g.measure_job(root, time.monotonic() + 1)
+    parent = next(row for row in rows if row['root'] == root)
+    child = next(row for row in rows if row['root'] != root)
+    assert parent['status'] == 'ok' and parent['bytes'] == 54 and parent['vanished'] == 1
+    assert parent['vanished_examples'] == [error.strip()]
+    assert child['status'] == 'ok' and child['bytes'] == 50 and 'vanished' not in child
+
+
+def test_growth_v5_bb_partition_keeps_vanished_once(monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    records = {g.BB_DATA: 32, g.BB_STORAGE: 28, g.BB_STORAGE + '/.shared-cache': 16,
+               g.GO_CACHE: 8, g.LINT_CACHE: 4, g.BB_STORAGE + '/thr_a': 8,
+               g.BB_STORAGE + '/leftover': 4}
+    output = ''.join(f'{size}\t{path}\0' for path, size in records.items())
+    error = f"du: cannot access '{g.BB_STORAGE}/gone': No such file or directory\n"
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], 1, output, error))
+    entries = mock.MagicMock()
+    entry = mock.Mock(); entry.name = 'thr_a'; entry.is_dir.return_value = True
+    entries.__enter__.return_value = iter([entry])
+    monkeypatch.setattr(g.os, 'scandir', lambda _: entries)
+    rows = g.measure_job(g.BB_DATA, time.monotonic() + 1)
+    assert len(rows) == 6 and all(row['status'] == 'ok' for row in rows)
+    assert next(row for row in rows if row['root'] == g.BB_DATA)['vanished'] == 1
+    assert sum(row.get('vanished', 0) for row in rows) == 1
+
+
+@pytest.mark.parametrize('stdout,stderr,returncode', [
+    ('123\t/data/system-tmp/child\n', "du: cannot access '/gone': No such file or directory\n", 1),
+    ('bad\t/data/system-tmp\n', "du: cannot access '/gone': No such file or directory\n", 1),
+    ('-1\t/data/system-tmp\n', "du: cannot access '/gone': No such file or directory\n", 1),
+    ('123\t/data/system-tmp\n', "du: cannot access '/gone': No such file or directory\ndu: error reading '/broken': Input/output error\n", 1),
+    ('123\t/data/system-tmp\n', '', 1),
+    ('123\t/data/system-tmp\n', "ionice: failed to execute du: No such file or directory\n", 1),
+    ('123\t/data/system-tmp\n', "du: cannot access '/gone': No such file or directory\n", -15),
+])
+def test_growth_v5_other_du_failures_stay_unknown(monkeypatch, stdout, stderr, returncode):
+    g = load_upkeep('storage_growth_measure')
+    monkeypatch.setattr(g.os, 'lstat', lambda _: mock.Mock(st_mode=0o40700))
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], returncode, stdout, stderr))
+    row = g.measure('/data/system-tmp', time.monotonic() + 1)
+    assert row['status'] == 'unknown' and 'bytes' not in row and 'vanished' not in row
+
+
+def test_growth_v5_null_child_only_output_is_not_a_complete_scan(monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    error = "du: cannot access '/data/code/gone': No such file or directory\n"
+    monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], 1, '50\t/data/code/child\0', error))
+    rows = g.measure_job('/data/code', time.monotonic() + 1)
+    assert len(rows) == 1 and rows[0]['status'] == 'unknown' and 'bytes' not in rows[0]
