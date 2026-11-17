@@ -68,7 +68,7 @@ BB 数据与自动化形态。它不覆盖 Mole 产品自身的清理逻辑，�
 | `/root/go/pkg/mod` → `/data/root-dev-cache/go-pkg-mod` | Go module cache | 体积大、跨项目共享、重下载成本高 | 只有 owner 批准的 `go clean -modcache` |
 | `/data/.pnpm-store` | 共享 pnpm store，内含 v3/v10/v11 | 版本化 store 体积大、跨项目共享 | 每周日 05:30 逐版本 `pnpm store prune`；见 3.4 |
 | `/data/docker/lib` | Docker data-root（overlay2、volumes、buildkit） | 数据盘容量大；日志走 journald | 只用 Docker owner 命令；见 3.3 |
-| `/data/code` | 主 checkout、`*-worktrees` 附加 worktree | 这里是工作负载本身 | 只清附加 worktree，主 checkout 永不动；见 3.5 |
+| `/data/code` | 主 checkout、`*-worktrees` 附加 worktree | 这里是工作负载本身 | 全盘 Git 规则判定，受保护主树保留；见 3.5 |
 | `/data/codex` | Codex home、sessions、worktrees、backups | 会话数据，体积大，不能当缓存 | 不自动删；备份待 owner 决策 |
 | `/data/bb-data` | BB `thread-storage`、共享缓存 | BB 的线程产物和共享缓存；`/root/.bb/thread-storage` 软链到这里 | 只修剪 `.shared-cache`；线程目录按 BB/线程状态处理 |
 | `/root/.bb` | BB 主库 `bb.db`、artifacts、插件状态 | 系统盘上的 BB 自有数据 | 不自动删；升级备份按 3.6 处理 |
@@ -244,56 +244,54 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
   它不参与自动修剪。重下载成本和“删了还能再下”是两件事，只有 owner 批准的
   `go clean -modcache` 才动。
 
-### 3.5 worktree 与独立 clone
+### 3.5 全盘 Git 工作树（2026-11-17）
 
-**worktree**
+一个入口 `git_tree_sweep.py` 同时发现独立 clone 和 linked worktree。两块本地盘 `/`、`/data`
+分别 `-xdev`，不按路径、深度、隐藏目录或是否受另一仓库忽略来筛选。发现与删除资格分开：
+每个发现对象都进入报告，损坏 gitdir 也列出，但无法读取状态就保留。
 
-- 主 checkout 永远不自动删；只处理附加 worktree，且必须同时满足：没有进程
-  （cwd/exe/fd/maps）、没有容器挂载、没有忙碌或 24 小时内更新的 BB 线程引用。
-- 闲置满 24 小时后：HEAD 已在实时远端分支上且干净，直接 `git worktree remove`；否则把
-  HEAD 或 WIP 快照推到 `archive/worktree/*`，`ls-remote` 核验 SHA 后再删。推送目的地优先
-  同主机个人命名空间或内部 origin；公共上游且无个人 fork 的保留；不 force push；mono2
-  不推 GitHub。
-- 删除前要检查 ignored 文件：如果 ignored 里有凭据类文件，而主 checkout 同一相对路径没有
-  内容相同的普通文件，整棵 worktree 保留。`git status` 默认不显示 ignored 文件，不能用
-  “status 干净”证明没有私有状态。
-- 归档 ref 带路径哈希，避免同名目录（`weekly-report`、`mono2`）互相覆盖。工蜂
-  committer-check 只接受账号本人邮箱时，把同一棵树压成一个快照提交（全局身份，父提交为
-  已发布基点）再推；原提交留在本地 archive ref。找不到已发布基点就保留并上报。
-- 删除后写 JSONL：URL、HEAD、归档 ref、SHA、完整恢复命令
-  `git fetch <url> <ref> && git worktree add <path> <sha>`。恢复信息是删除的一部分，不是
-  可选的日志。
+旧实现只从 `/data/code` 三层主 checkout 的登记列表找 linked worktree，再从两个 tmp 根的顶层找
+独立 clone。这漏掉 `/data/code/mono2/.worktrees` 中约 13 GiB 的独立 clone、其他仓库 linked
+worktree 和 thread-storage。容器路径不是恢复契约：扩几个白名单只会把相同遗漏移到下个目录。
+因此发现从磁盘开始；只裁剪 owner 管理的 Docker/包管理/语言缓存和有 owner 元数据证明的依赖树，具体名单及理由唯一维护在
+[storage-rules](../.claude/skills/devcloud-patrol/references/storage-rules.md) 的 2026-11-17 条目。
 
-**独立 clone**
+`.pyenv`、`.nvm` 本身可能是 Git clone，但工具安装不能因 clean status + old mtime 被当成遗留源码。
+新增真实使用证据：BB 项目 source、未销毁环境、软链、进程路径环境变量、shell 初始化文件、systemd、
+cron、BB 自动化命令。保护的是含引用的工作树；引用 thread-storage 父目录并不笼统保护其每个子 clone。
+主仓库有 linked worktree、父树含其他仓库时也保留，避免破坏共同 Git 元数据或嵌套树。
 
-- `/data/system-tmp`（即 `/tmp`）和 `/var/tmp` 顶层的独立 clone 由每天 06:45 的
-  `tmp_clone_sweep.py` 处理；`.git` 必须是真实目录，linked worktree 不在此入口。
-- 条件比 worktree 更严：无 `/proc` 引用、无容器挂载、无 BB 环境路径落在其中；除 `.git` 外
-  每个条目最新 mtime 满 24 小时；status（含全部 untracked）为空、无 stash、worktree list
-  仅自身、无嵌套 `.git`；`/data/code` 和两个 tmp 根的其他仓库没有 remote/alternates 引用；
-  ignored 无凭据类文件。
-- 本地分支、HEAD、tag 逐个用实时 `ls-remote` 证明；缺失对象先推
-  `archive/tmp-clone/*` 并核验 exact SHA；tag 用同前缀 tag ref；在待删 clone 内的本地
-  bare remote 不算恢复副本。不 force push，mono2 不推 GitHub，无归档目的地就保留。
+判定取两个旧脚本的严格条件：全树闲置 24h、含全部 untracked 的 clean status、无 stash/操作/锁、
+ignored 无凭据，每个 branch/HEAD/tag 都能恢复。旧 linked 的 WIP 快照、ignored 凭据主树同内容豁免，
+以及 committer-check 压缩归档都不再允许。归档必须保留原始 SHA 和历史，失败保留。
+全批远端 IO 完成后刷新发现与引用，随后重核本地状态再进入 sink。linked 只调主仓库的无 force
+`git worktree remove`；clone 绑定 ancestor fd 后只删除自身，不跟随软链。
+
+旧版先删目录再删除 BB 环境，曾为 dangling 环境补扫；当前政策改为任何未销毁环境都保护路径，
+因此不再自动调用 `bb environment delete`。旧两个脚本仍提供 helper 和旧行为回归 API，但 CLI 均转发新脚本；旧06:45任务停用且改为空操作，防止水位旧快照手动派发旧执行器。
+全盘发现约150万目录，旧12分钟轮次预算不足；完整实测一轮863秒，距BB单次900秒硬上限仅37秒余量，无法覆盖负载波动。因此06:30任务只启动systemd transient oneshot，worker内部30分钟、硬时限33分钟，结束后collect；维持全盘范围，拒绝用深度/路径白名单换速度。
+每日 06:30 先只预演；完整候选清单、保留原因、扫描覆盖/unknown 与耗时供 owner 审核后才开执行。
+
+实测教训：引用解析必须保留引号内空格并传播命令替换的 unknown；Git URL 先由 Git 展开 insteadOf/pushInsteadOf，闲置判据覆盖 fetch/ref/reflog，不能只看 HEAD/index。
+扫描中临时目录消失是正常并发变化，不应中断其余目录；权限/I/O/超时则必须报告不完整。
+沙箱会制造只读/空 `.git` 挂载，沙箱 PID 视图也不是宿主机 `/proc`，所以首轮完整预演由 BB
+script runner 在宿主机运行，不拿沙箱清单当全机清单。命令更新必须 check=True 成功再启动人工运行，
+BB script 的 timeout 最大 900 秒，不能因为更新失败而继续运行旧的执行命令。
 
 ### 3.6 BB 环境与 BB 自有数据
 
 - `/root/.bb` 在系统盘，放 `bb.db`（2026-11-14 约 12.7 GB）、artifacts、插件和部署检查点；
   `/root/.bb/thread-storage` 软链到 `/data/bb-data/thread-storage`，放线程产物和共享缓存。
   BB 自有数据（主库、artifacts）不在自动清理范围；只有 `.shared-cache` 由本仓修剪。
-- `bb environment delete <id>` 只清理环境记录和 attempt 标记，**不删除 Git 分支或 ref**。
-  本仓只在 worktree 已删除或路径已不存在时调用；路径仍存在时不调用 delete。仍有未归档线程时服务端返回 HTTP 409
-  `Environment still has live threads`，保留，下一轮自然补齐。
-- `worktree_sweep.py` 每轮在成功删除 worktree 后，按 `path` 精确全等处理未 `destroyed` 的
-  BB 环境；每轮每个环境只尝试一次，被拒绝记原因、不重试、不令脚本失败；`bb` 不可用时
-  fail open，只记 JSONL，不阻塞已授权的 worktree 删除。预演不调用 delete。
+- 旧版会在删 worktree 后补删 BB 环境，2026-11-17 已停用此流程；当前任何未销毁环境都保护路径，
+  查询失败保留，不调用环境删除。BB 本身的环境生命周期仍由 BB 管理，不由存储清理器代管。
 - 升级备份：`/data/bb-data/thread-storage/<thread>/upgrade-*` 只有在新版本稳定、owner 同意、
   且 `who-uses` 无引用、最新 mtime 早于升级窗口时才删。2026-11-14 已删 0.47 的
   `upgrade-047`（约 11 GiB）；0.49 的 `upgrade-049` 等新版稳定后按一次性提醒处理。
 
 ### 3.7 自动化形态
 
-- 五个脚本任务跑在 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 的不可变快照里，
+- 维护脚本任务跑在 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 的不可变快照里，
   不是仓库工作区。目录名是 `manifest.json` 规范化内容 sha256 的前 16 位；文件 `0444`，
   目录 `0555`；用 `python3 -I` 运行（任务里是 `/root/.pyenv/versions/3.12.12/bin/python3`），
   不生成 `.pyc`。改仓库不会影响正在跑的任务，
@@ -303,7 +301,7 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
 - 2026-11-05 起存储自动化统一为一套；重叠的旧任务（每周系统盘复盘、每周 DB 巡检、
   独立清理检查、fork-maintenance 09:00 闲置工作区清理）已退役。systemd 定时器不并入这套
   体系，继续由生产端自己维护（见自动化文档）。
-- 锁竞争是正常状态：Docker 与 worktree 共用 fork-maintenance 的 `run.lock`，拿不到就静默
+- 锁竞争是正常状态：Docker 使用 fork-maintenance 的 `run.lock`，全盘 Git 使用自身 `git-tree-sweep.lock`，拿不到就静默
   跳过；跳过不等于清理有效，但也不创建诊断会话、不重试、不把锁竞争当故障。
 
 ## 4. 设计原则
@@ -340,6 +338,7 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
 | 2026-11-03 | owner 长期授权“所有不是近期在用、可恢复的东西都能清理”，按 72h/引用/恢复校验执行 | 空间告急，需要可复用的授权边界而不是逐项请示 |
 | 2026-11-04 | 建立 `$devcloud-storage-upkeep`；Go 缓存按小时修剪；worktree 24h 归档；停用 tmpfiles 的 `/tmp` 年龄规则 | 增长源是缓存/卷/worktree，旧规则追不上；tmpfiles 会删坏 worktree |
 | 2026-11-05 | 存储自动化统一为一套，退役 4 个重叠任务 | 同一件事只留一个执行器，避免互相抢锁和口径分裂 |
+| 2026-11-17 | 全盘 Git 发现、两个脚本最严条件合并；06:30 只预演；BB 环境改为保护 | 深层独立 clone / 跨仓库 linked 漏扫；工具 clone 必须按真实引用保护 |
 | 2026-11-14 | Go/lint 修剪年龄从 2h 调到 24h；worktree 删除同步处理 BB 环境；`/var/tmp` 纳入 03:30 | 保留日内/隔夜复用；环境记录不该长期指向已删路径；系统盘也要清 |
 | 2026-11-14 | 11 个缓存/工具目录从 `/data` 迁回系统盘；保留会话、数据和大共享缓存 | 系统盘已扩容；`/data` 仍是工作负载盘，不能继续吞缓存 |
 | 2026-11-14 | pnpm 按 v3/v10/v11 逐版本 prune；共享 lint 缓存纳入同一 24h 规则 | 当前 pnpm 不会清旧版本 store；lint 和 Go 共用同一套缓存边界 |
@@ -366,7 +365,7 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
 | 镜像/卷大小相加远大于实际释放 | 共享层、硬链接、overlay 重复计数 | 只报非独占口径；回收量看 `df` | storage-rules「Docker」；`docker_leftovers.py` |
 | BuildKit 14 天规则只回收 130 B | `until` 按 last-used，条目都在窗口内 | 这是正常结论；不为凑数放宽门槛或改用创建时间 | storage-rules「Docker」；`docker_leftovers.py` |
 | 旧标签镜像被误当“很久没用” | 镜像不记录 last-used，`Created` 不是使用时间 | 30 天 + 无引用 + 同仓库有更新镜像；保留仓库最新/保护标签 | storage-rules「2026-11-14 owner 批准：带标签镜像」；`docker_leftovers.py` |
-| 删 worktree 可能丢唯一 `.env` | `git status` 不显示 ignored 文件 | ignored 凭据与主 checkout 比对；不同则整棵保留；先归档再删 | `worktree_sweep.py`；`test_ignored_env_missing_from_main_keeps_the_worktree` |
+| 删 worktree 可能丢唯一 `.env` | `git status` 不显示 ignored 文件 | ignored 凭据整棵保留，不因主 checkout 有同内容豁免 | `worktree_sweep.py`；`test_ignored_env_missing_from_main_keeps_the_worktree` |
 | 同名 worktree 归档 ref 互相覆盖 | 只用目录名做 ref | ref 带路径哈希 | `worktree_sweep.py`；`test_same_named_worktrees_get_distinct_archive_branches` |
 | `bb environment delete` 后以为分支没了 | 它只清环境记录，不删 Git ref | 每轮每个环境只试一次；409 保留；恢复命令写 JSONL | storage-rules「2026-11-14 owner 批准：worktree 删除及每轮补扫 BB 环境」；`test_matching_bb_environment_is_deleted_with_recovery_command_after_worktree_removal` |
 | Codex 沙箱写不了 `~/.cache/go-build` | 可写根不含缓存目录（只有工作区、TMPDIR、Git 目录和 thread-storage） | 软链到 `.shared-cache`；长期由 BB 加 writable root | 本文件 3.1；`go_cache_trim.py`；BB `runtimeWorkspaceWriteRoots` |
@@ -391,7 +390,7 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
 | dangling 镜像漏数 7 个，删除前复查形同虚设 | `repo==<none>` 不是 dangling；`sha256:<hex>` 与裸 hex 比较永远不命中 | dangling 用 tag 判定；复查统一 ID 形式；查询失败 fail closed | `docker_leftovers.py`；ledger 2026-09-17 |
 | Docker 的 GB 与系统 GiB 对不上 | Docker 用十进制 GB，账本用 GiB；镜像/层还共享 | 分列 Docker 自报、对象实占、df 净变；不逐项相加 | storage-rules「Docker」；`docker_leftovers.py` |
 | 镜像年龄差 8 小时被误判到期 | 把 UTC `Z` 当本地时间解析 | 带时区解析；门限按绝对时间算，不按日期字符串 | `docker_leftovers.py`；ledger 2026-09-20 |
-| `git worktree list` 看不到 `/tmp` 的独立 clone | 它只枚举已登记 worktree，不枚举普通 clone | 独立 clone 由每天的 `tmp_clone_sweep.py` 单独扫；不把 worktree 清单当全部 | `tmp_clone_sweep.py`；storage-rules「tmp 独立 clone」 |
+| `git worktree list` 看不到 `/tmp` 的独立 clone | 它只枚举已登记 worktree，不枚举普通 clone | 全盘发现 clone / linked，包括 ignored 后代；不把登记清单当全部 | `tmp_clone_sweep.py`；storage-rules「tmp 独立 clone」 |
 | squash merge 后 HEAD 与 PR head 不同 | squash 改写了 commit identity | 用 `refs/pull/<n>/head` + `merge-base --is-ancestor`；PR 候选另做年龄过滤 | 本文件 3.5；旧巡检测试 |
 | SIGTERM 后仍删了 15 项 / 进程退出窗口误报 | 取消没有共享事件和子进程组终止；`/proc` 读取与进程退出竞争 | 停止排队、终止进程组、恢复在途项；退出窗口有界重查，证据仍不全就拒绝 | `bin/devcloud_tmp.py`；`test_timeout_discards_plan_instead_of_deleting_prefix` |
 | 配置写的路径与实际写入路径不同 | 配置是声明，运行时的 fd/cwd 才是事实 | 用 `/proc` fd/cwd、`du` 设备号和 `df` 证明实际落盘；不按配置路径删除 | `who-uses`；ledger 2026-10-04 gitcrawl |

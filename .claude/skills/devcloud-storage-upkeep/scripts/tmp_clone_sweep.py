@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive and remove idle, independent top-level tmp clones (owner 2026-11-14).
+"""Legacy clone helpers; CLI delegates to the full-disk git_tree_sweep.py.
 
 Default is read-only. Shared process, Git proof, transport and archive helpers
 come from the sibling worktree sweeper, including in isolated (-I) execution.
@@ -430,4 +430,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    sys.exit(main())
+    entry = Path(__file__).with_name('git_tree_sweep.py')
+    namespace = {'__name__': 'git_tree_sweep_cli', '__file__': str(entry)}
+    exec(compile(entry.read_bytes(), str(entry), 'exec'), namespace)
+    sys.exit(namespace['main']())
