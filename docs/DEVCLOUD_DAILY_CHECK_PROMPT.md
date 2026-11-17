@@ -17,7 +17,7 @@
 1. 六个启用脚本定时任务与一个已停用旧任务（project proj_8d3wrcajxn）。用 `bb automation show <id> --project proj_8d3wrcajxn --json` 看 `enabled`、`lastRunAt`（毫秒时间戳）、`lastRunStatus`、`lastError`；用 `bb automation runs <id> --project proj_8d3wrcajxn --limit 30 --json` 看运行记录。只看定时触发的运行（`trigger` 为 `schedule`）；`manual` 是人工测试，不算。要求：启用任务 `enabled` 为 true（旧 tmp clone 例外，必须为 false）；最近 24 小时（pnpm 最近 8 天）的定时运行，status 只能是 succeeded、skipped 或 running；最近一次定时运行距 NOW 不超过下面的时限。
    - auto_1ih1erjpbqo（Docker 残留，每小时 07 分）：70 分钟。
    - auto_vad6yvkpdeq（Go 缓存修剪，每小时 37 分）：70 分钟。
-   - auto_hukidoavox0（全盘 Git 工作树预演，每天 06:30）：25 小时。读回保存的 script，必须调用不可变快照的 `git_tree_sweep_run.sh`，其 worker 调 `git_tree_sweep.py` 且不带 `--execute`；launcher 超时120秒、worker预算1800秒/systemd硬时限1980秒。BB succeeded仅表示启动成功。读 `/root/.local/state/devcloud-storage-upkeep/` 最近当日完整 `git-tree-sweep-*.json`，并核 `systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result`：07:30时不得仍运行（collect后not-found正常，但报告必须存在）。报告要求：mode=dry-run、complete=true、error=null、discovery.errors为空；列 clone/linked 数量、候选路径/大小、保留原因汇总、unmeasured和timings。任一扫描/引用 unknown 或预算不足算不符合，不把 unknown 大小当0。首次部署尚无新版 schedule 时明确“等待首次定时运行”，人工预演只作验证证据。
+   - auto_hukidoavox0（全盘 Git 工作树，每天 06:30）：25 小时。读回保存的 script，必须调用不可变快照的 `git_tree_sweep_run.sh`；按部署记录核对预演/执行模式。执行仅在2026-11-17 owner规定的候选子集及指定保护项条件满足后开启，不能由检查员改模式。launcher超时120秒；worker cwd=/，预演预算1800秒/硬限1980秒，执行预算9000秒/硬限9180秒。BB succeeded仅表示启动成功。读 `/root/.local/state/devcloud-storage-upkeep/` 当日JSONL start的时间、mode与阶段，并核 `systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result`。07:30执行仍在本轮预算内可记pending（06:30启动最迟09:03），明确尚未完成，不拿旧报告冒充本轮成功；同时核对上一轮已结束worker的完整报告及失败项，不能因本轮pending跳过上一轮失败。首次没有上一轮则明确等待首轮完整结果；预演07:03前应结束。超限，或worker停止却无本轮完整JSON报告，算不符合。collect后not-found正常，但必须有完整报告。报告要求mode与保存脚本相符、complete=true、error=null、discovery.errors为空；列clone/linked数量、候选路径/大小、实际removed/kept、archive_verified的URL/ref/SHA及失败项、保留原因汇总、unmeasured和timings。名称碰撞保留（含lighthouse-bak三项），嵌套树归父项目；所有位置闲置≥7天。进程cwd/HOME/XDG_*_HOME为/、挂载点、该UID passwd home时只保护点，其他值保护子树，普通home下.cache/.config仍保护子树。schema_version=2：逐条列unresolved的source/expression、scope、project_id/prefixes和protected_paths；prefix/project unknown允许存在。global_unresolved必须为空，非空点名来源并算不符合。完整扫描/库存失败或预算不足仍算不符合，不把unknown大小当0。预演archive+remove只是归档计划；执行归档以核SHA事件为准。传入--reviewed-preview的首批人工执行，其reviewed_comparison.added必须为空；日常定时执行不要求reviewed_comparison对象，也不绑定该路径清单。目录原du合计与df净变化分列，不等同实际释放。尚无新版schedule时明确“等待首次定时运行”，人工运行仅作验证。
    - auto_3jiqtmzreq8（旧 tmp clone）：必须 enabled=false，存储脚本必须为空操作且不含旧清理调用，不要求周期运行；不得手动触发或恢复。
    - auto_yfr5p14dvnc（pnpm 各版本 store prune，周日 05:30）：8 天。
    - auto_idedelow-3g（水位刹车，每 15 分钟）：25 分钟。
@@ -37,7 +37,9 @@
 
 ## 结果
 
-全部符合：最后一句只写「全部符合预期」，附上 go-build 大小、/data 和 / 的可用空间，不给任何线程发消息。
+有Git本轮仍在预算内运行时，单列pending及预计硬截止时间，不宣称本轮全部完成；其余检查照常，pending本身不发异常通知。
+
+全部已完成且符合：最后一句只写「全部符合预期」，附上 go-build 大小、/data 和 / 的可用空间，不给任何线程发消息。
 
 有不符合的：把所有不符合的项合成一条消息发给协调线程，发完就结束，不要等回复：
 

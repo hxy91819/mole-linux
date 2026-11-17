@@ -70,8 +70,8 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
 - **匿名测试 DB 卷满 1 小时即清**：无任何容器引用、名称为 64 位十六进制且只带
   `com.docker.volume.anonymous` 标签、内容是 MySQL/PostgreSQL 数据目录或为空，创建满 1 小时即
   `docker volume rm <id>`。容器已删的匿名卷没有任何程序还能挂回去；命名卷、compose 卷与 retained 登记照旧。
-- **2026-11-17 owner 要求：全盘 Git 工作树统一预演**：唯一运行入口 `git_tree_sweep.py`，
-  每天 06:30（Asia/Shanghai）经 BB 启动有时限的 systemd oneshot（30分钟预算/33分钟硬时限，结束 collect）；先只部署预演，候选清单经 owner 审核后才可加 `--execute`。
+- **2026-11-17 owner 要求：全盘 Git 工作树统一维护**：唯一运行入口 `git_tree_sweep.py`，
+  每天 06:30（Asia/Shanghai）经 BB 启动有时限的 systemd oneshot（预演30分钟/硬33分钟，执行150分钟/硬153分钟，结束 collect）；先预演。2026-11-17追加授权：满足下述候选集合条件后开启执行。
   此规则取代上版「只扫 /data/code 三层 linked worktree」「只扫 tmp 顶层 clone」及删除后清 BB 环境政策。
   旧 `worktree_sweep.py` / `tmp_clone_sweep.py` 保留 helper/历史回归 API；两个 CLI 名均转发统一入口，不再运行旧范围或旧删除政策。
   - **发现**：物理遍历 `/` 和 `/data`，每根 `-xdev`，按 device/inode 去重，不跟随软链，
@@ -88,10 +88,31 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     shell 初始化文件、systemd 系统/用户单元、crontab、BB 自动化保存的命令引用，均保护包含该引用的工作树。
     引用父容器本身不等于引用其中每个子 clone；不借引用保护恢复路径白名单。未成功物化、无 path/instance 的
     error 环境不表示磁盘上有环境；有 provider input path 时仍保护该路径。其他 BB 路径未知整轮保留。
-    shell 不执行；保留引号内空格，展开 HOME、普通变量赋值、默认值和已有 glob 匹配，动态路径赋值传播 unknown；无法解析时保留。
-  - **本地全条件**：所有非 `.git` 条目及 Git 元数据（含 FETCH_HEAD、ORIG_HEAD、refs 与 reflog）最新 mtime 满 24h；
+    shell 不执行；保留引号内空格，展开 HOME、普通变量赋值、默认/必填/替代参数（:-、:=、:?、:+）和已有 glob 匹配，动态路径赋值传播 unknown；for 序列同样先展开，命令替换保留原单词字面前缀。
+    先替换已读取真实进程环境的全部可能值，以及自动化显式 env、确定的 BB 项目/环境 cwd；不臆造 BB 注入变量。
+    系统 profile 的固定 `$(/绝对路径/go env GOPATH)` / GOROOT 仅以同一 Go 可执行文件的只读 `go env -json` 元数据替换，其他命令替换保持未知。
+    **引用未知按可能范围保留**（暂停/过期一次性任务同样适用）：每个动态操作数分别取第一个未解析变量、glob 或命令替换之前的绝对字面前缀（纯 glob 无论有无匹配都建范围，无匹配 for 仍分析 body），
+    保留前缀下及包含前缀的所有 Git 树；目录名中途截断的前缀按字节前缀匹配，软链和 `/tmp` bind alias 先归一父目录；未完成的最后组件保留拼写，并补充已有物理目标的子树范围。
+    无前缀时，保留该自动化所属项目的 source checkout、未销毁环境 worktree，以及与这些源或项目元数据具有相同有效 remote URL 的 clone/linked 树；
+    URL 比较（含项目元数据）应用 Git fetch/push 重写，并统一常见 SSH/HTTPS 表示及网络 `.git` 后缀；本地只按物理路径及 `/.git` 地址归一，不把不同目录 foo/foo.git 合并，不使用已缓存远端 ref 代替恢复证明。
+    只有既无前缀又无可定位项目时才因引用表达式未知整轮保留；完整库存/权限/进程扫描失败仍整轮保留。
+    缺 HEAD 等残缺树自身保留；其可读 remote/URL rewrite 配置可在自建临时 bare Git 上下文解析，不写原仓库。条件 include、不可读配置或仍无法解析均整轮保留，不静默丢弃引用。报告逐条记录 source、expression、scope、prefixes、project_id 和 protected_paths，
+    即使路径已被其他规则保护也列全；global_unresolved 点名全局阻断来源。scoped unknown 不使 complete=false，删除前所有复核复用相同范围策略。
+  - **2026-11-17追加证据规则**：remote 的 owner/repo，或长度≥4且非通用词/纯版本号的目录名，出现在配置中即保留；
+    匹配大小写归一的完整名称/路径组件，网络 .git 后缀归一，多个 clone 同名/同 namespace 时全部按名称碰撞保留，不设置路径豁免。
+    配置范围为 passwd HOME 下一层 dotfiles、~/.config/**、/etc/** 的≤1MiB普通文本；跟随配置目录的软链并按物理目录去重，
+    二进制、大文件、shell/editor历史及历史临时副本不是此处配置来源。读取失败不消费部分结果。
+    活进程（含清理器自身）的 cwd、HOME、XDG_*_HOME，保护完整子树；若值为 /、挂载点（含物理别名）、或该进程真实 UID 的 passwd home，
+    则仅保护该目录及其包含树，不把保护扩散到后代。普通 home 的子目录（如 ~/.config、~/.cache）仍保护子树；UID无passwd记录时保留较大的子树范围。
+    清理器 worker 的 cwd 设为 /，以免其自身 cwd=/var/tmp 人为占用所有临时 clone。
+  - **本轮执行授权条件**：新完整预演候选必须是旧034c预演131项的子集，且 tmux-resurrect/continuum、实例 HOME 下 codebuddy、dmca/upstream 和 evidence 均已保留。
+    满足即视为 owner 已审核通过：发布执行版、开启06:30并手动执行一次；出现新增候选则保持预演并回报。首批执行用 `--reviewed-preview <新完整预演>` 在任何归档/删除之前比较，
+    有新候选则整批不执行并恢复预演。此比较是本批授权核验，不成为日后按路径白名单清理；后续06:30按同一全盘证据规则运行。
+    owner核验的 account-limits/v0.3.2、devcloudtool/vim、bats-core-1.13.0 及 lighthouse-bak 不加路径例外；若仍有名称碰撞则保留并说明。
+  - **本地全条件**：所有非 `.git` 条目及 Git 元数据（含 FETCH_HEAD、ORIG_HEAD、refs 与 reflog）最新 mtime 满 7 天（168h），所有位置统一；
     status 含全部 untracked 为空、无 stash、无进行中的 Git 操作/锁、无已填充子模块，
     ignored 中无凭据（无主 checkout 同内容豁免，也不豁免依赖目录内凭据）。包含嵌套仓库的父树保留；
+    任意位于另一已发现 Git 树内的子树也保留（含 ignored 目录、独立 clone 和 linked），原因写“嵌套于 <父仓库>，由该项目自行保留”；父 Git 标记状态不明时同样保留，不替项目清理取证快照。
     主仓库还有登记 linked worktree 时保留；使用 alternates 或被其他发现仓库（含 bare）的 remote URL /
     pushurl（含 Git insteadOf/pushInsteadOf 展开后的全部有效 URL）/ alternates 引用时保留。主 checkout 仅在这些保护下判定，不再按路径或身份一律排除。
   - **恢复证明**：每个本地 branch、HEAD 和 tag 都要在实时远端上证明；tag 验 exact object SHA，
@@ -101,7 +122,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   - **删除与复核**：全批远端查询/归档结束后重扫两盘及全部引用，再在每个 sink 前复核本地状态与占用；
     unknown 或预算不足即保留。linked 必须从主 checkout 调 `git worktree remove -- <path>`，不加 `--force`；
     文件系统根和挂载点只列出保留；clone 仅 fd-based 删除该目录，逐级打开 ancestor 时 O_NOFOLLOW，不跟随任何软链。预演与执行共用判定。
-    不删除 BB 环境；本轮授权只允许部署预演。每对象 JSON/JSONL 包含路径、类型、实占（失败为 null）、
+    不删除 BB 环境。每对象 JSON/JSONL 包含路径、类型、实占（失败为 null）、
     决定/原因、refs/SHA、归档证据和耗时；嵌套占用不相加冒充可回收量。完整发现或引用扫描失败整轮保留。
 - **2026-11-14 owner 批准：pnpm store 每周日 05:30 owner prune**：`pnpm_store_prune.py` 在
   `/data/code/mole-linux` 用 `pnpm store path` 得到当前版本路径，再取共同 store 根（当前 `/data/.pnpm-store`）。
@@ -120,7 +141,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
 - **数据类不自动删**：会话（codex、bb-data）、凭据、在用数据库、命名卷、备份与迁移副本只列给 owner 决定。
 
 执行入口：`$devcloud-storage-upkeep` 的 `scripts/git_tree_sweep.py`、`scripts/docker_leftovers.py`、
-`scripts/go_cache_trim.py`、`scripts/pnpm_store_prune.py`，默认预演；全盘 Git 执行尚待 owner 审核。全盘回归 `tests/test_git_tree_sweep.py`；旧 helper 回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
+`scripts/go_cache_trim.py`、`scripts/pnpm_store_prune.py`，默认预演；全盘 Git 按本轮子集条件核验后开启执行。全盘回归 `tests/test_git_tree_sweep.py`；旧 helper 回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
 凭据文件保留、进程占用保留、近期活动保留、凭据类 ignored 文件与主 checkout 不同内容则整树保留、
 node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非退出错误整轮保留、docker ps/inspect
 失败整轮保留、删除后同步处理精确匹配 BB 环境与拒绝/故障 fail-open、busy 锁跳过、retained_volumes 排除；go_cache_trim：`test_old_go_cache_entries_are_deleted`、
@@ -357,7 +378,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   仍经 Mole dry-run 和最终 guard。最多 8 项并发；取消信号停止排队、终止 Mole 子进程组、恢复在途隔离项再退出，
   遗留隔离项阻止下一轮。完整计划扫描上限 240 秒，单普通树 5 秒、结构缓存树 60 秒；不设数量上限，余项递延。
   读取 /proc 时进程退出窗口错误只在有界复核证实消失、僵尸或 PID 重用时视为退出，证据仍不全则拒绝。
-- Git 工作树统一由每日 06:30 的 `git_tree_sweep.py` 预演，旧 06:45 任务停用；
+- Git 工作树统一由每日 06:30 的 `git_tree_sweep.py`（模式按本轮授权条件），旧 06:45 任务停用；
   不再补删 BB 环境，pnpm 每周日 05:30 逐版本 owner prune。
   `/data/bb-data/thread-storage/.shared-cache/` 是共享缓存，不在本段普通临时项或线程遗留范围。
 - 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted 事件与每根各一条
