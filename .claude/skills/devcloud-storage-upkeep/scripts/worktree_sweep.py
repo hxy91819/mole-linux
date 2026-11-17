@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Archive and remove idle linked Git worktrees (owner policy 2026-11-04).
+"""Legacy helpers and regression API; CLI delegates to git_tree_sweep.py.
+
+The historical main() below is retained for isolated regression fixtures.
+Production CLI policy is the full-disk owner policy 2026-11-17.
 
 A linked worktree is removed when nothing is using it and it has been idle
 for --idle-hours. If its HEAD is not provably on a live remote branch, or it
@@ -912,4 +915,7 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    entry = Path(__file__).with_name('git_tree_sweep.py')
+    namespace = {'__name__': 'git_tree_sweep_cli', '__file__': str(entry)}
+    exec(compile(entry.read_bytes(), str(entry), 'exec'), namespace)
+    sys.exit(namespace['main']())

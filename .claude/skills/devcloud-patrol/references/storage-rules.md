@@ -14,7 +14,7 @@ Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查�
   自动处理须同时满足：非近期在用（至少 72 小时，完整检查待清对象与相关活动）以及恢复性已验证
   （可重新下载、重新生成，或按已有 worktree 规则完成远端归档）。查询不明、扫描不完整或恢复校验失败时保留。
   授权长期有效，在范围内自主 preview、执行、逐对象记录，不重复请求批准。
-- 仍保护活跃/排队任务、共享引用、会话、凭据、唯一数据、主 checkout、数据库及明确 retained/备份。
+- 仍保护活跃/排队任务、共享引用、会话、凭据、唯一数据、受保护主 checkout、数据库及明确 retained/备份。
   活跃的 Go/npm/pnpm 混合缓存不能因为部分对象旧就整库清空；对象的恢复性不等于整个父目录都可删。
   服务停启和未知数据处置不从本授权推导。
 - **owner 命令也是删除入口**：`go clean`、`npm cache clean`、`pnpm store prune`、
@@ -70,35 +70,39 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
 - **匿名测试 DB 卷满 1 小时即清**：无任何容器引用、名称为 64 位十六进制且只带
   `com.docker.volume.anonymous` 标签、内容是 MySQL/PostgreSQL 数据目录或为空，创建满 1 小时即
   `docker volume rm <id>`。容器已删的匿名卷没有任何程序还能挂回去；命名卷、compose 卷与 retained 登记照旧。
-- **Worktree 没人用且闲置满 24 小时即处理**：没有进程（cwd/exe/fd/maps）、容器挂载或忙碌/24 小时内更新的
-  BB 线程引用。HEAD 在实时远端分支上且干净的直接 `git worktree remove`；否则把 HEAD 或 WIP 快照推到
-  `archive/worktree/*`，`ls-remote` 核验后删除。推送目的地：同主机下你的命名空间（hxy91819、hxy91819，
-  以及 owner 2026-11-04 确认「算」自己项目的 opencraft-app 组织）优先，内部仓库只推 git.example.invalid 上的 origin；
-  公共上游且无个人 fork 的保留待定。opencraft：owner 2026-11-04 原话「只要你不重写历史都是可以的」——
-  归档可以推到公开仓库 `opencraft-app/opencraft`，开源前的旧历史也可以；绝不 force push，也不改写远端
-  已有分支。ignored 文件仍随目录删除、不推送，但新增三条保留条件：① 有被忽略的凭据类文件（匹配
-  `SECRET_NAME`；跳过 `node_modules`、含 `pyvenv.cfg` 的目录和符号链接）而主 checkout 同一路径没有
-  内容相同的文件 → 整个 worktree 保留；② 归档目标远端在 `ls-remote` 时就失败 → 保留；③ 读取 `/proc`
-  出现进程退出以外的错误，或 `docker ps` / `docker inspect` 失败 → 本轮全部保留。仍保留：主 checkout、
-  locked、进行中的 git 操作、已填充子模块，以及 WIP 含凭据文件名或 >20 MiB 文件的 worktree。
-- **2026-11-14 owner 批准：worktree 删除及每轮补扫 BB 环境**：删除成功后仍记录 SHA、归档 ref 和恢复命令
-  `git fetch <url> <ref> && git worktree add <path> <sha>`，删除 hook 只匹配 `path` 精确全等的未销毁环境。
-  每轮 `--execute` 还枚举全部 `status != destroyed`、路径已不存在的环境，调用
-  `bb environment delete <id> --json`。每轮每 ID 仅尝试一次；有未归档线程等被拒时保留、记录原因、不重试、
-  不令脚本失败。线程归档后由后续轮次自然清理。dangling symlink 不算路径不存在；权限未知则不删该环境。
-  BB 查询或删除故障继续 fail-open 记账，不阻断已授权的 worktree 删除。经核查插件，路径不存在时只清环境记录及
-  attempt 标记，绝不删除 Git 分支/ref。预演不调用 delete。
-- **2026-11-14 owner 批准：tmp 独立 clone 每天 06:45 清理**：`tmp_clone_sweep.py` 只处理
-  `/data/system-tmp`（即 `/tmp`）及 `/var/tmp` 的顶层独立 clone（`.git` 为真实目录，非 linked worktree）。
-  必须同时满足：无 `/proc` cwd/exe/fd/maps 引用、无容器挂载、无未销毁 BB 环境路径落在其中，探针未知即保留；
-  除 `.git` 外每个条目最新 mtime 已满 24h；status 含全部 untracked 为空、无 stash、worktree list 仅自身、无嵌套 `.git`；
-  `/data/code` 及两 tmp 根的其他仓库（含 bare）无 remote URL 或 objects/info/alternates 引用；ignored 无凭据类文件。
-  每个本地分支、HEAD、tag 均经实时 `git ls-remote` 证明；在待删 clone 内的本地 bare remote 不算恢复副本。
-  缺失对象复用 worktree 归档器推同主机个人命名空间或内部 origin 的 `archive/tmp-clone/*`，精确核验 object SHA；
-  tag 用同前缀 tag ref，fetch/push URL 分离时以核验过的 push URL 为准。绝不 force push，mono2 不推 GitHub；
-  无可推位置、归档失败或只能压缩内容而不能保存原历史时保留。本批网络查询与归档结束后完整刷新引用，
-  随后重核占用及本地全条件，中间不再发网络请求。只删物理根内的该目录，fd-based 删除不跟随符号链接；
-  每删一个立即写 JSONL（URL、HEAD、归档 ref、bytes），保留项也记录原因。默认预演、`--execute` 才删。
+- **2026-11-17 owner 要求：全盘 Git 工作树统一预演**：唯一运行入口 `git_tree_sweep.py`，
+  每天 06:30（Asia/Shanghai）经 BB 启动有时限的 systemd oneshot（30分钟预算/33分钟硬时限，结束 collect）；先只部署预演，候选清单经 owner 审核后才可加 `--execute`。
+  此规则取代上版「只扫 /data/code 三层 linked worktree」「只扫 tmp 顶层 clone」及删除后清 BB 环境政策。
+  旧 `worktree_sweep.py` / `tmp_clone_sweep.py` 保留 helper/历史回归 API；两个 CLI 名均转发统一入口，不再运行旧范围或旧删除政策。
+  - **发现**：物理遍历 `/` 和 `/data`，每根 `-xdev`，按 device/inode 去重，不跟随软链，
+    跳过 `/proc /sys /dev /run`；没有深度、隐藏目录、项目路径或 BB thread-storage 排除。
+    `.git` 为目录是独立 clone，为文件是 linked/gitfile；发现仓库后仍扫描其后代，包含 ignored 下的仓库。
+    bare 仓库只作为引用来源。损坏 gitfile、gitdir 丢失、未登记 gitfile（含 submodule）均列出保留。
+  - **仅排除 owner 存储**：Docker 实时 data root、containerd、Nix/Guix store、npm `_cacache`、
+    pnpm store、pip/uv 缓存、Cargo registry/git、Go module/VCS 与 Go/lint build 缓存；解析迁移软链的真实根。
+    依赖容器 `node_modules/vendor/.venv/venv/__pypackages__` 仅在 package.json、Go/Composer/Bundler/Cargo 元数据、pyvenv.cfg 或 PEP 582 布局等 owner 证据存在时裁剪，pnpm 按版本/files 布局确认；仅同名目录仍遍历。
+    理由：其中的 Git 结构是安装器/缓存的实现状态，生命周期归 owner 命令；整库删除会破坏依赖和工具复用。
+    `.pyenv`、`.nvm` 等工具安装本身不按名称排除，依赖实际使用引用保护。排除路径及理由写入报告。
+  - **占用保护**：BB 项目全部 source 路径、任何未 destroyed 环境路径、原有忙碌/近期 BB 线程、
+    进程 cwd/exe/fd/maps 与 PATH、`*_HOME/*_ROOT/*_DIR`，容器（含 stopped）挂载、挂载点、外部软链，
+    shell 初始化文件、systemd 系统/用户单元、crontab、BB 自动化保存的命令引用，均保护包含该引用的工作树。
+    引用父容器本身不等于引用其中每个子 clone；不借引用保护恢复路径白名单。未成功物化、无 path/instance 的
+    error 环境不表示磁盘上有环境；有 provider input path 时仍保护该路径。其他 BB 路径未知整轮保留。
+    shell 不执行；保留引号内空格，展开 HOME、普通变量赋值、默认值和已有 glob 匹配，动态路径赋值传播 unknown；无法解析时保留。
+  - **本地全条件**：所有非 `.git` 条目及 Git 元数据（含 FETCH_HEAD、ORIG_HEAD、refs 与 reflog）最新 mtime 满 24h；
+    status 含全部 untracked 为空、无 stash、无进行中的 Git 操作/锁、无已填充子模块，
+    ignored 中无凭据（无主 checkout 同内容豁免，也不豁免依赖目录内凭据）。包含嵌套仓库的父树保留；
+    主仓库还有登记 linked worktree 时保留；使用 alternates 或被其他发现仓库（含 bare）的 remote URL /
+    pushurl（含 Git insteadOf/pushInsteadOf 展开后的全部有效 URL）/ alternates 引用时保留。主 checkout 仅在这些保护下判定，不再按路径或身份一律排除。
+  - **恢复证明**：每个本地 branch、HEAD 和 tag 都要在实时远端上证明；tag 验 exact object SHA，
+    branch/HEAD 可验位于实时远端分支历史。远端查询失败保留；指向待删树自身/内部的 local/file remote 不作独立恢复证明；外部本地 remote 的包含仓库由完整 URL 引用索引保护，bare 库只作引用源不进入删除。缺失 ref 只能向同主机个人命名空间或内部 origin 的 `archive/git-tree/*`
+    推原始对象，逐 ref `ls-remote` 核 exact SHA；tag 用 tag ref，不能用压缩快照替代原历史，不 force push，
+    mono2 不推 GitHub，无目的地/归档失败均保留。预演只查询，不推送。
+  - **删除与复核**：全批远端查询/归档结束后重扫两盘及全部引用，再在每个 sink 前复核本地状态与占用；
+    unknown 或预算不足即保留。linked 必须从主 checkout 调 `git worktree remove -- <path>`，不加 `--force`；
+    文件系统根和挂载点只列出保留；clone 仅 fd-based 删除该目录，逐级打开 ancestor 时 O_NOFOLLOW，不跟随任何软链。预演与执行共用判定。
+    不删除 BB 环境；本轮授权只允许部署预演。每对象 JSON/JSONL 包含路径、类型、实占（失败为 null）、
+    决定/原因、refs/SHA、归档证据和耗时；嵌套占用不相加冒充可回收量。完整发现或引用扫描失败整轮保留。
 - **2026-11-14 owner 批准：pnpm store 每周日 05:30 owner prune**：`pnpm_store_prune.py` 在
   `/data/code/mole-linux` 用 `pnpm store path` 得到当前版本路径，再取共同 store 根（当前 `/data/.pnpm-store`）。
   逐个存在的版本目录执行对应 pnpm 的 `--store-dir <共同根> store prune`；禁止把 `vN` 目录再当 store 根。
@@ -115,8 +119,8 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   只能由 `go_cache_trim.py` 按上述 24h 规则修剪；不得当作线程遗留删除或误报为待清线程目录。
 - **数据类不自动删**：会话（codex、bb-data）、凭据、在用数据库、命名卷、备份与迁移副本只列给 owner 决定。
 
-执行入口：`$devcloud-storage-upkeep` 的 `scripts/worktree_sweep.py`、`scripts/docker_leftovers.py`、
-`scripts/go_cache_trim.py`、`scripts/tmp_clone_sweep.py`、`scripts/pnpm_store_prune.py`，默认预演、`--execute` 执行。回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
+执行入口：`$devcloud-storage-upkeep` 的 `scripts/git_tree_sweep.py`、`scripts/docker_leftovers.py`、
+`scripts/go_cache_trim.py`、`scripts/pnpm_store_prune.py`，默认预演；全盘 Git 执行尚待 owner 审核。全盘回归 `tests/test_git_tree_sweep.py`；旧 helper 回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
 凭据文件保留、进程占用保留、近期活动保留、凭据类 ignored 文件与主 checkout 不同内容则整树保留、
 node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非退出错误整轮保留、docker ps/inspect
 失败整轮保留、删除后同步处理精确匹配 BB 环境与拒绝/故障 fail-open、busy 锁跳过、retained_volumes 排除；go_cache_trim：`test_old_go_cache_entries_are_deleted`、
@@ -179,8 +183,8 @@ thread-storage由一次物理du遍历拆成共享go-build、共享golangci-lint�
 - **历史 worktree 执行器**：旧 `auto_o3pwesztbpg` 及 fork-maintenance 09:00 闲置工作区
   清理已于 2026-11-05 退役。72 小时/30 天门槛、分支治理、reflog 事件时间、总锁竞争、
   引用树指纹、工蜂身份等实现细节只用于解读旧报告，已移到设计文档「决策记录」与
-  「经验教训」；现行 worktree 规则见上文 owner 2026-11-04 策略和 `worktree_sweep.py`。
-  主 checkout、活跃/排队会话、进程/共享依赖、未知 ignored 数据继续保护，这条不变。
+  「经验教训」；现行 worktree 规则见上文 owner 2026-11-17 策略和 `git_tree_sweep.py`。
+  当前保护以 2026-11-17 规则为准；旧的全量主 checkout 豁免与删除 BB 环境已被替代。
 
 ## 数据库卷
 
@@ -353,8 +357,8 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   仍经 Mole dry-run 和最终 guard。最多 8 项并发；取消信号停止排队、终止 Mole 子进程组、恢复在途隔离项再退出，
   遗留隔离项阻止下一轮。完整计划扫描上限 240 秒，单普通树 5 秒、结构缓存树 60 秒；不设数量上限，余项递延。
   读取 /proc 时进程退出窗口错误只在有界复核证实消失、僵尸或 PID 重用时视为退出，证据仍不全则拒绝。
-- tmp 独立 clone 由每日 06:45 的 `tmp_clone_sweep.py` 处理，完整恢复条件见 owner 策略节；
-  worktree 清理每轮另补扫缺失 BB 环境，pnpm 每周日 05:30 逐版本 owner prune，均沿用该节规则。
+- Git 工作树统一由每日 06:30 的 `git_tree_sweep.py` 预演，旧 06:45 任务停用；
+  不再补删 BB 环境，pnpm 每周日 05:30 逐版本 owner prune。
   `/data/bb-data/thread-storage/.shared-cache/` 是共享缓存，不在本段普通临时项或线程遗留范围。
 - 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted 事件与每根各一条
   summary 分开，`path` 区分两个根；错误日志为同名 `.stderr.log`。summary 记录两盘前后容量和
@@ -374,7 +378,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 
 旧 `patrol_worktrees.py --execute` 和 `cleanup_worktrees.py` 的流程已退役；7 天/分支政策、
 工蜂 MR 核验、执行器 token、`--sweep-only` 等细节只用于解读旧报告，已移到设计文档
-「决策记录」和「经验教训」。现行入口是 `worktree_sweep.py`，规则见上文 owner 2026-11-04
+「决策记录」和「经验教训」。现行入口是 `git_tree_sweep.py`，规则见上文 owner 2026-11-17
 策略；旧报告不构成删除授权。
 
 - 含 submodule 的工作树不进入自动执行：git 会拒绝非 `--force` 的 `worktree remove`。

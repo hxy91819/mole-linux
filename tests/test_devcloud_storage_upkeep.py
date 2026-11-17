@@ -1841,7 +1841,9 @@ def test_tmp_clone_final_local_guards_run_after_reference_io(clone_case, monkeyp
 @pytest.mark.parametrize('name', ['tmp_clone_sweep.py', 'pnpm_store_prune.py'])
 def test_storage_snapshot_help_does_not_write_bytecode(tmp_path, name):
     source = Path(__file__).resolve().parents[1] / '.claude/skills/devcloud-storage-upkeep/scripts'
-    for f in (name, 'worktree_sweep.py'): shutil.copy2(source / f, tmp_path / f)
+    # Both retired CLI names now delegate to the one full-disk entrypoint.
+    for f in dict.fromkeys((name, 'worktree_sweep.py', 'tmp_clone_sweep.py', 'git_tree_sweep.py')):
+        shutil.copy2(source / f, tmp_path / f)
     before = sorted(p.name for p in tmp_path.iterdir())
     subprocess.run(['python3', '-I', str(tmp_path / name), '--help'], check=True, capture_output=True, text=True)
     assert sorted(p.name for p in tmp_path.iterdir()) == before

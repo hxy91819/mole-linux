@@ -5,11 +5,11 @@
 设计原因和踩坑记录见 [DEVCLOUD_STORAGE_DESIGN](DEVCLOUD_STORAGE_DESIGN.md)；
 逐目标能不能清的规则见
 [storage-rules](../.claude/skills/devcloud-patrol/references/storage-rules.md)。
-任务现状以 `bb automation list` / `bb automation show` 为准，本文是撰写时快照（2026-11-14）。
+任务现状以 `bb automation list` / `bb automation show` 为准，本文是撰写时快照（Git 部分更新于 2026-11-17）。
 
 ## 1. 现行任务
 
-水位与增长两个任务使用独立快照 `56806e44ddcbe176`，不改变下列五个清理任务的快照：
+水位与增长两个任务使用独立快照 `56806e44ddcbe176`，不改变其他清理任务的快照（Git 使用下文独立快照）：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -17,7 +17,7 @@
 | 增长计量 | `auto_u4kos3to-di` | `0 7 * * *` | `/usr/bin/python3 -I <snap>/storage_growth_measure.py` | 900 秒 |
 
 均用 bash 启动脚本 exec 上述命令，工作目录 `/var/tmp`。水位只调用既有任务：/data 对应
-Docker、Go、worktree、tmp clone、pnpm、clean-tmp `/data/system-tmp`，/ 对应 clean-tmp `/var/tmp`。
+Docker、Go、全盘 Git 预演、pnpm 与 clean-tmp `/data/system-tmp`，/ 对应 clean-tmp `/var/tmp`；旧 tmp clone ID 已停用且改为空操作，即使旧水位快照手动派发也不会执行旧删除。
 首次越线、级别升高或两小时冷却结束才触发并打印一行简报；正常/冷却完全静默（skipped）。
 运行查询 unknown 跳过并在简报注明。`--dry-run` 只打印计划，不查 BB、不写状态、不启动清理。
 状态在系统盘 `/var/lib/devcloud-storage-upkeep/watermark.json`，清理派发后、通知之前保存，
@@ -70,7 +70,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 ```
 
 
-五个脚本任务都属于 project `proj_8d3wrcajxn`，时区 `Asia/Shanghai`。
+维护脚本任务都属于 project `proj_8d3wrcajxn`，时区 `Asia/Shanghai`。
 它们跑的是 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 下的不可变副本，
 不是仓库工作区。`<sha16>` 是 `manifest.json` 规范化内容 sha256 的前 16 位；
 2026-11-14 当前快照是 `0a809fb13caabb6c`，发布新快照后替换。
@@ -79,8 +79,8 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 |---|---|---|---|---|---|
 | Docker 残留 | `auto_1ih1erjpbqo` | 每小时第 7 分 | `/var/tmp` | `${PY} -I <snap>/docker_leftovers.py --execute --quiet` | `skipped`，exit 0 |
 | Go 缓存修剪 | `auto_vad6yvkpdeq` | 每小时第 37 分 | `/var/tmp` | `${PY} -I <snap>/go_cache_trim.py --execute --quiet` | `skipped`，exit 0 |
-| worktree 清理 | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `${PY} -I <snap>/worktree_sweep.py --execute --quiet --budget-minutes 12` | `skipped`，exit 0 |
-| /tmp 独立 clone | `auto_3jiqtmzreq8` | 每天 06:45 | `/var/tmp` | `${PY} -I <snap>/tmp_clone_sweep.py --execute --quiet --budget-minutes 12` | `skipped`，exit 0 |
+| 全盘 Git 工作树预演 | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `bash <git-snap>/git_tree_sweep_run.sh` | 输出清单位置、候选/保留汇总；无删除 |
+| 旧 tmp 独立 clone | `auto_3jiqtmzreq8` | 已停用 | `/var/tmp` | 保留历史记录；新统一入口覆盖其范围 | enabled=false |
 | pnpm store prune | `auto_yfr5p14dvnc` | 周日 05:30 | `/data/code/mole-linux` | `${PY} -I <snap>/pnpm_store_prune.py --execute --quiet` | `skipped`，exit 0 |
 
 脚本任务共同的解释器与 PATH：
@@ -100,14 +100,14 @@ export PATH=/root/.nvm/versions/node/v24.22.1/bin:/root/.nvm/versions/node/v24.1
 在 `/var/tmp` 或 `/data` 下解析会得到不同的 store。拿到共同根 `/data/.pnpm-store` 后，
 逐版本工具从中立目录运行并显式传 `--store-dir /data/.pnpm-store`，不能把 `vN` 目录当根。
 
-所有脚本任务超时：Docker/Go 600 秒，worktree/tmp/pnpm 900 秒。`--quiet` 只表示“没有实际
+脚本任务超时：Docker/Go 600 秒，pnpm 900 秒。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 内部预算1800秒、systemd RuntimeMaxSec=1980秒。实测12分钟内部预算不足；完整一轮863秒距BB900秒硬上限仅37秒裕量，不能缩小发现范围来迁就BB上限。最终实测与裕量见交付快照报告。`--quiet` 只表示“没有实际
 清理且命令没有失败时保持安静”，BB 把它记为 `skipped`；`skipped` 不是失败。
 
 每日检查是 agent 任务，不是脚本任务：
 
 | 任务 | ID | 时间 | 执行 | 行为 |
 |---|---|---|---|---|
-| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对七个脚本任务的 schedule 运行、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源；全部符合只回一句，不符合才发协调线程 |
+| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对六个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源；全部符合只回一句，不符合才发协调线程 |
 
 prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)。改检查项时
 两边同步：改文件 → 用文件里的提取命令更新 `bb automation update ... --prompt` → `show` 回读。
@@ -120,18 +120,42 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 ## 2. 不可变快照与发布
 
-仓库里的脚本不会自动进入定时任务。发布一次存储脚本变更：
+仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`，仅含
+`git_tree_sweep.py`、`git_tree_sweep_run.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 四个文件和 `manifest.json`；
+后两个提供 helper/历史回归 API，CLI 均转发统一入口。当前 Git 专用快照为 `852562f78c6581f7`（2026-11-17；四个文件与 manifest，文件0444/目录0555），其他任务不跟随更换快照。launcher 用固定 transient unit `devcloud-git-tree-sweep.service` 启动只读 worker；active/activating/deactivating 时跳过，状态未知拒绝启动；`--collect` 在结束后回收单元，不常驻监控。其他 Docker/Go/pnpm/水位/计量任务继续使用各自现有快照。
 
-1. 把 `scripts/docker_leftovers.py`、`go_cache_trim.py`、`worktree_sweep.py`、
-   `tmp_clone_sweep.py`、`pnpm_store_prune.py` 复制到新目录
-   `/data/tools/devcloud-storage-upkeep/releases/<sha16>/`。
-2. 同目录写 `manifest.json`：每个文件的 sha256 和 mode；目录名 = 这份 manifest 规范化内容
-   sha256 的前 16 位。目录 `0555`，文件 `0444`。
-3. 对五个入口各跑一次 `--help`，确认目录仍只有五个脚本 + manifest，没有 `__pycache__`，
-   哈希和模式一致。
-4. 用真实 `--help` / 预演验证后，把五个 BB 任务命令里的 `<sha16>` 换成新目录；
-   回读 `bb automation show` 核对命令、`Asia/Shanghai`、cron、enabled。
-5. 保留旧快照用于回滚；不要覆盖旧目录。
+1. 每个脚本记录 sha256 与 mode=0444；`manifest.json` 用稳定 JSON 编码与末尾换行，
+   `<sha16>` = **manifest 实际字节** sha256 前16位。新目录 `/data/tools/devcloud-storage-upkeep/releases/<sha16>`，
+   文件0444、目录0555，不覆盖旧快照。
+2. `python3 -I <git-snap>/git_tree_sweep.py --help` 后复算 manifest、脚本哈希与模式，确认仅五个文件、无 pycache。
+3. 先在宿主机运行无 `--execute` 的首轮预演，保存完整 JSON/JSONL、按路径候选表及保留原因。
+   沙箱 `/proc` 和人工 `.git` 挂载不代表宿主机；用 BB script runner 在宿主机运行。
+4. 以短文件名 `git-tree.sh`，`bb automation update auto_hukidoavox0 --project proj_8d3wrcajxn
+   --script-file <file> --timeout 2m`。更新必须检查返回码；失败时绝不继续 `run` 旧命令。
+   用 show 读回存储脚本内容，确认不含 `--execute`、cron=`30 6 * * *`、Asia/Shanghai、timeout=120000。
+5. 旧 `auto_3jiqtmzreq8` 替换为空操作脚本并 pause，确认 enabled=false；因为 paused 仍可能被旧水位逻辑手动派发，不能只 pause；
+   每日检查 prompt 同步此状态、首轮清单/完整性和预演模式。保留旧任务历史，不让两个入口并行。
+6. owner 审核通过之前保持预演。执行授权通过后才改命令，不能把每日检查或水位触发当作授权。
+
+只读复现（命令不带路径筛选参数）：
+
+```bash
+python3 -I <git-snap>/git_tree_sweep.py --budget-minutes 30 --json
+# 定时等价：bash <git-snap>/git_tree_sweep_run.sh；异步 worker 受 systemd 33 分钟硬时限约束
+python3 -m pytest tests/test_git_tree_sweep.py tests/test_devcloud_storage_upkeep.py -q
+bb automation show auto_hukidoavox0 --project proj_8d3wrcajxn --json
+bb automation show auto_3jiqtmzreq8 --project proj_8d3wrcajxn --json
+bb automation runs auto_hukidoavox0 --project proj_8d3wrcajxn --limit 3 --json
+```
+
+JSON 报告在 `~/.local/state/devcloud-storage-upkeep/git-tree-sweep-<UTC>.json`；
+JSONL 同前缀，含阶段时点与每对象证据。检查 `complete`、`error`、`unresolved`、`discovery.errors`、
+`summary.unmeasured`、`timings` 和 `items`。unknown/超时不当0；嵌套目录的大小不能相加当可回收量。
+`bb automation` 的 succeeded 仅表示 worker 启动成功；实际成功以最新 JSON 报告和 JSONL 完整阶段为准。每日07:30读取报告，worker 应在07:03之前结束。`systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result` 可查在途状态；collect 后 unit not-found 属正常，仍必须有当日完整报告。
+
+linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` 后
+`git worktree add <path> <sha>`；独立 clone 用记录 URL clone 后恢复每个 branch/tag。
+恢复原始 SHA 的证据必须在删除前落账，不能仅记录成功的 installer/命令输出。
 
 水位/计量快照包含 `storage_watermark_brake.py`、`storage_growth_measure.py`、`clean_tmp_runner.py`
 及 `storage_growth_fingerprints.md` 四个文件与 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
@@ -249,14 +273,14 @@ go env GOCACHE
    `journald`；迁移已有 Docker 数据要在停写窗口做，不要热搬。
 4. **工具链**：Python 3.12.12、Node 24.22.1（pnpm 12）、Go；路径以本机实际安装为准。
 5. **共享缓存**：按第 6 节建目录和软链；旧缓存先复制、验证、再删。
-6. **快照**：按第 2 节部署五个 storage-upkeep 脚本和 clean-tmp 快照，复算 manifest、
+6. **快照**：按第 2 节分别部署全盘 Git、其他 storage-upkeep 与 clean-tmp 快照，复算 manifest、
    设 `0444/0555`、跑 `--help` 和预演。
 7. **crontab**：按第 3 节写 clean-tmp 行；`crontab -l` 回读。
 8. **tmpfiles**：按第 4 节写 `/etc/tmpfiles.d/tmp.conf`；`systemd-tmpfiles --cat-config` 回读。
-9. **BB 任务**：按第 1 节创建/更新五个脚本任务和每日 DSH 检查；时区 `Asia/Shanghai`；
+9. **BB 任务**：按第 1 节创建/更新现行启用脚本任务和每日 DSH 检查，并停用旧 tmp clone 任务；时区 `Asia/Shanghai`；
    回读 ID、cron、工作目录、命令、enabled。每日检查 prompt 从
    [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md) 复制。
-10. **验证**：先手动跑五个脚本的默认预演，再跑一次 `--execute` 并确认 exit 0 / skipped；
+10. **验证**：先手动跑各入口的默认预演；Git 保持无 `--execute` 等 owner 审核，其他已授权任务验证 exit 0 / skipped；
     跑一次 DSH 检查（`manual` 不算周期）；确认两盘可用 ≥150 GiB、共享缓存可写、
     `/tmp` summary 两个根都有、tmpfiles 的 `/tmp` 年龄为 `-`。
 

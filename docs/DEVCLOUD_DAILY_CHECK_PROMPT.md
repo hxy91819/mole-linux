@@ -3,10 +3,10 @@
 取自 `bb automation show auto_5gacevqssoe --project proj_8d3wrcajxn --json`（2026-11-14）。
 改检查项、阈值或协调线程时，必须同时更新这里和 BB 任务，并回读核对。
 提取正文（从一级标题开始）：
-  sed -n '/^# 每日存储检查/,$p' docs/DEVCLOUD_DAILY_CHECK_PROMPT.md
+  sed -n '/^# 每日存储检查（只读）$/,$p' docs/DEVCLOUD_DAILY_CHECK_PROMPT.md
 更新 BB 任务：
   bb automation update auto_5gacevqssoe --project proj_8d3wrcajxn \
-    --prompt "$(sed -n '/^# 每日存储检查/,$p' docs/DEVCLOUD_DAILY_CHECK_PROMPT.md)"
+    --prompt "$(sed -n '/^# 每日存储检查（只读）$/,$p' docs/DEVCLOUD_DAILY_CHECK_PROMPT.md)"
 -->
 # 每日存储检查（只读）
 
@@ -14,11 +14,11 @@
 
 先用 `date '+%F %T %z'` 记下现在的时间 NOW。下面每一项都写出实测值和结论。
 
-1. 七个脚本定时任务（project proj_8d3wrcajxn）。用 `bb automation show <id> --project proj_8d3wrcajxn --json` 看 `enabled`、`lastRunAt`（毫秒时间戳）、`lastRunStatus`、`lastError`；用 `bb automation runs <id> --project proj_8d3wrcajxn --limit 30 --json` 看运行记录。只看定时触发的运行（`trigger` 为 `schedule`）；`manual` 是人工测试，不算。要求：`enabled` 为 true；最近 24 小时（pnpm 最近 8 天）的定时运行，status 只能是 succeeded、skipped 或 running；最近一次定时运行距 NOW 不超过下面的时限。
+1. 六个启用脚本定时任务与一个已停用旧任务（project proj_8d3wrcajxn）。用 `bb automation show <id> --project proj_8d3wrcajxn --json` 看 `enabled`、`lastRunAt`（毫秒时间戳）、`lastRunStatus`、`lastError`；用 `bb automation runs <id> --project proj_8d3wrcajxn --limit 30 --json` 看运行记录。只看定时触发的运行（`trigger` 为 `schedule`）；`manual` 是人工测试，不算。要求：启用任务 `enabled` 为 true（旧 tmp clone 例外，必须为 false）；最近 24 小时（pnpm 最近 8 天）的定时运行，status 只能是 succeeded、skipped 或 running；最近一次定时运行距 NOW 不超过下面的时限。
    - auto_1ih1erjpbqo（Docker 残留，每小时 07 分）：70 分钟。
    - auto_vad6yvkpdeq（Go 缓存修剪，每小时 37 分）：70 分钟。
-   - auto_hukidoavox0（worktree 清理，每天 06:30）：25 小时。另外用 `bb automation runs auto_hukidoavox0 --project proj_8d3wrcajxn --output <最近一次定时运行的 runId>` 取输出，出现 `process scan incomplete` 或 `failed` 也算不符合。
-   - auto_3jiqtmzreq8（/tmp 独立 clone 清理，每天 06:45）：25 小时。
+   - auto_hukidoavox0（全盘 Git 工作树预演，每天 06:30）：25 小时。读回保存的 script，必须调用不可变快照的 `git_tree_sweep_run.sh`，其 worker 调 `git_tree_sweep.py` 且不带 `--execute`；launcher 超时120秒、worker预算1800秒/systemd硬时限1980秒。BB succeeded仅表示启动成功。读 `/root/.local/state/devcloud-storage-upkeep/` 最近当日完整 `git-tree-sweep-*.json`，并核 `systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result`：07:30时不得仍运行（collect后not-found正常，但报告必须存在）。报告要求：mode=dry-run、complete=true、error=null、discovery.errors为空；列 clone/linked 数量、候选路径/大小、保留原因汇总、unmeasured和timings。任一扫描/引用 unknown 或预算不足算不符合，不把 unknown 大小当0。首次部署尚无新版 schedule 时明确“等待首次定时运行”，人工预演只作验证证据。
+   - auto_3jiqtmzreq8（旧 tmp clone）：必须 enabled=false，存储脚本必须为空操作且不含旧清理调用，不要求周期运行；不得手动触发或恢复。
    - auto_yfr5p14dvnc（pnpm 各版本 store prune，周日 05:30）：8 天。
    - auto_idedelow-3g（水位刹车，每 15 分钟）：25 分钟。
    - auto_u4kos3to-di（增长计量，每天 07:00）：25 小时。
