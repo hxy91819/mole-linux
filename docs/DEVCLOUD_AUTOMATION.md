@@ -17,7 +17,7 @@
 | 增长计量 | `auto_u4kos3to-di` | `0 7 * * *` | `/usr/bin/python3 -I <snap>/storage_growth_measure.py` | 900 秒 |
 
 均用 bash 启动脚本 exec 上述命令，工作目录 `/var/tmp`。水位只调用既有任务：/data 对应
-Docker、Go、全盘 Git 预演、pnpm 与 clean-tmp `/data/system-tmp`，/ 对应 clean-tmp `/var/tmp`；旧 tmp clone ID 已停用且改为空操作，即使旧水位快照手动派发也不会执行旧删除。
+Docker、Go、全盘 Git 清理、pnpm 与 clean-tmp `/data/system-tmp`，/ 对应 clean-tmp `/var/tmp`；旧 tmp clone ID 已停用且改为空操作，即使旧水位快照手动派发也不会执行旧删除。
 首次越线、级别升高或两小时冷却结束才触发并打印一行简报；正常/冷却完全静默（skipped）。
 运行查询 unknown 跳过并在简报注明。`--dry-run` 只打印计划，不查 BB、不写状态、不启动清理。
 状态在系统盘 `/var/lib/devcloud-storage-upkeep/watermark.json`，清理派发后、通知之前保存，
@@ -79,7 +79,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 |---|---|---|---|---|---|
 | Docker 残留 | `auto_1ih1erjpbqo` | 每小时第 7 分 | `/var/tmp` | `${PY} -I <snap>/docker_leftovers.py --execute --quiet` | `skipped`，exit 0 |
 | Go 缓存修剪 | `auto_vad6yvkpdeq` | 每小时第 37 分 | `/var/tmp` | `${PY} -I <snap>/go_cache_trim.py --execute --quiet` | `skipped`，exit 0 |
-| 全盘 Git 工作树预演 | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `bash <git-snap>/git_tree_sweep_run.sh` | 输出清单位置、候选/保留汇总；无删除 |
+| 全盘 Git 工作树 | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `bash <git-snap>/git_tree_sweep_run.sh --execute` | 输出异步报告位置；实际结果以完整JSON/JSONL为准 |
 | 旧 tmp 独立 clone | `auto_3jiqtmzreq8` | 已停用 | `/var/tmp` | 保留历史记录；新统一入口覆盖其范围 | enabled=false |
 | pnpm store prune | `auto_yfr5p14dvnc` | 周日 05:30 | `/data/code/mole-linux` | `${PY} -I <snap>/pnpm_store_prune.py --execute --quiet` | `skipped`，exit 0 |
 
@@ -122,7 +122,7 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`，仅含
 `git_tree_sweep.py`、`git_tree_sweep_run.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 四个文件和 `manifest.json`；
-后两个提供 helper/历史回归 API，CLI 均转发统一入口。当前 Git 专用快照为 `852562f78c6581f7`（2026-11-17；四个文件与 manifest，文件0444/目录0555），其他任务不跟随更换快照。launcher 用固定 transient unit `devcloud-git-tree-sweep.service` 启动只读 worker；active/activating/deactivating 时跳过，状态未知拒绝启动；`--collect` 在结束后回收单元，不常驻监控。其他 Docker/Go/pnpm/水位/计量任务继续使用各自现有快照。
+后两个提供 helper/历史回归 API，CLI 均转发统一入口。当前 Git 专用快照为 `9656f1207a402a82`（2026-11-17；四个文件与 manifest，文件0444/目录0555），其他任务不跟随更换快照。launcher 用固定 transient unit `devcloud-git-tree-sweep.service` 启动 worker（cwd=/）；active/activating/deactivating 时跳过，状态未知拒绝启动；`--collect` 在结束后回收单元，不常驻监控。其他 Docker/Go/pnpm/水位/计量任务继续使用各自现有快照。
 
 1. 每个脚本记录 sha256 与 mode=0444；`manifest.json` 用稳定 JSON 编码与末尾换行，
    `<sha16>` = **manifest 实际字节** sha256 前16位。新目录 `/data/tools/devcloud-storage-upkeep/releases/<sha16>`，
@@ -132,10 +132,16 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
    沙箱 `/proc` 和人工 `.git` 挂载不代表宿主机；用 BB script runner 在宿主机运行。
 4. 以短文件名 `git-tree.sh`，`bb automation update auto_hukidoavox0 --project proj_8d3wrcajxn
    --script-file <file> --timeout 2m`。更新必须检查返回码；失败时绝不继续 `run` 旧命令。
-   用 show 读回存储脚本内容，确认不含 `--execute`、cron=`30 6 * * *`、Asia/Shanghai、timeout=120000。
+   用 show 读回存储脚本内容，确认当前预演不含 `--execute`、cron=`30 6 * * *`、Asia/Shanghai、timeout=120000。
 5. 旧 `auto_3jiqtmzreq8` 替换为空操作脚本并 pause，确认 enabled=false；因为 paused 仍可能被旧水位逻辑手动派发，不能只 pause；
    每日检查 prompt 同步此状态、首轮清单/完整性和预演模式。保留旧任务历史，不让两个入口并行。
-6. owner 审核通过之前保持预演。执行授权通过后才改命令，不能把每日检查或水位触发当作授权。
+6. 2026-11-17 owner 已给条件授权：新完整预演候选 `(path,type)` 是旧131项的子集，且 tmux两项、实例HOME下codebuddy、dmca/upstream、evidence全部保留，即开启06:30执行并手动执行一次。有新增候选保持预演并回报。
+   名称引用碰撞继续保留；lighthouse-bak 的 api/lightglobal/lightpro 不设路径豁免。
+7. 条件满足后更新保存脚本为 `bash <git-snap>/git_tree_sweep_run.sh --execute`，check成功并读回核对模式后才手动执行。
+   首批使用 `bash <git-snap>/git_tree_sweep_run.sh --execute --reviewed-preview <新预演JSON>`；若本批有新增候选，零归档零删除，恢复定时预演并回报。
+   `--reviewed-preview` 仅约束本批，不给以后的动态清理建立路径白名单。
+8. 每个 sink 前继续重读完整占用，不使用历史库存。预演30分钟/硬33分钟；执行150分钟/硬153分钟，首次实测后校准。
+   BB脚本仍只负责120秒内启动，worker独立运行；记录实际删除/归档、保留/失败、目录原实占以及两盘df净变化。
 
 只读复现（命令不带路径筛选参数）：
 
@@ -148,10 +154,23 @@ bb automation show auto_3jiqtmzreq8 --project proj_8d3wrcajxn --json
 bb automation runs auto_hukidoavox0 --project proj_8d3wrcajxn --limit 3 --json
 ```
 
+旧测试的临时夹具固定写 `/var/tmp`，测试复现需在宿主可写环境运行；沙箱只读挂载的创建失败不算脚本行为回归。
+
 JSON 报告在 `~/.local/state/devcloud-storage-upkeep/git-tree-sweep-<UTC>.json`；
-JSONL 同前缀，含阶段时点与每对象证据。检查 `complete`、`error`、`unresolved`、`discovery.errors`、
+JSONL 同前缀，含阶段时点与每对象证据。schema_version=2 的 `unresolved` 每条含 source、expression、scope、
+绝对 prefixes 或项目归属，以及实际 protected_paths；按前缀或项目限定的 unknown 不阻断其他路径。
+`global_unresolved` 只列无前缀且无归属的表达式，非空才使整轮因引用未知保留。暂停任务同样参与。
+只读复现先查看每条 `unresolved[].protected_paths`，再导出 `items` 中 action 为 remove/archive+remove 的路径、类型、bytes、
+idle_hours、objects、remote_proofs、archive_objects；archive+remove 尚未完成归档，不能报成可直接删除。
+检查 `complete`、`error`、`global_unresolved`、`discovery.errors`、
 `summary.unmeasured`、`timings` 和 `items`。unknown/超时不当0；嵌套目录的大小不能相加当可回收量。
-`bb automation` 的 succeeded 仅表示 worker 启动成功；实际成功以最新 JSON 报告和 JSONL 完整阶段为准。每日07:30读取报告，worker 应在07:03之前结束。`systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result` 可查在途状态；collect 后 unit not-found 属正常，仍必须有当日完整报告。
+2026-11-17 最终人工预演（034c4a1830a97ec5）：发现1,751,851目录、2,298个Git标记；
+691.288秒完成发现、764.967秒完成引用库存、852.654秒完成计划，总1189.708秒（约19分50秒），
+据此维持30分钟预算/33分钟硬限。complete=true、global_unresolved为空；115条未知表达式按67条prefix/48条project保留，
+131候选（122 remove、9 archive+remove）；逐路径实占合计13.618 GiB，不是实际释放量。最终明细和逐条保护范围见线程审核包：
+`/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/scoped-rework/REPORT.md`。人工预演不算首次schedule运行。
+
+`bb automation` 的 succeeded 仅表示 worker 启动成功；实际成功以最新 JSON 报告和 JSONL 完整阶段为准。每日07:30读取报告：预演应在07:03前结束；执行可能仍在150分钟预算内，硬时限为启动后153分钟（06:30启动则09:03）。核对本轮JSONL start时间与mode，预算内仍运行记pending并明确尚无完成结论，不能拿前一轮报告冒充本轮成功，同时核对上一轮已结束的完整报告及失败项，防止每天pending掩盖上一轮失败；超限或停止后无完整报告算失败。`systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result` 可查在途状态；collect 后 unit not-found 属正常，仍必须有当日完整报告。
 
 linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` 后
 `git worktree add <path> <sha>`；独立 clone 用记录 URL clone 后恢复每个 branch/tag。
@@ -280,7 +299,7 @@ go env GOCACHE
 9. **BB 任务**：按第 1 节创建/更新现行启用脚本任务和每日 DSH 检查，并停用旧 tmp clone 任务；时区 `Asia/Shanghai`；
    回读 ID、cron、工作目录、命令、enabled。每日检查 prompt 从
    [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md) 复制。
-10. **验证**：先手动跑各入口的默认预演；Git 保持无 `--execute` 等 owner 审核，其他已授权任务验证 exit 0 / skipped；
+10. **验证**：先手动跑各入口的默认预演；Git 按本轮子集条件核验后才开启执行，其他已授权任务验证 exit 0 / skipped；
     跑一次 DSH 检查（`manual` 不算周期）；确认两盘可用 ≥150 GiB、共享缓存可写、
     `/tmp` summary 两个根都有、tmpfiles 的 `/tmp` 年龄为 `-`。
 
@@ -314,3 +333,7 @@ readlink -f /root/.cache/go-build /root/.cache/golangci-lint
   [WORKTREE_CLEANUP_REVIEW](WORKTREE_CLEANUP_REVIEW.md)。这些是历史，不是当前授权。
 - 本文件替代此前按日期堆叠的落地方案；旧根目录设计文档已并入
   [DEVCLOUD_STORAGE_DESIGN](DEVCLOUD_STORAGE_DESIGN.md)。
+
+2026-11-17追加证据规则的全量预演（9656f1207a402a82）：扫描1,754,216目录、2,417个Git标记；738.916秒完成发现，790.177秒引用库存，822.100秒计划，总1157.459秒。20个clone候选（15 remove、5 archive+remove，9个ref待归档），实占6.210GiB，全部是旧131项子集，无新增候选。118条unknown为70 prefix/48 project、0 global，实际保护132棵树。tmux/codebuddy/dmca/evidence已保留，lighthouse-bak三项按名称碰撞保留。授权条件已核验，06:30保存脚本已切换--execute；首次人工执行使用--reviewed-preview绑定本次完整预演。报告见 `/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/owner-evidence/REPORT.md`、`subset-comparison.json` 与 `protections.md`（同线程审核包目录）。
+
+首批人工执行（20261117T075718Z，9656快照）：完整成功，20/20个clone已删除，9个archive ref/5个唯一SHA均核验，未删除与失败0；耗时3633.691秒（60分34秒），reviewed_comparison.added=[]。删除目录原实占6.209614GiB；删除窗口可用净增6.155987GiB，全程系统盘/数据盘可用净增0.330288/1.995007GiB（含同期其他活动）。证据见同审核包 `EXECUTION.md`、`archives.tsv`、`removed.tsv`、`final-validation.json`。06:30已启用--execute；首次新版schedule尚待次日，人工执行不算schedule。

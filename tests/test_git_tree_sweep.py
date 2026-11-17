@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 SCRIPT = Path(__file__).resolve().parents[1] / '.claude/skills/devcloud-storage-upkeep/scripts/git_tree_sweep.py'
-OLD = time.time() - 3 * 86400
+OLD = time.time() - 10 * 86400
 
 
 def shell(*args, cwd=None):
@@ -179,8 +179,8 @@ def test_local_refusals(case, guard):
     if guard not in ('recent_file', 'recent_metadata'): age(c.repo)
     row = plan(c)
     assert row['action'] == 'keep', row
-    expect = {'untracked': 'dirty', 'dirty': 'dirty', 'stash': 'stash', 'recent_file': '24h',
-              'recent_metadata': '24h', 'ignored_secret': 'credential', 'dependency_secret': 'credential',
+    expect = {'untracked': 'dirty', 'dirty': 'dirty', 'stash': 'stash', 'recent_file': '168h',
+              'recent_metadata': '168h', 'ignored_secret': 'credential', 'dependency_secret': 'credential',
               'operation': 'progress', 'alternates': 'alternates'}
     assert expect[guard] in row['reason'], row
 
@@ -271,6 +271,7 @@ def test_process_probe_reads_cwd_maps_fd_and_environment(case, tmp_path, probe):
     (pid / 'fd').mkdir(parents=True)
     (pid / 'cwd').symlink_to(c.repo if probe == 'cwd' else '/unrelated')
     (pid / 'exe').symlink_to(c.repo / 'a' if probe == 'exe' else '/usr/bin/bash')
+    (pid / 'status').write_text('Uid: 0 0 0 0\n')
     (pid / 'stat').write_text('987654 (test process) ' + ' '.join(['1'] * 25))
     (pid / 'maps').write_text('a b c d e ' + (str(c.repo / 'lib.so') if probe == 'maps' else '/unrelated/lib.so') + '\n')
     (pid / 'environ').write_text('NVM_DIR=' + (str(c.repo) if probe == 'environment' else '/unrelated') + '\0')
@@ -520,7 +521,7 @@ def test_unknown_path_expression_is_reported_but_nonpath_shell_state_is_ignored(
     c = case
     anchors = {}
     unknown = c.m.text_anchors(anchors, 'source "$UNKNOWN_HOME/init.sh"\ncase "$TERM" in x) ;; esac', '/root', 'shell')
-    assert unknown and 'UNKNOWN_HOME' in unknown[0]
+    assert unknown and 'UNKNOWN_HOME' in unknown[0]['expression']
     assert c.m.text_anchors({}, 'test "$TERM" = x', '/root', 'shell') == []
 
 
@@ -611,7 +612,7 @@ def test_recent_git_activity_protects_even_without_checkout_changes(case, rel):
     target.parent.mkdir(parents=True, exist_ok=True)
     target.touch()
     row = plan(c)
-    assert row['action'] == 'keep' and '24h' in row['reason'], row
+    assert row['action'] == 'keep' and '168h' in row['reason'], row
 
 
 def test_wildcard_shell_reference_expands_complete_quoted_paths(case):
@@ -620,7 +621,8 @@ def test_wildcard_shell_reference_expands_complete_quoted_paths(case):
     target.mkdir()
     (target / 'init.sh').touch()
     anchors = {}
-    assert not c.m.text_anchors(anchors, 'source "' + str(c.root / 'tool*' / 'init.sh') + '"', '/root', 'config')
+    records = c.m.text_anchors(anchors, 'source "' + str(c.root / 'tool*' / 'init.sh') + '"', '/root', 'config')
+    assert records and all(r["prefixes"] for r in records)
     assert c.m.ws.anchored(anchors, str(target))
 
 
@@ -680,7 +682,9 @@ def test_for_source_binds_literal_and_glob_paths(case, inline):
     script = 'for file in "' + str(c.repo) + '"/*.sh; do\n source "$file"\ndone'
     if inline: script = script.replace('; do\n', '; do ').replace('\n', '; ')
     anchors = {}
-    assert not c.m.text_anchors(anchors, script, '/root', 'shell')
+    records = c.m.text_anchors(anchors, script, '/root', 'shell')
+    c.m.scope_unknown(anchors, records, inv(c))
+    assert records and all(r['scope'] == 'prefix' for r in records)
     assert c.m.ws.anchored(anchors, str(c.repo))
 
 
@@ -722,10 +726,11 @@ def test_prompt_command_is_code_and_pwd_rendering_is_read_only(case):
     assert not c.m.text_anchors({}, '''PROMPT_COMMAND='printf "%s" "${PWD/#$HOME/~}"' ''', '/root', 'shell')
 
 
+@pytest.mark.parametrize('execute', [False, True])
 @pytest.mark.parametrize('state,success,launched', [('LoadState=not-found\nActiveState=inactive',True,True),
     ('LoadState=loaded\nActiveState=active',True,False), ('LoadState=loaded\nActiveState=deactivating',True,False),
     ('LoadState=unknown\nActiveState=inactive',False,False), ('ERROR',False,False)])
-def test_launcher_starts_only_one_bounded_dry_run(case, state, success, launched):
+def test_launcher_starts_only_one_bounded_dry_run(case, state, success, launched, execute):
     c = case
     bindir = c.root / 'bin'
     bindir.mkdir()
@@ -737,20 +742,21 @@ def test_launcher_starts_only_one_bounded_dry_run(case, state, success, launched
     run.write_text('#!' + os.sys.executable + '\nimport os,sys,json,pathlib\npathlib.Path(os.environ["PROBE_CAPTURE"]).write_text(json.dumps(sys.argv[1:]))\n')
     run.chmod(0o755)
     launcher = SCRIPT.with_name('git_tree_sweep_run.sh')
-    result = subprocess.run(['bash', str(launcher)], env=dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH'],
+    result = subprocess.run(['bash', str(launcher), *(['--execute'] if execute else [])], env=dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH'],
                             PROBE_STATE=state, PROBE_CAPTURE=str(capture)), capture_output=True, text=True)
     assert (result.returncode == 0) == success, result.stderr
     assert capture.exists() == launched
     if launched:
         args = json.loads(capture.read_text())
-        assert '--property=RuntimeMaxSec=1980' in args
-        assert args[-2:] == ['--budget-minutes','30']
-        assert '--execute' not in args
+        assert ('--property=RuntimeMaxSec=9180' if execute else '--property=RuntimeMaxSec=1980') in args
+        assert '--property=WorkingDirectory=/' in args
+        assert args[args.index('--budget-minutes') + 1] == ('150' if execute else '30')
+        assert ('--execute' in args) is execute
         assert str(SCRIPT) in args
 
 
-def test_launcher_has_no_execute_path(case):
-    result = subprocess.run(['bash', str(SCRIPT.with_name('git_tree_sweep_run.sh')), '--execute'], capture_output=True, text=True)
+def test_launcher_rejects_unknown_execute_arguments(case):
+    result = subprocess.run(['bash', str(SCRIPT.with_name('git_tree_sweep_run.sh')), '--execute', '--unknown'], capture_output=True, text=True)
     assert result.returncode == 2
 
 
@@ -796,8 +802,8 @@ def test_legacy_consumers_resolve_symlinked_parent_paths(case, monkeypatch, cons
     if consumer == 'container':
         monkeypatch.setattr(c.m, 'process_anchors', lambda _: None)
         monkeypatch.setattr(c.m.ws, 'docker_anchors', reserve)
-        monkeypatch.setattr(c.m, 'bb_anchors', lambda _: [])
-        monkeypatch.setattr(c.m, 'config_anchors', lambda _: [])
+        monkeypatch.setattr(c.m, 'bb_anchors', lambda *a, **kw: [])
+        monkeypatch.setattr(c.m, 'config_anchors', lambda *a, **kw: [])
         anchors, unknown = c.m.usage(inv(c))
     else:
         monkeypatch.setattr(c.m.ws, 'bb_anchors', reserve)
@@ -864,3 +870,751 @@ def test_mount_point_is_retained_at_the_local_boundary(case, monkeypatch):
     c = case
     monkeypatch.setattr(c.m.os.path,'ismount',lambda path: path==str(c.repo))
     assert 'mount point' in plan(c)['reason']
+
+
+def scoped(case, text, trees=None, **owner):
+    c = case
+    inventory = {'trees': trees or {str(c.repo): 'clone'}, 'remote_urls': {}}
+    anchors = {}
+    records = c.m.text_anchors(anchors, text, '/root', 'test source', {'PATH': '/usr/bin'})
+    for record in records:
+        record.update(owner)
+    c.m.scope_unknown(anchors, records, inventory)
+    return anchors, records
+
+
+@pytest.mark.parametrize('operand', ['{root}/$name/bin', '{root}/*/$name/bin', '{root}/${name}/$other', '{root}/pre$name/bin'])
+def test_unknown_prefix_protects_descendants_and_containing_tree_only(case, operand):
+    c = case
+    prefix = str(c.repo / 'ignored with spaces')
+    expression = operand.replace("{root}", prefix)
+    child = prefix + ('/prefix' if '/pre$' in expression else '/child')
+    sibling = str(c.root / 'unrelated')
+    anchors, records = scoped(c, 'source "' + expression + '"',
+                              {str(c.repo): 'clone', child: 'clone', sibling: 'linked'})
+    assert records and all(r['scope'] == 'prefix' for r in records)
+    assert set().union(*(set(r['protected_paths']) for r in records)) == {str(c.repo), child}
+    assert not c.m.global_unknown(records)
+    assert not c.m.ws.anchored(anchors, sibling)
+
+
+def test_loop_variable_keeps_its_absolute_prefix(case):
+    c = case
+    _, records = scoped(c, f'for checkout in "{c.repo}/$name"; do source "$checkout/init.sh"; done')
+    assert records and all(r['scope'] == 'prefix' for r in records)
+    assert all(str(c.repo) in r['protected_paths'] for r in records)
+
+
+def test_unrelated_literal_on_same_line_cannot_bound_unknown(case):
+    _, records = scoped(case, 'echo /usr/bin; source "$UNBOUND_HOME/init.sh"')
+    assert records and any(r['scope'] == 'global' for r in records)
+    assert case.m.global_unknown(records)
+
+
+@pytest.mark.parametrize('expression', ['source "$UNKNOWN_HOME/init.sh"', 'source relative/tool', 'export TOOL_ROOT="$(locate-tool)"'])
+def test_unowned_unknown_names_source_and_blocks_global_generation(case, expression):
+    anchors, records = scoped(case, expression)
+    assert records and all(r['scope'] == 'global' for r in records)
+    assert case.m.global_unknown(records)[0].startswith('test source: ')
+    assert all(r['protected_paths'] == [str(case.repo)] for r in records)
+    assert plan(case, anchors=anchors)['action'] == 'keep'
+
+
+def test_unknown_prefix_canonicalizes_symlink_parent(case):
+    c = case
+    alias = c.root / 'alias'
+    alias.symlink_to(c.repo, target_is_directory=True)
+    _, records = scoped(c, f'source "{alias}/$name/init.sh"')
+    assert records[0]['prefixes'][0]['path'] == str(c.repo)
+    assert records[0]['protected_paths'] == [str(c.repo)]
+
+
+@pytest.mark.parametrize('path,expected', [('/tmp/$name/bin', '/data/system-tmp'), ('/$name/init', '/')])
+def test_unknown_prefix_handles_bind_alias_and_root(case, monkeypatch, path, expected):
+    monkeypatch.setattr(case.m.os.path, 'samefile', lambda *a: True)
+    records = case.m.text_anchors({}, 'source "' + path + '"', '/root', 'shell')
+    assert records[0]['prefixes'][0]['path'] == expected
+    inventory = {'trees': {expected + '/tree': 'clone'}}
+    case.m.scope_unknown({}, records, inventory)
+    assert records[0]['protected_paths'] == [expected + '/tree']
+
+
+@pytest.mark.parametrize('values', [1, 2])
+def test_observed_process_values_are_all_substituted(case, monkeypatch, values):
+    c = case
+    monkeypatch.setattr(c.m.os, 'environ', {})
+    paths = {str(c.repo), str(c.root / 'second')} if values == 2 else {str(c.repo)}
+    anchors = {}
+    records = c.m.environment_references(anchors, 'source "$TOOL_ROOT/init.sh"', '/root', 'shell', {'TOOL_ROOT': paths})
+    assert records == []
+    assert all(c.m.ws.anchored(anchors, path) for path in paths)
+
+
+def test_process_snapshot_returns_real_values_for_later_substitution(case, tmp_path):
+    p = tmp_path / '123'
+    (p / 'fd').mkdir(parents=True)
+    (p / 'cwd').symlink_to(case.repo)
+    (p / 'status').write_text('Uid: 0 0 0 0\n')
+    (p / 'stat').write_text('123 (proc) ' + ' '.join(['0'] * 22))
+    (p / 'maps').write_text('')
+    (p / 'environ').write_text('TERM=dumb\0TOOL_ROOT=' + str(case.repo) + '\0')
+    env = case.m.process_anchors({}, str(tmp_path))
+    assert env['TERM'] == {'dumb'} and env['TOOL_ROOT'] == {str(case.repo)}
+
+
+def test_project_fallback_matches_effective_fetch_push_urls_and_linked_trees(case):
+    c = case
+    work = linked(c)
+    other = c.root / 'same remote'
+    shell('git', 'clone', '-q', str(c.bare), str(other))
+    shell('git', 'remote', 'set-url', 'origin', 'git@git.woa.com:group/repo.git', cwd=other)
+    different = c.root / 'different'
+    shell('git', 'init', '-q', str(different))
+    shell('git', 'config', 'remote.origin.url', 'https://git.woa.com/group/different.git', cwd=different)
+    inventory = inv(c)
+    c.m.references(inventory)
+    record = c.m.unresolved('paused automation a', 'source "$checkout/init.sh"')
+    record.update(project_id='p', project_paths=[str(c.repo)], project_remote_ids=[])
+    c.m.scope_unknown({}, [record], inventory)
+    assert record['scope'] == 'project'
+    assert set(record['protected_paths']) == {str(c.repo), str(work), str(other)}
+    assert str(different) not in record['protected_paths']
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_bb_unknown_keeps_project_env_metadata_and_disabled_tasks(case, monkeypatch, enabled):
+    c = case
+    script = c.root / 'automation.sh'
+    script.write_text('source "$checkout/init.sh"\nsource "$PWD/tools.sh"')
+    env = str(c.root / 'environment')
+    responses = {'project': [{'id': 'p', 'sources': [{'path': str(c.repo)}]}],
+                 'environment': [{'id': 'e', 'projectId': 'p', 'status': 'ready', 'path': env}],
+                 'automation': [{'id': 'a', 'enabled': enabled, 'execution': {'storedScriptPath': str(script), 'workingDirectory': {'type': 'project'}}}]}
+    monkeypatch.setattr(c.m, 'command', lambda cmd, **kw: SimpleNamespace(stdout=json.dumps([] if cmd[1] == 'automation' and 'proj_personal' in cmd else responses[cmd[1]])))
+    monkeypatch.setattr(c.m.ws, 'bb_anchors', lambda *a: None)
+    anchors = {}
+    records = c.m.bb_anchors(anchors, {})
+    c.m.scope_unknown(anchors, records, {'trees': {str(c.repo): 'clone', env: 'linked'}})
+    assert records and all(r['scope'] == 'project' for r in records)
+    assert all(r['automation_enabled'] is enabled for r in records)
+    assert all(set(r['protected_paths']) == {str(c.repo), env} for r in records)
+    assert all('PWD' not in r['expression'] for r in records)
+
+
+def test_unknown_report_lists_paths_even_if_already_protected(case):
+    c = case
+    anchors = {str(c.repo): 'BB project source'}
+    r = c.m.unresolved('config', f'source "{c.repo}/$x/init"', [f'{c.repo}/$x/init'])
+    c.m.scope_unknown(anchors, [r], {'trees': {str(c.repo): 'clone'}})
+    assert r['protected_paths'] == [str(c.repo)]
+    assert json.loads(json.dumps(r))['scope'] == 'prefix'
+
+
+@pytest.mark.parametrize('expression', ['source "$HOME/tools/$name/init.sh"', 'source /etc/profile.d/$name.sh'])
+def test_scoped_unknown_allows_unrelated_clone_to_reach_remote_proof(case, expression):
+    c = case
+    anchors, records = scoped(c, expression)
+    assert not c.m.global_unknown(records)
+    row = plan(c, anchors=anchors)
+    assert row['action'] == 'remove'
+    assert row['remote_proofs'] and all(row['remote_proofs'].values())
+
+
+@pytest.mark.parametrize('protect', [False, True])
+def test_execution_rechecks_scoped_unknown_without_global_veto(case, monkeypatch, protect):
+    c = case
+    row = plan(c)
+    row['bytes'] = 4096
+    def usage(inventory):
+        root = c.repo if protect else c.root / 'elsewhere'
+        anchors = {}
+        records = c.m.text_anchors(anchors, f'source "{root}/$name/init"', '/root', 'new config')
+        return anchors, c.m.scope_unknown(anchors, records, inventory)
+    monkeypatch.setattr(c.m, 'usage', usage)
+    c.m.execute([row], inv(c), {}, {}, [str(c.root)], set(), 'scoped', c.root / 'events')
+    assert c.repo.exists() is protect
+    assert row['result'] == ('kept' if protect else 'removed')
+
+
+def test_system_unit_description_is_prose_and_path_fields_are_still_consumers(case):
+    c = case
+    unit = c.root / 'tool.service'
+    unit.write_text('[Unit]\nDescription=Read-only source image timer\n[Service]\nEnvironment=TOOL_ROOT=' + str(c.repo) + '\nExecStart=/usr/bin/python3 ' + str(c.repo / 'tool.py') + '\n')
+    anchors = {}
+    assert not c.m.config_anchors(anchors, sources=[(str(unit), '/root')])
+    assert c.m.ws.anchored(anchors, str(c.repo))
+
+
+def test_profile_loop_uses_observed_term_and_go_metadata_without_shell(case, monkeypatch):
+    c = case
+    monkeypatch.setattr(c.m.os, 'environ', {})
+    text = 'for file in "$HOME/.colors.$TERM"; do test -f "$file"; done\nexport PATH="$PATH:$(/usr/local/go/bin/go env GOPATH)/bin"'
+    anchors = {}
+    assert not c.m.environment_references(anchors, text, '/root', 'profile',
+        {'TERM': {'dumb'}, 'PATH': {'/usr/bin'}, '__GO_EXE': {'/usr/local/go/bin/go'}, '__GO_GOPATH': {str(c.repo)}})
+    assert c.m.ws.anchored(anchors, str(c.repo))
+    assert not c.calls
+
+
+def test_process_environment_contexts_preserve_observed_correlations(case, monkeypatch):
+    c = case
+    monkeypatch.setattr(c.m.os, 'environ', {})
+    env = c.m.ProcessEnvironments()
+    env.contexts = [{'TOOL_ROOT': str(c.root / 'first'), 'EDITION': 'one'},
+                    {'TOOL_ROOT': str(c.root / 'second'), 'EDITION': 'two'}]
+    for context in env.contexts:
+        for key, value in context.items():
+            env.setdefault(key, set()).add(value)
+    anchors = {}
+    assert not c.m.environment_references(anchors, 'source "$TOOL_ROOT/$EDITION/init"', '/root', 'profile', env)
+    assert str(c.root / 'first/one/init') in anchors
+    assert str(c.root / 'second/two/init') in anchors
+    assert str(c.root / 'first/two/init') not in anchors
+    assert str(c.root / 'second/one/init') not in anchors
+
+
+def test_dynamic_systemd_environment_value_has_scoped_protection(case):
+    c = case
+    unit = c.root / 'tool.service'
+    unit.write_text('[Service]\nEnvironment="TOOL_ROOT=' + str(c.repo) + '/$flavour"\n')
+    anchors = {}
+    records = c.m.config_anchors(anchors, sources=[(str(unit), '/root')])
+    c.m.scope_unknown(anchors, records, inv(c))
+    assert records and all(r['scope'] == 'prefix' for r in records)
+    assert all(str(c.repo) in r['protected_paths'] for r in records)
+
+
+def test_missing_process_value_preserves_shell_default(case, monkeypatch):
+    c = case
+    monkeypatch.setattr(c.m.os, 'environ', {'PATH': '/usr/bin'})
+    env = c.m.ProcessEnvironments()
+    env.contexts = [{'XDG_CONFIG_HOME': str(c.repo)}, {'PATH': '/usr/bin'}]
+    env.update({'XDG_CONFIG_HOME': {str(c.repo)}, 'PATH': {'/usr/bin'}})
+    anchors = {}
+    assert not c.m.environment_references(anchors, 'source "${XDG_CONFIG_HOME:-$HOME/.config}/init"', '/root', 'profile', env)
+    assert c.m.ws.anchored(anchors, str(c.repo))
+
+
+def test_systemd_multiline_command_is_parsed_as_one_statement(case):
+    c = case
+    unit = c.root / 'multiline.service'
+    unit.write_text('[Service]\nExecStart=/bin/bash -c \'read args <&3; \\\n exec ' + str(c.repo / 'tool') + '; exit 0\'\n')
+    anchors = {}
+    assert not c.m.config_anchors(anchors, sources=[(str(unit), '/root')])
+    assert c.m.ws.anchored(anchors, str(c.repo))
+
+
+def test_default_assignment_carries_path_to_following_statement(case):
+    c = case
+    anchors = {}
+    assert not c.m.text_anchors(anchors, ': "${TOOL_ROOT:=' + str(c.repo) + '}"\nsource "$TOOL_ROOT/init"', '/root', 'profile')
+    assert c.m.ws.anchored(anchors, str(c.repo))
+
+
+def test_dynamic_absolute_scratch_assignment_keeps_its_prefix(case):
+    anchors, records = scoped(case, 'tool="' + str(case.repo) + '/$version"\n"$tool"')
+    assert records and all(r['scope'] == 'prefix' for r in records)
+    assert str(case.repo) in records[0]['protected_paths']
+    assert plan(case, anchors=anchors)['action'] == 'keep'
+
+
+def test_project_remote_metadata_scopes_unknown_even_without_local_checkout(case):
+    c = case
+    inventory = inv(c)
+    c.m.references(inventory)
+    record = c.m.unresolved('automation', 'source "$checkout/init"')
+    record.update(project_id='remote-only', project_paths=[],
+                  project_remote_ids=[c.m.remote_identity('git@git.woa.com:group/repo.git', '/')])
+    c.m.scope_unknown({}, [record], inventory)
+    assert record['scope'] == 'project'
+    assert record['protected_paths'] == [str(c.repo)]
+    assert not c.m.global_unknown([record])
+
+
+@pytest.mark.parametrize('push', [False, True])
+def test_broken_git_stays_keep_but_effective_urls_still_protect_consumers(case, push):
+    c = case
+    broken = c.root / 'lost HEAD'
+    shell('git', 'init', '-q', str(broken))
+    shell('git', 'config', 'remote.origin.url', 'https://example.com/read-only', cwd=broken)
+    if not push:
+        shell('git', 'config', 'remote.origin.url', 'local:repo', cwd=broken)
+        shell('git', 'config', 'url.' + str(c.repo) + '/.insteadOf', 'local:', cwd=broken)
+    else:
+        shell('git', 'config', 'url.' + str(c.repo) + '/.pushInsteadOf', 'https://example.com/', cwd=broken)
+    (broken / '.git/HEAD').unlink()
+    inventory = inv(c)
+    refs = c.m.references(inventory)
+    assert c.m.ws.anchored(refs, str(c.repo))
+    assert c.m.plan(str(broken), 'clone', inventory, {}, refs)['action'] == 'keep'
+    assert not (broken / '.git/HEAD').exists()
+    assert c.m.remote_identity(str(c.repo / ('read-only' if push else 'repo')), str(broken)) in inventory['remote_urls'][str(broken)]
+
+
+def test_broken_git_conditional_config_remains_global_unknown(case):
+    c = case
+    broken = c.root / 'lost HEAD'
+    shell('git', 'init', '-q', str(broken))
+    shell('git', 'config', 'remote.origin.url', 'https://example.com/repo', cwd=broken)
+    shell('git', 'config', 'includeIf.gitdir:/something/.path', str(c.root / 'external.conf'), cwd=broken)
+    (broken / '.git/HEAD').unlink()
+    with pytest.raises(c.m.ws.ScanIncomplete, match='conditional config unknown'):
+        c.m.references(inv(c))
+
+
+def test_broken_git_global_conditional_config_stays_unknown(case, monkeypatch):
+    c = case
+    broken = c.root / 'lost HEAD'
+    shell('git', 'init', '-q', str(broken))
+    shell('git', 'config', 'remote.origin.url', 'https://example.com/repo', cwd=broken)
+    (broken / '.git/HEAD').unlink()
+    config = c.root / 'global-config'
+    config.write_text('[includeIf "gitdir:/something/"]\npath=/nonexistent/config\n')
+    monkeypatch.setattr(c.m.ws, 'ENV', dict(c.m.ws.ENV, GIT_CONFIG_GLOBAL=str(config)))
+    with pytest.raises(c.m.ws.ScanIncomplete, match='conditional config unknown'):
+        c.m.references(inv(c))
+
+
+@pytest.mark.parametrize('kind', ['source', 'loop', 'environment'])
+def test_pure_unmatched_glob_protects_all_git_trees_below_prefix(case, kind):
+    c = case
+    pattern = str(c.root / '*' / 'no-matching-init-file')
+    scripts = {'source': f'source "{pattern}"',
+               'loop': f'for file in "{pattern}"; do source "$file"; done',
+               'environment': f'Environment="TOOL_ROOT={pattern}"'}
+    anchors, records = scoped(c, scripts[kind])
+    assert records and all(r['scope'] == 'prefix' for r in records)
+    assert not c.m.global_unknown(records)
+    assert all(str(c.repo) in r['protected_paths'] for r in records)
+    assert plan(c, anchors=anchors)['action'] == 'keep'
+
+
+@pytest.mark.parametrize('substitution', ['$(tool locate)', '`tool locate`', '$(tool $(nested $(another nested)))'])
+def test_loop_command_substitution_retains_literal_absolute_prefix(case, substitution):
+    c = case
+    text = f'for file in "{c.repo}/{substitution}"; do source "$file/init"; done'
+    _, records = scoped(c, text)
+    assert records and all(r['scope'] == 'prefix' for r in records)
+    assert all(r['protected_paths'] == [str(c.repo)] for r in records)
+    assert not c.m.global_unknown(records)
+
+
+@pytest.mark.parametrize('operator', [':?', ':?message', ':+' ])
+def test_bb_explicit_env_modifiers_protect_paths_outside_project(case, monkeypatch, operator):
+    c = case
+    outside = c.root / 'external-tool'
+    script = c.root / 'automation.sh'
+    expression = '${TOOL_HOME' + operator + (str(outside) if operator == ':+' else '') + '}'
+    script.write_text('source "' + expression + '/init.sh"')
+    responses = {'project': [{'id': 'p', 'sources': [{'path': str(c.repo)}]}], 'environment': [],
+                 'automation': [{'id': 'a', 'execution': {'storedScriptPath': str(script), 'env': {'TOOL_HOME': str(outside)}}}]}
+    monkeypatch.setattr(c.m, 'command', lambda cmd, **kw: SimpleNamespace(stdout=json.dumps([] if cmd[1] == 'automation' and 'proj_personal' in cmd else responses[cmd[1]])))
+    monkeypatch.setattr(c.m.ws, 'bb_anchors', lambda *a: None)
+    anchors = {}
+    assert not c.m.bb_anchors(anchors)
+    assert c.m.ws.anchored(anchors, str(outside))
+
+
+@pytest.mark.parametrize('operator', [':?', ':+' ])
+def test_unknown_required_or_alternative_parameter_remains_unknown(case, operator):
+    assert case.m.text_anchors({}, 'source "${MISSING_HOME' + operator + '}/init"', '/root', 'config')
+
+
+def test_alternative_parameter_expands_nested_known_value(case):
+    c = case
+    anchors = {}
+    assert not c.m.text_anchors(anchors, 'source "${ENABLED:+${TOOL_HOME}}/init"', '/root', 'shell',
+                                {'ENABLED': '1', 'TOOL_HOME': str(c.repo)})
+    assert c.m.ws.anchored(anchors, str(c.repo))
+
+
+def test_broken_gitfile_readable_config_still_protects_remote_target(case):
+    c = case
+    broken, metadata = c.root / 'broken linked', c.root / 'metadata'
+    shell('git', 'init', '-q', '--separate-git-dir', str(metadata), str(broken))
+    shell('git', 'config', 'remote.origin.url', str(c.repo), cwd=broken)
+    (metadata / 'HEAD').unlink()
+    inventory = inv(c)
+    refs = c.m.references(inventory)
+    assert c.m.ws.anchored(refs, str(c.repo))
+    assert c.m.plan(str(broken), 'linked', inventory, {}, refs)['action'] == 'keep'
+    assert not (metadata / 'HEAD').exists()
+
+
+@pytest.mark.parametrize('push', [False, True])
+def test_project_metadata_urls_apply_git_rewrites_before_scope_matching(case, monkeypatch, push):
+    c = case
+    config = c.root / 'global-url-config'
+    if push:
+        value = 'https://read.example/group/repo.git'
+        config.write_text('[url "ssh://git@write.example/"]\n pushInsteadOf=https://read.example/\n')
+        shell('git', 'remote', 'set-url', 'origin', 'https://different.example/repo.git', cwd=c.repo)
+        shell('git', 'config', 'remote.origin.pushurl', 'ssh://git@write.example/group/repo.git', cwd=c.repo)
+        expected = 'write.example/group/repo'
+    else:
+        value = 'short:group/repo.git'
+        config.write_text('[url "https://rewritten.example/"]\n insteadOf=short:\n')
+        shell('git', 'remote', 'set-url', 'origin', 'https://rewritten.example/group/repo.git', cwd=c.repo)
+        expected = 'rewritten.example/group/repo'
+    monkeypatch.setattr(c.m.ws, 'ENV', dict(c.m.ws.ENV, GIT_CONFIG_GLOBAL=str(config)))
+    identities = c.m.project_url_identities(value, [])
+    assert expected in identities
+    inventory = inv(c); c.m.references(inventory)
+    record = c.m.unresolved('automation', 'source "$checkout/init"')
+    record.update(project_id='p', project_paths=[], project_remote_ids=identities)
+    c.m.scope_unknown({}, [record], inventory)
+    assert record['scope'] == 'project' and record['protected_paths'] == [str(c.repo)]
+
+
+def test_local_url_suffix_preserves_distinct_physical_stores(case):
+    c = case
+    distinct = Path(str(c.repo) + '.git')
+    shell('git', 'init', '--bare', '-q', str(distinct))
+    other = c.root / 'other-consumer'
+    shell('git', 'init', '-q', str(other))
+    shell('git', 'config', 'remote.origin.url', str(distinct), cwd=other)
+    assert c.m.remote_identity(str(c.repo), '/') == c.m.remote_identity(str(c.repo / '.git'), '/')
+    assert c.m.remote_identity(str(c.repo), '/') != c.m.remote_identity(str(distinct), '/')
+    inventory = inv(c); c.m.references(inventory)
+    record = c.m.unresolved('project', 'source "$checkout/init"')
+    record.update(project_id='p', project_paths=[str(c.repo)], project_remote_ids=[c.m.remote_identity(str(c.repo), '/')])
+    c.m.scope_unknown({}, [record], inventory)
+    assert str(c.repo) in record['protected_paths'] and str(other) not in record['protected_paths']
+
+
+def test_nonpath_systemd_environment_glob_does_not_reserve_entire_generation(case):
+    assert not case.m.text_anchors({}, 'Environment="URL=https://example.com?q=a"', '/root', 'unit')
+
+
+def test_for_sequence_resolves_required_parameter_before_binding(case):
+    c = case
+    records = c.m.text_anchors({}, 'for file in "${TOOL_HOME:?}/$(tool locate)"; do source "$file/init"; done',
+                               '/root', 'config', {'TOOL_HOME': str(c.repo)})
+    c.m.scope_unknown({}, records, {'trees': {str(c.repo): 'clone'}})
+    assert records and all(r['scope'] == 'prefix' for r in records)
+
+
+def test_bb_project_metadata_rewrite_protects_same_remote_clone_end_to_end(case, monkeypatch):
+    c = case
+    config = c.root / 'global-url-config'
+    config.write_text('[url "https://rewritten.example/"]\n insteadOf=short:\n')
+    monkeypatch.setattr(c.m.ws, 'ENV', dict(c.m.ws.ENV, GIT_CONFIG_GLOBAL=str(config)))
+    shell('git', 'remote', 'set-url', 'origin', 'https://rewritten.example/group/repo.git', cwd=c.repo)
+    inventory = inv(c); c.m.references(inventory)
+    script = c.root / 'unknown-consumer.sh';script.write_text('source "$checkout/init.sh"')
+    raw = c.m.command
+    def command(cmd, **kw):
+        if cmd[0] != 'bb': return raw(cmd, **kw)
+        data = {'project': [{'id': 'p', 'gitRemoteUrl': 'short:group/repo.git', 'sources': []}], 'environment': [],
+                'automation': [] if 'proj_personal' in cmd else [{'id': 'a', 'execution': {'storedScriptPath': str(script)}}]}
+        return SimpleNamespace(stdout=json.dumps(data[cmd[1]]))
+    monkeypatch.setattr(c.m, 'command', command)
+    monkeypatch.setattr(c.m.ws, 'bb_anchors', lambda *a: None)
+    anchors = {};records = c.m.bb_anchors(anchors)
+    c.m.scope_unknown(anchors, records, inventory)
+    assert records and all(r['protected_paths'] == [str(c.repo)] for r in records)
+    assert c.m.ws.anchored(anchors, str(c.repo))
+
+
+def test_project_url_scratch_cannot_write_inherited_git_directory(case, monkeypatch):
+    c = case
+    before = (c.repo / '.git/config').read_bytes()
+    monkeypatch.setattr(c.m.ws, 'ENV', dict(c.m.ws.ENV, GIT_DIR=str(c.repo / '.git'), GIT_WORK_TREE=str(c.repo)))
+    assert 'example.com/group/repo' in c.m.project_url_identities('https://example.com/group/repo.git', [])
+    assert (c.repo / '.git/config').read_bytes() == before
+    assert not (c.repo / '.git/refs/heads/project').exists()
+
+
+def test_project_url_scratch_uses_source_rules_without_temp_conditional_rules(case, monkeypatch):
+    c = case
+    config = c.root / 'global-url-config'
+    extra = c.root / 'temp-rules'
+    extra.write_text('[url "https://wrong.example/"]\n insteadOf=short:group/\n')
+    config.write_text('[url "https://correct.example/"]\n insteadOf=short:\n'
+                      '[includeIf "gitdir:/tmp/git-project-url-*/"]\n path=' + str(extra) + '\n')
+    monkeypatch.setattr(c.m.ws, 'ENV', dict(c.m.ws.ENV, GIT_CONFIG_GLOBAL=str(config)))
+    assert c.m.project_url_identities('short:group/repo.git', []) == ['correct.example/group/repo']
+
+
+def test_bb_explicit_home_is_used_for_tool_reference(case, monkeypatch):
+    c = case
+    outside = c.root / 'external-home'
+    script = c.root / 'automation.sh';script.write_text('source "$HOME/tool/init.sh"')
+    responses = {'project': [{'id': 'p', 'sources': [{'path': str(c.repo)}]}], 'environment': [],
+                 'automation': [{'id': 'a', 'execution': {'storedScriptPath': str(script), 'env': {'HOME': str(outside)}}}]}
+    monkeypatch.setattr(c.m, 'command', lambda cmd, **kw: SimpleNamespace(stdout=json.dumps([] if cmd[1] == 'automation' and 'proj_personal' in cmd else responses[cmd[1]])))
+    monkeypatch.setattr(c.m.ws, 'bb_anchors', lambda *a: None)
+    anchors = {}; assert not c.m.bb_anchors(anchors)
+    assert c.m.ws.anchored(anchors, str(outside / 'tool'))
+
+
+@pytest.mark.parametrize('field', ['WorkingDirectory', 'ExecStart'])
+@pytest.mark.parametrize('known', [False, True])
+def test_systemd_environment_dynamic_bare_path_is_resolved_or_unknown(case, field, known):
+    c = case
+    variables = {'OBSERVED': str(c.repo)} if known else {}
+    anchors = {}
+    records = c.m.text_anchors(anchors, f'Environment=WORKTREE=$OBSERVED\n{field}=$WORKTREE', '/root', 'unit', variables)
+    if known:
+        assert not records and c.m.ws.anchored(anchors, str(c.repo))
+    else:
+        c.m.scope_unknown(anchors, records, inv(c))
+        assert records and c.m.global_unknown(records)
+        assert all(str(c.repo) in r['protected_paths'] for r in records)
+
+
+@pytest.mark.parametrize('injection', ['directory', 'config_count'])
+def test_project_source_url_rules_ignore_inherited_repository_and_injection(case, monkeypatch, injection):
+    c = case
+    config = c.root / 'global-rules'
+    config.write_text('[url "https://right.example/"]\n insteadOf=short:\n')
+    shell('git', 'config', 'url.https://wrong.example/.insteadOf', 'short:group/', cwd=c.repo)
+    values = dict(c.m.ws.ENV, GIT_CONFIG_GLOBAL=str(config))
+    if injection == 'directory':
+        values.update(GIT_DIR=str(c.repo / '.git'), GIT_WORK_TREE=str(c.repo))
+    else:
+        values.update(GIT_CONFIG_COUNT='1', GIT_CONFIG_KEY_0='url.https://wrong.example/.insteadOf', GIT_CONFIG_VALUE_0='short:group/')
+    monkeypatch.setattr(c.m.ws, 'ENV', values)
+    assert c.m.project_url_identities('short:group/repo.git', []) == ['right.example/group/repo']
+
+
+@pytest.mark.parametrize('gitfile', [False, True])
+@pytest.mark.parametrize('push', [False, True])
+def test_broken_git_imports_global_fetch_and_push_rewrites(case, monkeypatch, gitfile, push):
+    c = case
+    broken, metadata = c.root / 'broken', c.root / 'metadata'
+    if gitfile:
+        shell('git', 'init', '-q', '--separate-git-dir', str(metadata), str(broken))
+    else:
+        shell('git', 'init', '-q', str(broken)); metadata = broken / '.git'
+    value = 'https://fetch.example/repo' if push else 'meta:repo'
+    shell('git', 'config', 'remote.origin.url', value, cwd=broken)
+    (metadata / 'HEAD').unlink()
+    config = c.root / 'global-rewrite'
+    key, match = ('pushInsteadOf', 'https://fetch.example/') if push else ('insteadOf', 'meta:')
+    config.write_text('[url "' + str(c.repo) + '/"]\n ' + key + '=' + match + '\n')
+    monkeypatch.setattr(c.m.ws, 'ENV', dict(c.m.ws.ENV, GIT_CONFIG_GLOBAL=str(config)))
+    inventory = inv(c); refs = c.m.references(inventory)
+    expected = c.m.remote_identity(str(c.repo / 'repo'), str(broken))
+    assert expected in inventory['remote_urls'][str(broken)]
+    assert c.m.ws.anchored(refs, str(c.repo))
+    assert not (metadata / 'HEAD').exists()
+
+
+def test_broken_git_unreadable_global_rules_deny_inventory(case, monkeypatch):
+    c = case
+    broken = c.root / 'broken'
+    shell('git', 'init', '-q', str(broken))
+    shell('git', 'config', 'remote.origin.url', 'meta:repo', cwd=broken)
+    (broken / '.git/HEAD').unlink()
+    config = c.root / 'unreadable-global'
+    config.write_text('[url "https://example.com/"]\n insteadOf=meta:\n')
+    monkeypatch.setattr(c.m.ws, 'ENV', dict(c.m.ws.ENV, GIT_CONFIG_GLOBAL=str(config)))
+    raw = c.m._run
+    def denied(args, **kw):
+        # The test runs as root: emulate Git's real permission-error reply.
+        if '--global' in args and any(arg.startswith('^url') for arg in args):
+            return SimpleNamespace(returncode=128, stdout='', stderr='permission denied')
+        return raw(args, **kw)
+    monkeypatch.setattr(c.m, '_run', denied)
+    with pytest.raises(c.m.ws.ScanIncomplete, match='global URL rules unknown'): c.m.references(inv(c))
+
+
+def test_partial_component_prefix_preserves_symlink_spelling_and_target(case):
+    c = case
+    alias = c.root / 'tool';alias.symlink_to(c.repo, target_is_directory=True)
+    sibling, unrelated = str(alias) + '-old', str(c.repo) + '-unrelated'
+    _, records = scoped(c, f'source "{alias}$edition/init"',
+                        {str(c.repo): 'clone', sibling: 'clone', unrelated: 'clone'})
+    assert records and all(r['scope'] == 'prefix' for r in records)
+    assert set(records[0]['protected_paths']) == {str(c.repo), sibling}
+
+
+def test_partial_tmp_prefix_covers_bind_descendants_and_root_siblings(case, monkeypatch):
+    c = case
+    monkeypatch.setattr(c.m.os.path, 'samefile', lambda *a: True)
+    _, records = scoped(c, 'source "/tmp$variant/init"',
+                        {'/tmp-tools': 'clone', '/data/system-tmp/tool': 'clone', '/data/system-tmp-other': 'clone'})
+    assert records and set(records[0]['protected_paths']) == {'/tmp-tools', '/data/system-tmp/tool'}
+
+
+@pytest.mark.parametrize('kind', ['cwd', 'HOME', 'XDG_CACHE_HOME'])
+@pytest.mark.parametrize('location', ['root', 'mount', 'login', 'isolated', 'xdg_child'])
+def test_process_directory_scope_exceptions_and_isolated_homes(case, monkeypatch, kind, location):
+    c = case
+    login = str(c.root / 'login-home')
+    root = {'root':'/', 'mount':str(c.root / 'volume'), 'login':login,
+            'isolated':str(c.root / 'instance/home'), 'xdg_child':login + '/.cache'}[location]
+    target = root.rstrip('/') + '/clone'
+    anchors, scopes = {}, {}
+    c.m.process_directory(anchors, scopes, root, login, {str(c.root / 'volume')}, f'process 42 {kind}')
+    c.m.scope_directories(anchors, scopes, {'trees':{target:'clone'}})
+    if location in ('root','mount','login'):
+        assert not c.m.ws.anchored(anchors, target)
+        assert not scopes
+        if root != '/': assert c.m.ws.anchored(anchors, root)
+    else:
+        assert c.m.ws.anchored(anchors, target) == f'process 42 {kind} subtree'
+
+
+@pytest.mark.parametrize('key', ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'cwd'])
+def test_process_home_from_proc_protects_nested_checkout(case, tmp_path, monkeypatch, key):
+    c = case
+    proc = tmp_path / 'proc'; p = proc / '987654'
+    (p/'fd').mkdir(parents=True)
+    instance = c.root / 'server-instance/home'
+    (p/'cwd').symlink_to(instance if key == 'cwd' else '/')
+    (p/'stat').write_text('987654 (server) ' + ' '.join(['1'] * 25))
+    (p/'status').write_text('Uid: 0 0 0 0\n')
+    (p/'maps').write_text('')
+    (p/'environ').write_text(key + '=' + str(instance) + '\0' if key != 'cwd' else '')
+    monkeypatch.setattr(c.m.pwd, 'getpwuid', lambda uid: SimpleNamespace(pw_dir='/root'))
+    anchors = {}; env = c.m.process_anchors(anchors, str(proc))
+    target = str(instance / '.codebuddy/extensions/tool')
+    c.m.scope_directories(anchors, env.scopes, {'trees':{target:'clone'}})
+    assert key + ' subtree' in c.m.ws.anchored(anchors, target)
+
+
+def test_passwd_home_comes_from_process_uid(case, tmp_path, monkeypatch):
+    c = case;proc = tmp_path / 'proc';p=proc/'987654';(p/'fd').mkdir(parents=True)
+    home = str(c.root/'service-login')
+    (p/'cwd').symlink_to(home)
+    (p/'stat').write_text('987654 (server) ' + ' '.join(['1'] * 25))
+    (p/'status').write_text('Uid: 2345 2345 2345 2345\n');(p/'maps').write_text('')
+    (p/'environ').write_text('HOME='+home+'\0')
+    observed=[]
+    def entry(uid): observed.append(uid);return SimpleNamespace(pw_dir=home)
+    monkeypatch.setattr(c.m.pwd,'getpwuid',entry)
+    anchors={};env=c.m.process_anchors(anchors,str(proc))
+    c.m.scope_directories(anchors,env.scopes,{'trees':{home+'/unreferenced':'clone'}})
+    assert observed == [2345] and not c.m.ws.anchored(anchors,home+'/unreferenced')
+
+
+@pytest.mark.parametrize('text', ["set -g @plugin 'tmux-plugins/tmux-resurrect'", 'plugins=["https://github.com/tmux-plugins/tmux-resurrect.git"]'])
+def test_remote_namespace_in_configuration_reserves_tool_by_name(case, text):
+    c=case;config=c.root/'.tmux.conf';config.write_text(text)
+    inventory={'trees':{str(c.repo):'clone'},'remote_urls':{str(c.repo):['github.com/tmux-plugins/tmux-resurrect']}}
+    anchors={};c.m.configuration_name_anchors(anchors,inventory,[str(config)])
+    assert 'configuration name reference' in c.m.ws.anchored(anchors,str(c.repo))
+    assert inventory['configuration_name_references'][0]['config']==str(config)
+
+
+@pytest.mark.parametrize('name,protect', [('special-tool',True),('tool with spaces',True),('repo',False),('src',False),('upstream',False),('v0.3.2',False),('abc',False)])
+def test_directory_name_reference_requires_distinctive_name(case, name, protect):
+    c=case;path=str(c.root/name);config=c.root/'settings';config.write_text('enabled='+name+'\n')
+    inventory={'trees':{path:'clone'},'remote_urls':{}};anchors={}
+    c.m.configuration_name_anchors(anchors,inventory,[str(config)])
+    assert bool(c.m.ws.anchored(anchors,path)) is protect
+
+
+def test_tool_name_boundary_does_not_match_a_prefix(case):
+    c=case;path=str(c.root/'tmux-resurrect');cfg=c.root/'settings';cfg.write_text('tmux-resurrect-other')
+    anchors={};c.m.configuration_name_anchors(anchors,{'trees':{path:'clone'}},[str(cfg)])
+    assert not c.m.ws.anchored(anchors,path)
+
+
+def test_config_name_scan_uses_small_text_only_and_denies_read_failure(case, monkeypatch):
+    c=case;path=str(c.root/'special-tool');root=c.root/'configs';root.mkdir()
+    binary=root/'binary';binary.write_bytes(b'\0special-tool')
+    big=root/'large';big.write_text('special-tool'+' '*c.m.CONFIG_TEXT_LIMIT)
+    anchors={};c.m.configuration_name_anchors(anchors,{'trees':{path:'clone'}},[str(binary),str(big)])
+    assert not anchors
+    import builtins
+    raw=builtins.open
+    def denied(file,*a,**kw):
+        if str(file)==str(binary):raise PermissionError('denied')
+        return raw(file,*a,**kw)
+    monkeypatch.setattr(builtins,'open',denied)
+    with pytest.raises(PermissionError):c.m.configuration_name_anchors({}, {'trees':{path:'clone'}},[str(binary)])
+
+
+def test_nested_independent_clone_is_project_owned_even_if_clean_published(case):
+    c=case;target=c.repo/'.local/evidence/upstream'
+    shell('git','clone','-q',str(c.bare),str(target));age(c.repo)
+    row=plan(c,target)
+    assert row['action']=='keep' and row['reason']==f'嵌套于 {c.repo}，由该项目自行保留'
+
+
+def test_nested_linked_worktree_is_project_owned(case):
+    c=case;target=linked(c);age(c.repo)
+    row=plan(c,target,'linked')
+    assert row['action']=='keep' and row['reason']==f'嵌套于 {c.repo}，由该项目自行保留'
+
+
+@pytest.mark.parametrize('hours,eligible', [(68,False),(167,False),(169,True),(240,True)])
+def test_every_location_requires_seven_days_idle(case, hours, eligible):
+    c=case;stamp=time.time()-hours*3600
+    for parent,dirs,files in os.walk(c.repo):
+        for name in dirs+files:os.utime(Path(parent,name),(stamp,stamp),follow_symlinks=False)
+        os.utime(parent,(stamp,stamp))
+    row=plan(c)
+    assert (row['action']=='remove') is eligible,row
+    if not eligible:assert '168h' in row['reason']
+
+
+def test_name_configuration_sources_exclude_history_and_follow_config_aliases(case, monkeypatch):
+    c=case;home=c.root/'login';home.mkdir();config=home/'.config';config.mkdir()
+    dot=home/'.tmux.conf';dot.write_text('plugin')
+    history=home/'.bash_history-45871.tmp';history.write_text('not config')
+    nested=config/'deep';nested.mkdir();(nested/'settings').write_text('plugin')
+    external=c.root/'external-config';external.mkdir();(external/'tool.conf').write_text('plugin')
+    (config/'linked').symlink_to(external,target_is_directory=True)
+    empty=c.root/'empty-etc';empty.mkdir();raw=c.m.os.scandir
+    monkeypatch.setattr(c.m.pwd,'getpwall',lambda:[SimpleNamespace(pw_dir=str(home))])
+    monkeypatch.setattr(c.m.os,'scandir',lambda p:raw(empty if str(p)=='/etc' else p))
+    paths=set(c.m.name_config_sources())
+    assert str(dot) in paths and str(nested/'settings') in paths and str(config/'linked/tool.conf') in paths
+    assert str(history) not in paths
+
+
+def test_configuration_name_collision_keeps_all_matching_clones(case):
+    c=case;other=str(c.root/'backup');cfg=c.root/'settings';cfg.write_text('group/repo')
+    inventory={'trees':{str(c.repo):'clone',other:'clone'},
+               'remote_urls':{str(c.repo):['git.example/group/repo'],other:['git.example/group/repo']}}
+    anchors={};c.m.configuration_name_anchors(anchors,inventory,[str(cfg)])
+    assert all('collision' in c.m.ws.anchored(anchors,p) for p in inventory['trees'])
+    assert all(x['collision'] for x in inventory['configuration_name_references'])
+
+
+def test_reviewed_preview_detects_additional_candidates_and_types(case):
+    c=case;p=c.root/'reviewed.json'
+    p.write_text(json.dumps({'mode':'dry-run','complete':True,'error':None,
+        'items':[{'path':str(c.repo),'type':'clone','action':'remove'}]}))
+    allowed={'path':str(c.repo),'type':'clone','action':'archive+remove'}
+    assert c.m.reviewed_comparison([allowed],p)['added']==[]
+    added=dict(allowed,path=str(c.root/'new'))
+    assert c.m.reviewed_comparison([allowed,added],p)['added']==[{'path':added['path'],'type':'clone'}]
+    assert c.m.reviewed_comparison([dict(allowed,type='linked')],p)['added']
+    p.write_text(json.dumps({'mode':'execute','complete':True}))
+    with pytest.raises(c.m.ws.Keep):c.m.reviewed_comparison([allowed],p)
+
+
+def test_new_candidate_stops_execution_before_archive_or_remove(case, monkeypatch):
+    c=case;old=c.root/'reviewed.json';old.write_text(json.dumps({'mode':'dry-run','complete':True,'error':None,
+      'items':[{'path':str(c.repo),'type':'clone','action':'remove'}]}))
+    other=c.root/'new-candidate';other.mkdir()
+    inventory={'trees':{str(c.repo):'clone',str(other):'clone'},'bare':[],'links':[],'errors':[],'excluded':{},'directories':2}
+    monkeypatch.setattr(c.m,'managed_roots',lambda:set())
+    monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
+    monkeypatch.setattr(c.m,'references',lambda _: {})
+    monkeypatch.setattr(c.m,'usage',lambda _: ({},[]))
+    monkeypatch.setattr(c.m,'plan',lambda path,kind,*a: {'path':path,'type':kind,'action':'remove','archives':[]})
+    def forbidden(*a,**kw):raise AssertionError('execution must not start')
+    monkeypatch.setattr(c.m,'execute',forbidden)
+    state=c.root/'state'
+    assert c.m.main(['--execute','--reviewed-preview',str(old),'--state-dir',str(state)])==1
+    report=json.loads(next(state.glob('*.json')).read_text())
+    assert not report['complete'] and report['reviewed_comparison']['added']==[{'path':str(other),'type':'clone'}]
+    assert c.repo.exists() and other.exists()
+
+
+def test_failure_of_one_project_task_inventory_is_not_ignored(case, monkeypatch):
+    c=case
+    def command(cmd,**kw):
+        if cmd[1]=='project':data=[{'id':'p','sources':[]}]
+        elif cmd[1]=='environment':data=[]
+        elif cmd[cmd.index('--project')+1]=='proj_personal':raise RuntimeError('personal unreadable')
+        else:data=[]
+        return SimpleNamespace(stdout=json.dumps(data))
+    monkeypatch.setattr(c.m,'command',command)
+    with pytest.raises(RuntimeError,match='personal unreadable'):c.m.bb_anchors({})
