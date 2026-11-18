@@ -244,9 +244,11 @@ lightspace 侧收窄；全机共享资源统一由本仓的 `go_cache_trim.py`�
   它不参与自动修剪。重下载成本和“删了还能再下”是两件事，只有 owner 批准的
   `go clean -modcache` 才动。
 
-### 3.5 全盘 Git 工作树（2026-11-17）
+### 3.5 全盘 Git 工作树（2026-11-17；2026-11-18拆分linked）
 
-一个入口 `git_tree_sweep.py` 同时发现独立 clone 和 linked worktree。两块本地盘 `/`、`/data`
+当前 `worktree_sweep.py` 走 Git 登记的 linked 快速路径（24h），`git_tree_sweep.py` 走独立 clone 全盘路径（7天）；详见文末2026-11-18决策。以下先说明全盘发现与clone恢复契约的建立过程。
+
+全盘发现入口 `git_tree_sweep.py` 同时发现独立 clone 和 linked worktree。两块本地盘 `/`、`/data`
 分别 `-xdev`，不按路径、深度、隐藏目录或是否受另一仓库忽略来筛选。发现与删除资格分开：
 每个发现对象都进入报告，损坏 gitdir 也列出，但无法读取状态就保留。
 
@@ -261,16 +263,16 @@ worktree 和 thread-storage。容器路径不是恢复契约：扩几个白名�
 cron、BB 自动化命令。保护的是含引用的工作树；引用 thread-storage 父目录并不笼统保护其每个子 clone。
 主仓库有 linked worktree、父树含其他仓库时也保留，避免破坏共同 Git 元数据或嵌套树。
 
-判定取两个旧脚本的严格条件（2026-11-17追加：全树闲置统一7天，旧24h不再适用）：含全部 untracked 的 clean status、无 stash/操作/锁、
+独立clone判定取两个旧脚本的严格条件（统一闲置7天；linked已按最新方向另用24h）：含全部 untracked 的 clean status、无 stash/操作/锁、
 ignored 无凭据，每个 branch/HEAD/tag 都能恢复。旧 linked 的 WIP 快照、ignored 凭据主树同内容豁免，
 以及 committer-check 压缩归档都不再允许。归档必须保留原始 SHA 和历史，失败保留。
 全批远端 IO 完成后刷新发现与引用，随后重核本地状态再进入 sink。linked 只调主仓库的无 force
 `git worktree remove`；clone 绑定 ancestor fd 后只删除自身，不跟随软链。
 
 旧版先删目录再删除 BB 环境，曾为 dangling 环境补扫；当前政策改为任何未销毁环境都保护路径，
-因此不再自动调用 `bb environment delete`。旧两个脚本仍提供 helper 和旧行为回归 API，但 CLI 均转发新脚本；旧06:45任务停用且改为空操作，防止水位旧快照手动派发旧执行器。
-全盘发现约150万目录，旧12分钟轮次预算不足；完整实测一轮863秒，距BB单次900秒硬上限仅37秒余量，无法覆盖负载波动。因此06:30任务只启动systemd transient oneshot，worker内部30分钟、硬时限33分钟，结束后collect；维持全盘范围，拒绝用深度/路径白名单换速度。
-每日 06:30 先只预演；完整候选清单、保留原因、扫描覆盖/unknown 与耗时供 owner 审核后才开执行。
+因此不再自动调用 `bb environment delete`。旧两个脚本仍提供 helper 和旧行为回归 API；worktree CLI转linked_main，tmp clone CLI转clone主函数；旧06:45任务停用且改为空操作，防止水位旧快照手动派发旧执行器。
+全盘发现约150万目录，旧12分钟轮次预算不足；完整实测一轮863秒，距BB单次900秒硬上限仅37秒余量，无法覆盖负载波动。因此06:30任务只启动systemd transient service，结束后collect；当前先linked15分钟，再clone预演45分钟/执行150分钟，整体硬限63/168分钟。维持全盘发现范围，不用深度或路径白名单换速度。
+最初仅部署预演，owner完成逐轮审核后已授权06:30执行；每次规则变化仍先验证预演和对应授权。
 
 2026-11-17 引用未知范围修订：首轮 25 条解析未知把所有 2,358 个 Git 标记都保留，
 其中许多来自暂停/过期任务的循环；这种全局传播会使执行长期没有候选。unknown 仍是保护证据，
@@ -510,3 +512,51 @@ owner授权新候选为旧131项子集且指定在用/证据树排除后即可�
 只读BB自动化列表现按项目并行采集，任一项目失败仍拒绝消费部分库存；每个执行复核都重新采集，不缓存保护证据。宿主实测usage由115.46秒降到84.39秒，预算仍先保留150分钟，等待真实执行测量。
 
 首次实测：预演1157.459秒，执行3633.691秒（20个clone、9个archive ref），准备开始时与归档后完整重扫，且每个sink重新usage/local_state。按已测较慢usage115.46秒估算40次检查加两次发现和计量，保留150分钟/硬153分钟预算覆盖负载差异；超预算仍保留，不以削减范围或复核频率换速度。原目录du合计6.209614GiB；删除窗口可用净增6.155987GiB，全程两盘仅净增2.325294GiB。后两者都含同期其他活动，不能将du或长窗口df差当成严格因果释放量。
+
+### 2026-11-18：alternates方向与自动化解释器
+
+对象借用是有方向的：删借用方只移除自身文件，不会删除外部对象库；需要保护的是被借用对象的一方。过去把“本仓有alternates”直接当保留条件混淆了恢复证明与反向引用。现取消该条件，保留所有真实alternates引用源扫描，并将借用配置mtime纳入活动证据；借用方的全部refs仍必须有实时远端证明或先归档核原SHA。
+
+mono2的10个Python自动化曾产生17条shell式for未知表达式，导致同remote的整组clone被保留。按execution.interpreter区分Python3后，通过AST只读收集Path/文件调用及可证明的前缀；Python数据循环不再成为路径未知。未知文件操作数、语法错误、无法界定的局部绑定仍保留项目范围；不执行脚本、Shell或其导入。原子写入临时文件、BB automation-storage真实cwd和datetime.replace各自按其语义处理。
+
+本次发现mono2/.worktrees另有独立保护：所有19棵已发现树均嵌套于Git工作树/data/code/mono2，按11-17 owner规则属于父项目；修正alternates/未知引用不会放行。保留此规则，并逐树报告所有自动化阻断，供owner决定后续是否调整生产端或项目保留策略。
+
+2026-11-18计时校准：当日完整执行含2次删除及最终复扫，耗1905.630秒，不能直接当作纯预演耗时；本轮纯预演实测1039.615秒。新预演预算45分钟/硬48分钟，为全盘发现和计量的负载波动留余量；执行预算保留150/153分钟，不缩小发现范围。
+
+本轮审查补齐：容器下标/原地变更及别名使有限路径失效，循环内变更不得复用首轮值；文件调用的关键字/不透明kwargs、相对replace目标和chdir参数均进入引用判定。无法解析的值保留unknown，不因路径为相对字符串或参数不在位置列表而漏保。
+
+### 2026-11-18：嵌套保护限定第三方快照
+
+把所有嵌套树都归父项目保留，会让mono2自己的.worktrees永远不能清理。owner明确收窄：是父仓的linked工作树，或与父仓任一规范化有效remote同源的副本，不适用嵌套保护，仍完整检查7天、干净、BB环境/进程/引用与原SHA恢复证明；异源/无remote/未知关系继续保护DMCA和evidence。多层包含逐层核验，不能借内层同源越过异源外层。
+
+同源结论在每次local_state重读common gitdir与有效fetch/push URL，复用Git rewrite和本地物理地址归一逻辑；父仓改remote不一定触动子树mtime，所以不能在删除时复用计划时的remote身份。linked的登记、锁和主仓可用性仍由原metadata检查；同源不是删除证明。回归覆盖同源linked/clone候选、异源dmca和无remote保留、无remote的linked继续恢复检查、脏树/BB环境保留、父remote变更后sink拒绝、多remote及重写归一、多层异源外层保护。
+
+旧131项子集检查用来验证当次规则差异；把自然达到7天的128KiB候选当作新规则扩张停下，是对该条件的过度解释。owner已接受dd88的4项候选，今后自然到期按既有规则处理；本轮只需证明规则变化带来的新增来自同源嵌套收窄，不建立路径白名单。
+
+独立审查发现：remote集合相交不具有传递性，A外仓/B证据仓中的A+B子clone可与两个祖先分别相交，不能据此越过证据仓的异源边界。现逐对核验相邻Git祖先。桥接回归在1318旧快照明确失败，修复后381项Git回归及336项兼容测试全通过，最终快照0c547e019c0d46ea。
+
+逐树报告必须展示叠加保护：本轮解除mono2的14棵同源嵌套保护后，才在首要原因桶看到系统unit中的wisp/mono2名称碰撞（全部14棵都命中）、BB环境和容器引用；auto_3yhlnd21-wo也同时保护这14棵。只看先命中规则会把“删除一个阻断就能释放”误当结论。报告现同时列名称引用、BB环境、未知自动化及首要原因，并明确先命中保护后尚未继续评估的Git状态/闲置条件。
+
+
+2026-11-18三项引用范围修正：上轮同源嵌套已放行，但cwd=/data/code的bridge worker仍使所有子仓库受保护；cwd只证明包含它的那棵树在用，现仅锚定cwd点。HOME和XDG仍可能装有未打开的插件，维持子树及根/挂载点/登录home例外。
+
+名称引用证明同源副本中至少一份在用，不证明每份都在用。现先收集非名称证据，再把名称绑定到已有保留副本；名称证据不能互相循环满足。不存在的目录不算副本，选择前后核物理身份。其他副本仍须通过所有清洁、7天和远端证明条件；没有其他保留副本时歧义全保。lighthouse-bak遵守同一规则，不设置路径豁免。
+
+auto_3yhlnd21-wo从字面路径deploy-after-security.json读取environmentPath，当前值是/data/code/bb-codex-home-package/.worktrees/tooling。此前不读取状态而将helper *args视为未知，按其非Git项目源/data/code和登记环境remote扩展，误护mono2副本。现静态识别标准JSON读取，读取当前有界普通文件并核身份，跟踪字段、get和已知参数向量；缺失、定制decoder、无法证明的改写或逃逸保持unknown，不执行自动化代码。每轮占用复核重新读取状态；容器项目的unknown仅保护源点和登记环境，不能从这些环境remote传播到别的项目。
+
+删除前复核补齐先前审查缺口：全批网络IO后的一次完整库存不足以服务多个sink。现每项删除都重新完成两盘发现、remote/alternates引用和占用解析；真实回归在首项删除后创建第二项的本地remote消费者，旧版误删第二项，新版保留。新增扫描耗时纳入150分钟执行预算，预算用尽保留余项，不能为追求单轮删除量省略复核。
+
+本轮独立审查thr_dyswdnb64k指出两项JSON传播缺口：对象嵌入容器/星号参数逃逸后不能继续信任旧字段，os.open写flags与os.write也可能改变稍后读取的文件。已补容器别名、参数污染与低层写入识别；非UTF8文本打开不能套用UTF8字段值，同步保留unknown。12条针对性回归在修复前失败，修复后JSON相关42项通过，真实auto3y仍精确解析tooling且无unknown。
+
+
+2026-11-18 linked快速路径：owner反馈通用清理太难太慢，明确要求把linked从全盘clone判定中拆出。旧流程三项收窄虽然预演成功，但每个sink前全盘复核让34项clone积压需要数小时；已在初始扫描停止旧人工执行，归档/删除均为0。新linked路径只读取BB项目/环境及最近完整发现库存来定位主仓，重新读Git登记；每项只复核locked、BB环境、cwd、所在分支和24小时活动，由Git remove最终判断clean/ignored/submodule，不使用force和raw delete fallback。其他共享分支/tag/stash保存在主仓，无需随每个linked重复归档；主仓仍按原clone规则保护。
+
+24h应衡量该worktree自己的工作文件、gitdir和分支ref/reflog，不能用共享common gitdir的fetch活动把全部副本刷新为近期。名称/项目fallback/嵌套/alternates等证据保留给独立clone，不再推导linked所有权。`git worktree prune`仅让Git清理已失效登记，不删除无法判定的残缺工作目录。BB/进程读取未知仍保留对应快速路径。
+
+部署仍只有一个06:30入口，但worker先linked（15m），后clone（45m预演/150m执行），两条路径分别写完整JSON/JSONL；一条失败仍运行另一条并传播非零。整体硬限63m/168m。人工可以单独预演/执行linked，不因验证Git登记清理而等待clone全盘扫描；clone完整发现继续刷新后续快速路径可用的主仓索引。旧linked helper API留作历史回归，生产CLI指向linked_main；tmp helper CLI指向clone主函数。
+
+linked审查收尾：thr_d2prih37sv发现self local/file remote会把共享本地refs误当外部恢复证明，现排除落在待删树内、同common Git存储及无法证明独立的本地endpoint。主仓登记还会再从实际primary重读，避免备份复制的gitdir覆盖真实列表。当前分支在origin取得实时heads证明就不等待无关remote；无证明时只可计划允许的原SHA归档，执行核验失败仍保留。8项回归在修复前失败，修复后通过；实际执行报告保留最新远端证明。prune按显式Git命令的默认语义判断失效登记，不额外传expire覆盖项；锁定登记仍由Git保留。实测gc.worktreePruneExpire约束git gc，不阻止显式worktree prune。
+
+linked年龄补充：计算工作树文件/目录和自身gitdir的实际文件（index、HEAD、FETCH_HEAD、reflog等）mtime，不以Git管理目录自身mtime作为活动。实测3棵mono2树仅管理目录被临时锁/探针刷新，实际文件均旧于24h；目录mtime不应使它们永久刷活。此修正只用于linked，clone保持原7天全部元数据规则。
+
+linked首次实测：完整预演128.080秒、执行278.043秒，27候选中10删除/17保留，mono2删除6棵。Git对13棵回指不一致的登记拒绝remove，符合“Git拒绝就保留”，未修登记来绕过拒绝；其余4项因远端不存在/无凭据保留。9个原SHA归档ref独立核验通过，7棵虽归档但Git拒绝仍保留。15分钟预算有实测裕量；失败登记不需要恢复通用clone启发式。总删除窗口可用净增9.131GiB（mono2 5.744GiB），与原du9.064GiB（mono2 5.720GiB）分列，差异含并发活动。06:30已部署6d0208714b86c771，两条路径仍分开报告；完整逐linked证据在linked-fastpath-20261118/REPORT.md。本轮不再等待独立clone数小时批次，独立clone由原每日策略继续处理。

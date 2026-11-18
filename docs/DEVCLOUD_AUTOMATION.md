@@ -5,7 +5,7 @@
 设计原因和踩坑记录见 [DEVCLOUD_STORAGE_DESIGN](DEVCLOUD_STORAGE_DESIGN.md)；
 逐目标能不能清的规则见
 [storage-rules](../.claude/skills/devcloud-patrol/references/storage-rules.md)。
-任务现状以 `bb automation list` / `bb automation show` 为准，本文是撰写时快照（Git 部分更新于 2026-11-17）。
+任务现状以 `bb automation list` / `bb automation show` 为准，本文是撰写时快照（Git 部分更新于 2026-11-18）。
 
 ## 1. 现行任务
 
@@ -79,7 +79,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 |---|---|---|---|---|---|
 | Docker 残留 | `auto_1ih1erjpbqo` | 每小时第 7 分 | `/var/tmp` | `${PY} -I <snap>/docker_leftovers.py --execute --quiet` | `skipped`，exit 0 |
 | Go 缓存修剪 | `auto_vad6yvkpdeq` | 每小时第 37 分 | `/var/tmp` | `${PY} -I <snap>/go_cache_trim.py --execute --quiet` | `skipped`，exit 0 |
-| 全盘 Git 工作树 | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `bash <git-snap>/git_tree_sweep_run.sh --execute` | 输出异步报告位置；实际结果以完整JSON/JSONL为准 |
+| Git linked→独立clone | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `bash <git-snap>/git_tree_sweep_run.sh --execute` | 输出异步报告位置；实际结果以完整JSON/JSONL为准 |
 | 旧 tmp 独立 clone | `auto_3jiqtmzreq8` | 已停用 | `/var/tmp` | 保留历史记录；新统一入口覆盖其范围 | enabled=false |
 | pnpm store prune | `auto_yfr5p14dvnc` | 周日 05:30 | `/data/code/mole-linux` | `${PY} -I <snap>/pnpm_store_prune.py --execute --quiet` | `skipped`，exit 0 |
 
@@ -100,7 +100,7 @@ export PATH=/root/.nvm/versions/node/v24.22.1/bin:/root/.nvm/versions/node/v24.1
 在 `/var/tmp` 或 `/data` 下解析会得到不同的 store。拿到共同根 `/data/.pnpm-store` 后，
 逐版本工具从中立目录运行并显式传 `--store-dir /data/.pnpm-store`，不能把 `vN` 目录当根。
 
-脚本任务超时：Docker/Go 600 秒，pnpm 900 秒。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 内部预算1800秒、systemd RuntimeMaxSec=1980秒。实测12分钟内部预算不足；完整一轮863秒距BB900秒硬上限仅37秒裕量，不能缩小发现范围来迁就BB上限。最终实测与裕量见交付快照报告。`--quiet` 只表示“没有实际
+脚本任务超时：Docker/Go 600 秒，pnpm 900 秒。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 先给 linked 15分钟，再给独立 clone 预演45分钟/执行150分钟，systemd 整体硬限分别63分钟/168分钟。预算按两条路径实测分别设置，不缩小发现范围。`--quiet` 只表示“没有实际
 清理且命令没有失败时保持安静”，BB 把它记为 `skipped`；`skipped` 不是失败。
 
 每日检查是 agent 任务，不是脚本任务：
@@ -121,33 +121,24 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 ## 2. 不可变快照与发布
 
 仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`，仅含
-`git_tree_sweep.py`、`git_tree_sweep_run.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 四个文件和 `manifest.json`；
-后两个提供 helper/历史回归 API，CLI 均转发统一入口。当前 Git 专用快照为 `9656f1207a402a82`（2026-11-17；四个文件与 manifest，文件0444/目录0555），其他任务不跟随更换快照。launcher 用固定 transient unit `devcloud-git-tree-sweep.service` 启动 worker（cwd=/）；active/activating/deactivating 时跳过，状态未知拒绝启动；`--collect` 在结束后回收单元，不常驻监控。其他 Docker/Go/pnpm/水位/计量任务继续使用各自现有快照。
+当前快照为 `/data/tools/devcloud-storage-upkeep/releases/6d0208714b86c771/`，包含
+`git_tree_sweep.py`、`git_tree_sweep_run.sh`、`git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 五个脚本和 `manifest.json`。
+launcher创建同一个有时限的systemd unit，worker先运行linked登记路径，再运行独立clone全盘路径；cwd=/，BB只负责120秒内启动。其他维护任务继续使用各自已有快照。
 
-1. 每个脚本记录 sha256 与 mode=0444；`manifest.json` 用稳定 JSON 编码与末尾换行，
-   `<sha16>` = **manifest 实际字节** sha256 前16位。新目录 `/data/tools/devcloud-storage-upkeep/releases/<sha16>`，
-   文件0444、目录0555，不覆盖旧快照。
-2. `python3 -I <git-snap>/git_tree_sweep.py --help` 后复算 manifest、脚本哈希与模式，确认仅五个文件、无 pycache。
-3. 先在宿主机运行无 `--execute` 的首轮预演，保存完整 JSON/JSONL、按路径候选表及保留原因。
-   沙箱 `/proc` 和人工 `.git` 挂载不代表宿主机；用 BB script runner 在宿主机运行。
-4. 以短文件名 `git-tree.sh`，`bb automation update auto_hukidoavox0 --project proj_8d3wrcajxn
-   --script-file <file> --timeout 2m`。更新必须检查返回码；失败时绝不继续 `run` 旧命令。
-   用 show 读回存储脚本内容，确认当前预演不含 `--execute`、cron=`30 6 * * *`、Asia/Shanghai、timeout=120000。
-5. 旧 `auto_3jiqtmzreq8` 替换为空操作脚本并 pause，确认 enabled=false；因为 paused 仍可能被旧水位逻辑手动派发，不能只 pause；
-   每日检查 prompt 同步此状态、首轮清单/完整性和预演模式。保留旧任务历史，不让两个入口并行。
-6. 2026-11-17 owner 已给条件授权：新完整预演候选 `(path,type)` 是旧131项的子集，且 tmux两项、实例HOME下codebuddy、dmca/upstream、evidence全部保留，即开启06:30执行并手动执行一次。有新增候选保持预演并回报。
-   名称引用碰撞继续保留；lighthouse-bak 的 api/lightglobal/lightpro 不设路径豁免。
-7. 条件满足后更新保存脚本为 `bash <git-snap>/git_tree_sweep_run.sh --execute`，check成功并读回核对模式后才手动执行。
-   首批使用 `bash <git-snap>/git_tree_sweep_run.sh --execute --reviewed-preview <新预演JSON>`；若本批有新增候选，零归档零删除，恢复定时预演并回报。
-   `--reviewed-preview` 仅约束本批，不给以后的动态清理建立路径白名单。
-8. 每个 sink 前继续重读完整占用，不使用历史库存。预演30分钟/硬33分钟；执行150分钟/硬153分钟，首次实测后校准。
-   BB脚本仍只负责120秒内启动，worker独立运行；记录实际删除/归档、保留/失败、目录原实占以及两盘df净变化。
+1. 5脚本各记sha256，manifest稳定JSON+换行，目录名取manifest哈希前16位，文件0444/目录0555。两个Python入口与launcher的help均验证成功且无pycache。
+2. linked先运行 `python3 -I <snap>/worktree_sweep.py --json`；完整后用其专用预演文件执行 `--execute --reviewed-preview <linked-preview.json>`。只读Git登记定位不重扫磁盘；主仓来自实时BB source/环境和最近一次完整两盘发现库存。无缓存的初次安装先用clone全盘预演建立库存。
+3. clone入口 `python3 -I <snap>/git_tree_sweep.py --json` 保持7天、全部原引用/凭据/恢复证明规则；只送独立clone进通用计划，linked仅作为引用来源/下次主仓索引。其人工执行只绑定自己的clone预演，不混用linked预演。
+4. 部署保存脚本 `bash <snap>/git_tree_sweep_run.sh --execute`，读回enabled、cron=30 6 * * *、Asia/Shanghai、timeout=120000及命令快照。launcher只接受无参数或--execute；手动绑定预演使用上面各自Python入口。
+5. 旧tmp任务auto_3jiqtmzreq8保持disabled+noop，不恢复或手动触发；每日检查prompt同步读回。其余维护任务不跟随更换快照。
+6. linked只按最新Git登记五条件、24h和Git remove/no-force判断，网络后立即复核BB/cwd/登记/HEAD/age/clean；实际Git状态文件计活动，不让管理目录的临时锁mtime刷活。Git prune按显式命令清失效登记，锁定登记仍保留。单主仓无法读登记只保留并报告该主仓，不扩大成全局阻断；BB/cwd整体读取未知则该阶段不执行。
+7. linked预算15m；clone预算预演45m/执行150m；同一worker整体硬限预演63m/执行168m。一阶段失败仍尝试另一阶段并最终非零。06:30执行最迟09:18，07:30可为clone记pending，linked必须已有完整结果；同时检查上一轮已结束结果。
+8. 两阶段分别写linked-worktree-sweep-<UTC>.json(l)（schema3/policy=linked）和git-tree-sweep-<UTC>.json(l)（schema2/policy=clones）。逐路径删除/保留/原SHA归档与Git拒绝原因、prune输出、目录原du及两盘可用容量变化分列。人工单独linked验证不算首次完整schedule。
 
 只读复现（命令不带路径筛选参数）：
 
 ```bash
-python3 -I <git-snap>/git_tree_sweep.py --budget-minutes 30 --json
-# 定时等价：bash <git-snap>/git_tree_sweep_run.sh；异步 worker 受 systemd 33 分钟硬时限约束
+python3 -I <git-snap>/git_tree_sweep.py --budget-minutes 45 --json
+# 定时等价：bash <git-snap>/git_tree_sweep_run.sh；linked→clone，预演整体硬限63分钟
 python3 -m pytest tests/test_git_tree_sweep.py tests/test_devcloud_storage_upkeep.py -q
 bb automation show auto_hukidoavox0 --project proj_8d3wrcajxn --json
 bb automation show auto_3jiqtmzreq8 --project proj_8d3wrcajxn --json
@@ -159,6 +150,7 @@ bb automation runs auto_hukidoavox0 --project proj_8d3wrcajxn --limit 3 --json
 JSON 报告在 `~/.local/state/devcloud-storage-upkeep/git-tree-sweep-<UTC>.json`；
 JSONL 同前缀，含阶段时点与每对象证据。schema_version=2 的 `unresolved` 每条含 source、expression、scope、
 绝对 prefixes 或项目归属，以及实际 protected_paths；按前缀或项目限定的 unknown 不阻断其他路径。
+名称引用明细在`discovery.configuration_name_references`（同时查看`satisfied_by/other_reason/protected_by_name`）；JSON状态按每次usage重新读取，无跨轮缓存。非Git项目容器的unknown标`project_scope_kind=source-points-and-environments`，不借环境remote扩散。
 `global_unresolved` 只列无前缀且无归属的表达式，非空才使整轮因引用未知保留。暂停任务同样参与。
 只读复现先查看每条 `unresolved[].protected_paths`，再导出 `items` 中 action 为 remove/archive+remove 的路径、类型、bytes、
 idle_hours、objects、remote_proofs、archive_objects；archive+remove 尚未完成归档，不能报成可直接删除。
@@ -170,7 +162,7 @@ idle_hours、objects、remote_proofs、archive_objects；archive+remove 尚未�
 131候选（122 remove、9 archive+remove）；逐路径实占合计13.618 GiB，不是实际释放量。最终明细和逐条保护范围见线程审核包：
 `/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/scoped-rework/REPORT.md`。人工预演不算首次schedule运行。
 
-`bb automation` 的 succeeded 仅表示 worker 启动成功；实际成功以最新 JSON 报告和 JSONL 完整阶段为准。每日07:30读取报告：预演应在07:03前结束；执行可能仍在150分钟预算内，硬时限为启动后153分钟（06:30启动则09:03）。核对本轮JSONL start时间与mode，预算内仍运行记pending并明确尚无完成结论，不能拿前一轮报告冒充本轮成功，同时核对上一轮已结束的完整报告及失败项，防止每天pending掩盖上一轮失败；超限或停止后无完整报告算失败。`systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result` 可查在途状态；collect 后 unit not-found 属正常，仍必须有当日完整报告。
+`bb automation` 的 succeeded 仅表示 worker 启动成功；实际成功以最新 JSON 报告和 JSONL 完整阶段为准。每日07:30读取两条路径的报告：linked 应已结束；全轮预演硬截止为07:33，执行整体硬截止为09:18（均以06:30启动计）。clone 仍在自身预算内运行时记 pending。核对本轮JSONL start时间与mode，预算内仍运行记pending并明确尚无完成结论，不能拿前一轮报告冒充本轮成功，同时核对上一轮已结束的完整报告及失败项，防止每天pending掩盖上一轮失败；超限或停止后无完整报告算失败。`systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result` 可查在途状态；collect 后 unit not-found 属正常，仍必须有当日完整报告。
 
 linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` 后
 `git worktree add <path> <sha>`；独立 clone 用记录 URL clone 后恢复每个 branch/tag。
@@ -337,3 +329,28 @@ readlink -f /root/.cache/go-build /root/.cache/golangci-lint
 2026-11-17追加证据规则的全量预演（9656f1207a402a82）：扫描1,754,216目录、2,417个Git标记；738.916秒完成发现，790.177秒引用库存，822.100秒计划，总1157.459秒。20个clone候选（15 remove、5 archive+remove，9个ref待归档），实占6.210GiB，全部是旧131项子集，无新增候选。118条unknown为70 prefix/48 project、0 global，实际保护132棵树。tmux/codebuddy/dmca/evidence已保留，lighthouse-bak三项按名称碰撞保留。授权条件已核验，06:30保存脚本已切换--execute；首次人工执行使用--reviewed-preview绑定本次完整预演。报告见 `/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/owner-evidence/REPORT.md`、`subset-comparison.json` 与 `protections.md`（同线程审核包目录）。
 
 首批人工执行（20261117T075718Z，9656快照）：完整成功，20/20个clone已删除，9个archive ref/5个唯一SHA均核验，未删除与失败0；耗时3633.691秒（60分34秒），reviewed_comparison.added=[]。删除目录原实占6.209614GiB；删除窗口可用净增6.155987GiB，全程系统盘/数据盘可用净增0.330288/1.995007GiB（含同期其他活动）。证据见同审核包 `EXECUTION.md`、`archives.tsv`、`removed.tsv`、`final-validation.json`。06:30已启用--execute；首次新版schedule尚待次日，人工执行不算schedule。
+
+2026-11-18复现：在新不可变快照运行默认全量预演；逐条导出unresolved的automation_id/name/enabled/last_run_at、expression、prefixes及protected_paths。对/data/code/mono2/.worktrees下每棵树列出最终原因与所有仍保护它的自动化，不只看优先命中的保留桶。比较新旧候选，新增项必须能追溯到去掉借用方alternates拒绝或按Python解释器修正未知引用；近期、脏树、引用、嵌套等条件不变。满足才更新每日执行并用--reviewed-preview绑定新预演手动执行。
+
+前一轮预演（dd88e12c889a8f7c，20261118T012347Z）：709项回归通过，两轮只读审查发现均修复；扫描1,752,924目录、2,337标记，完整成功1039.615秒。4候选实占1.573666GiB，其中3项来自Python引用收窄；另1项 `/root/.agentflow/knowledge-cache/kb-git-1b7bb0e0b2f5a8bb`（128KiB）仅因自然满7天而新增，不符合本轮条件授权，因此未切换每日执行、未手动执行、未归档或删除。线上仍9656快照，工作区的新版每日检查prompt尚未部署。mono2/.worktrees总占24.980549GiB，19棵Git树全部因嵌套保留；其中14棵还受已暂停的auto_3yhlnd21-wo动态environmentPath保护。原mono2项目10条自动化的17条Python循环误报已解除，每条对这里的保护由17棵变为0。逐树、逐自动化及每条未知的全部保护路径见 `/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/alternates-scope-20261118/REPORT.md`。新版本仍待本次新增候选审核，不以路径豁免绕过。
+
+2026-11-18 owner复核澄清：已接受dd88预演4项；自然达到7天不需重新审批。新增同源嵌套例外，逐层比较当前common gitdir或有效fetch/push remote身份；异源、无remote及关系未知的树继续按父项目保留。发布需新快照全盘预演、规则来源核验、06:30脚本和每日检查prompt读回一致，再绑定新预演手动执行；auto_3yhlnd21-wo真实未知仍保留并单列。
+
+最终发布与执行（0c547e019c0d46ea）：717项测试通过，Codex只读审查thr_g3zqb7f7mc的一项多remote桥接P1已修复并经旧版红灯/新版绿灯验证。完整预演1062.737秒，候选仍为owner接受的4项，无规则收窄新增；06:30保存脚本已切到新版--execute，每日检查prompt已更新并读回相同。首批绑定预演执行2066.148秒（34分26秒），added=[]：删除QQ修复linked worktree与agentflow知识库clone共2项，原du374571008B；12个tag按原SHA归档并独立远端复验。另agent-cli-profile-skills和hermes-agent由新出现的BB provider bridge worker（PID472396、cwd=/data/code）保护而保留，删除失败0。删除窗口可用净增368660480B；全程/data和/净变化为-2905645056B/-237510656B，含同期其他活动。mono2仍19树、容器26822660096B（24.980549GiB），本轮0删除/0释放；14同源树同时有名称碰撞与auto3y未知引用，5异源/未知保留，新BB进程cwd也覆盖这19树。证据=/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/nested-origin-20261118/REPORT.md。尚待首次新版schedule，人工执行不算schedule。
+
+2026-11-18三项引用范围收窄（1dfa3d6ab70611e6）：431项Git回归+336项兼容回归通过；独立审查thr_dyswdnb64k的两项JSON传播P1已修复并有12红/42绿回归。全盘预演1067.892秒，1,750,656目录/2,336树（2,182clone+154linked），34候选9.657GiB（29remove、5archive+remove）；117条unknown=72prefix+45project，0global。新候选来源均为三项授权收窄或不变规则自然生命周期，未发现意外扩大；06:30已切到1dfa执行，每日prompt已同步读回。mono2/.worktrees仍19棵、24.981GiB，无候选，原因已收敛为8棵近期7天/4BB环境/5异源嵌套/1alternates借出/1容器。auto3当前JSON精确保tooling，名称由mono2主树满足。每个sink现在都重做完整库存；本次34项积压的人工执行按实测668.759秒库存乘(N+2)、25%余量及30分钟网络/准备，单次预算540分钟/硬543分钟，仍绑定本次reviewed-preview。该轮日常预算为150/153分钟。该次人工执行在下述方向调整后于初始扫描阶段停止，归档/删除均0，不计首次新版schedule。证据=/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/evidence-resolution-20261118/。
+
+2026-11-18最新linked分工（以本段取代此前linked适用7天/全盘保护的描述）：
+
+- `worktree_sweep.py` CLI调用 `git_tree_sweep.py:linked_main`，主仓来源是BB项目source/环境和最近一次完整两盘发现库存，实时Git登记是真相。只查locked、未销毁BB环境、活进程cwd在树内、当前分支/HEAD已推送或原SHA归档、24h。Git status用于预演，Git remove无force作为最终判断；之后Git prune，仅清失效登记。名称、项目fallback、嵌套、alternates、HOME/XDG、配置/容器等全盘clone规则不用于linked。
+- `git_tree_sweep.py` 默认CLI只计划/执行独立clone，保持全部原7天保护；仍发现linked以建立clone引用索引和下次快速路径的已知主仓。`tmp_clone_sweep.py` CLI转发它。
+- launcher调用5脚本快照内的worker，先linked15m，再clone45/150m；整体硬限63/168m，cwd=/，BB启动超时120秒。一条失败仍尝试另一条，最终非零；各阶段有独立锁及完整报告。
+- linked报告=`linked-worktree-sweep-<UTC>.json(l)`，schema_version=3、policy=linked；clone报告仍`git-tree-sweep-<UTC>.json(l)`、schema_version=2、policy=clones。检查两份结果，不用clone耗时掩盖linked是否已完成。
+- 手动只验证本次变更：`python3 -I <snap>/worktree_sweep.py --json`，确认完整后 `python3 -I <snap>/worktree_sweep.py --execute --reviewed-preview <linked预演JSON> --json`。每项最终复核仅重读BB/进程cwd/Git登记/状态及当前分支，不重复全盘扫描。独立clone人工命令仍使用它自己的预演文件；launcher仅接受无参数或--execute，不混用两类预演。
+- 旧1dfa人工执行已于2026-11-18 12:56停止，尚在发现阶段，归档/删除均0。本轮人工执行针对linked；34个clone候选继续由原每日clone策略处理。尚未发生新版schedule时明示等待首次定时运行。
+
+linked年龄补充：计算工作树文件/目录和自身gitdir的实际文件（index、HEAD、FETCH_HEAD、reflog等）mtime，不以Git管理目录自身mtime作为活动。实测3棵mono2树仅管理目录被临时锁/探针刷新，实际文件均旧于24h；目录mtime不应使它们永久刷活。此修正只用于linked，clone保持原7天全部元数据规则。
+
+2026-11-18 linked最终发布与执行（6d0208714b86c771）：494项Git回归+336项兼容回归=830项通过；Codex只读审查thr_d2prih37sv的一项self local/file恢复证明P1已修复，8红/73绿验证，cwd容器bind子目录另1红→绿。独立clone九个核心判定函数与1dfa的AST相同。5脚本快照哈希/0444/0555/无pycache均核验。06:30 enabled、Asia/Shanghai、--execute、120秒launcher及每日prompt读回一致；新版首次schedule尚待运行。
+最终linked预演128.080秒，1118主仓、79登记linked+81未登记/残缺gitfile、27候选（13个ref待归档）；完整执行278.043秒，complete=true/error=null、added=[]。实际删除10棵，其中mono2 6棵；17候选保留（13个Git回指校验拒绝、3个归档仓库不存在、1个内部远端凭据不可用）。实际9ref均原SHA归档并独立ls-remote复验，其中2棵随后删除、7棵Git仍拒绝。1118主仓prune均成功，清10个失效登记，不计目录删除。
+删除10棵原du9732804608B（9.064GiB），删除窗口可用净增9804591104B（9.131GiB）；mono2六棵原du6141558784B（5.720GiB），对应窗口净增6167609344B（5.744GiB）。全程/data和/可用分别+7192014848B/+2202112000B，均含同期活动；执行后/data=275576782848B、/=210092060672B。mono2/.worktrees du从26983763968B降到20832604160B（25.131→19.402GiB）。13个有效登记linked中6删/7保留（4BB环境、1近期、1脏、1Git回指不一致）；另1残缺gitfile及5独立clone未删。17个独占测试根核无活cwd/exe/fd后清理，发生于容量采样后，单独记账。逐linked与mono2结果、删除/归档/失败清单、容量窗口和全部原始证据见/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/linked-fastpath-20261118/REPORT.md。源码、测试、规则与文档留工作区由owner提交，无commit/push。

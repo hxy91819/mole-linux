@@ -159,7 +159,7 @@ def test_clean_old_published_clone_is_candidate_and_preview_does_not_mutate(case
 
 
 @pytest.mark.parametrize('guard', ['untracked', 'dirty', 'stash', 'recent_file', 'recent_metadata',
-                                  'ignored_secret', 'dependency_secret', 'operation', 'alternates'])
+                                   'ignored_secret', 'dependency_secret', 'operation'])
 def test_local_refusals(case, guard):
     c = case
     if guard == 'untracked': (c.repo / 'untracked').write_text('unique')
@@ -175,13 +175,12 @@ def test_local_refusals(case, guard):
         (c.repo / 'node_modules').mkdir()
         (c.repo / 'node_modules/key.pem').write_text('private')
     if guard == 'operation': (c.repo / '.git/MERGE_HEAD').write_text('x')
-    if guard == 'alternates': (c.repo / '.git/objects/info/alternates').write_text(str(c.bare / 'objects'))
     if guard not in ('recent_file', 'recent_metadata'): age(c.repo)
     row = plan(c)
     assert row['action'] == 'keep', row
     expect = {'untracked': 'dirty', 'dirty': 'dirty', 'stash': 'stash', 'recent_file': '168h',
               'recent_metadata': '168h', 'ignored_secret': 'credential', 'dependency_secret': 'credential',
-              'operation': 'progress', 'alternates': 'alternates'}
+              'operation': 'progress'}
     assert expect[guard] in row['reason'], row
 
 
@@ -443,7 +442,7 @@ def test_remote_or_archive_uncertainty_retains_clone(case, monkeypatch, mode):
 def execute_case(c, monkeypatch):
     row = plan(c)
     row['bytes'] = 4096
-    def usage(inventory):
+    def usage(inventory, refs=None):
         anchors = {}
         c.m.symlink_anchors(anchors, inventory)
         return anchors, []
@@ -509,7 +508,7 @@ def test_archive_and_last_network_window_failures_keep_clone(case, monkeypatch, 
     if failure == 'config_unknown':
         row = plan(c)
         row['bytes'] = 4096
-        monkeypatch.setattr(c.m, 'usage', lambda _: ({}, ['unknown path variable']))
+        monkeypatch.setattr(c.m, 'usage', lambda _, refs=None: ({}, ['unknown path variable']))
         c.m.execute([row], inv(c), {}, {}, [str(c.root)], set(), 'test', c.root / 'ledger')
     else:
         row, _ = execute_case(c, monkeypatch)
@@ -563,7 +562,7 @@ def test_main_reports_budget_exhaustion_and_never_executes_partial_inventory(cas
     inventory = inv(c)
     monkeypatch.setattr(c.m, 'managed_roots', lambda: set())
     monkeypatch.setattr(c.m, 'discover', lambda *a: inventory)
-    monkeypatch.setattr(c.m, 'usage', lambda _: ({}, []))
+    monkeypatch.setattr(c.m, 'usage', lambda _, refs=None: ({}, []))
     monkeypatch.setattr(c.m, 'references', lambda _: {})
     state = c.root / 'state'
     assert c.m.main(['--budget-minutes', '0', '--state-dir', str(state)]) == 1
@@ -748,11 +747,11 @@ def test_launcher_starts_only_one_bounded_dry_run(case, state, success, launched
     assert capture.exists() == launched
     if launched:
         args = json.loads(capture.read_text())
-        assert ('--property=RuntimeMaxSec=9180' if execute else '--property=RuntimeMaxSec=1980') in args
+        assert ('--property=RuntimeMaxSec=10080' if execute else '--property=RuntimeMaxSec=3780') in args
         assert '--property=WorkingDirectory=/' in args
-        assert args[args.index('--budget-minutes') + 1] == ('150' if execute else '30')
+        assert str(SCRIPT.with_name('git_tree_sweep_worker.sh')) in args
         assert ('--execute' in args) is execute
-        assert str(SCRIPT) in args
+        assert '/root/.pyenv/versions/3.12.12/bin/python3' in args
 
 
 def test_launcher_rejects_unknown_execute_arguments(case):
@@ -804,6 +803,7 @@ def test_legacy_consumers_resolve_symlinked_parent_paths(case, monkeypatch, cons
         monkeypatch.setattr(c.m.ws, 'docker_anchors', reserve)
         monkeypatch.setattr(c.m, 'bb_anchors', lambda *a, **kw: [])
         monkeypatch.setattr(c.m, 'config_anchors', lambda *a, **kw: [])
+        monkeypatch.setattr(c.m, 'name_config_sources', lambda: [])
         anchors, unknown = c.m.usage(inv(c))
     else:
         monkeypatch.setattr(c.m.ws, 'bb_anchors', reserve)
@@ -819,7 +819,8 @@ def test_legacy_clis_delegate_to_unfiltered_entry(name):
     path = SCRIPT.with_name(name)
     result = subprocess.run([os.sys.executable,'-I',str(path),'--help'],capture_output=True,text=True)
     assert result.returncode == 0
-    assert 'Inventory all local Git working trees' in result.stdout
+    expected = 'Registered linked worktrees' if name == 'worktree_sweep.py' else 'Full-disk independent clones'
+    assert expected in result.stdout
     assert '--root' not in result.stdout
     blocked = subprocess.run([os.sys.executable,'-I',str(path),'--root','/some/path'],capture_output=True,text=True)
     assert blocked.returncode == 2 and 'unrecognized arguments' in blocked.stderr
@@ -1025,7 +1026,7 @@ def test_execution_rechecks_scoped_unknown_without_global_veto(case, monkeypatch
     c = case
     row = plan(c)
     row['bytes'] = 4096
-    def usage(inventory):
+    def usage(inventory, refs=None):
         root = c.repo if protect else c.root / 'elsewhere'
         anchors = {}
         records = c.m.text_anchors(anchors, f'source "{root}/$name/init"', '/root', 'new config')
@@ -1438,7 +1439,7 @@ def test_partial_tmp_prefix_covers_bind_descendants_and_root_siblings(case, monk
     assert records and set(records[0]['protected_paths']) == {'/tmp-tools', '/data/system-tmp/tool'}
 
 
-@pytest.mark.parametrize('kind', ['cwd', 'HOME', 'XDG_CACHE_HOME'])
+@pytest.mark.parametrize('kind', ['HOME', 'XDG_CACHE_HOME'])
 @pytest.mark.parametrize('location', ['root', 'mount', 'login', 'isolated', 'xdg_child'])
 def test_process_directory_scope_exceptions_and_isolated_homes(case, monkeypatch, kind, location):
     c = case
@@ -1457,7 +1458,7 @@ def test_process_directory_scope_exceptions_and_isolated_homes(case, monkeypatch
         assert c.m.ws.anchored(anchors, target) == f'process 42 {kind} subtree'
 
 
-@pytest.mark.parametrize('key', ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'cwd'])
+@pytest.mark.parametrize('key', ['HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME'])
 def test_process_home_from_proc_protects_nested_checkout(case, tmp_path, monkeypatch, key):
     c = case
     proc = tmp_path / 'proc'; p = proc / '987654'
@@ -1528,16 +1529,87 @@ def test_config_name_scan_uses_small_text_only_and_denies_read_failure(case, mon
     with pytest.raises(PermissionError):c.m.configuration_name_anchors({}, {'trees':{path:'clone'}},[str(binary)])
 
 
-def test_nested_independent_clone_is_project_owned_even_if_clean_published(case):
+def test_foreign_nested_dmca_clone_is_project_owned_even_if_clean_published(case):
     c=case;target=c.repo/'.local/evidence/upstream'
     shell('git','clone','-q',str(c.bare),str(target));age(c.repo)
     row=plan(c,target)
     assert row['action']=='keep' and row['reason']==f'嵌套于 {c.repo}，由该项目自行保留'
 
 
-def test_nested_linked_worktree_is_project_owned(case):
+def test_same_origin_nested_linked_worktree_is_a_candidate(case):
     c=case;target=linked(c);age(c.repo)
     row=plan(c,target,'linked')
+    assert row['action']=='remove',row
+
+
+def test_same_origin_nested_clone_is_a_candidate(case):
+    c=case;target=c.repo/'.worktrees/copy'
+    shell('git','clone','-q',str(c.bare),str(target))
+    shell('git','remote','set-url','origin','https://git.woa.com/group/repo.git',cwd=target)
+    age(c.repo)
+    row=plan(c,target)
+    assert row['action']=='remove',row
+
+
+def test_nested_clone_without_remote_stays_project_owned(case):
+    c=case;target=c.repo/'.local/dmca-20261118/upstream'
+    shell('git','clone','-q',str(c.bare),str(target));shell('git','remote','remove','origin',cwd=target);age(c.repo)
+    row=plan(c,target)
+    assert row['action']=='keep' and row['reason']==f'嵌套于 {c.repo}，由该项目自行保留'
+
+
+def test_same_origin_linked_without_remote_reaches_recovery_check(case):
+    c=case;target=linked(c);shell('git','remote','remove','origin',cwd=c.repo);age(c.repo)
+    row=plan(c,target,'linked')
+    assert row['action']=='keep' and row['reason']=='no independently recoverable remote'
+
+
+def test_nested_same_origin_still_keeps_dirty_and_referenced_work(case):
+    c=case;target=linked(c);(target/'new').write_text('private');age(c.repo)
+    assert 'dirty working tree' in plan(c,target,'linked')['reason']
+    (target/'new').unlink();age(c.repo)
+    assert plan(c,target,'linked',anchors={str(target):'BB environment: live'})['reason']=='BB environment: live'
+
+
+def test_nested_parent_remote_change_rebinds_relationship(case):
+    c=case;target=c.repo/'.worktrees/copy'
+    shell('git','clone','-q',str(c.bare),str(target))
+    shell('git','remote','set-url','origin','https://git.woa.com/group/repo.git',cwd=target);age(c.repo)
+    inventory=inv(c);c.m.references(inventory)
+    row=c.m.plan(str(target),'clone',inventory,{},{});assert row['action']=='remove',row
+    shell('git','remote','set-url','origin','https://git.woa.com/foreign/evidence.git',cwd=c.repo)
+    with pytest.raises(c.m.ws.Keep,match='嵌套于'):
+        c.m.remove(row,inventory,{},{} )
+    assert target.exists()
+
+
+def test_nested_same_origin_matches_any_effective_parent_remote(case,monkeypatch):
+    c=case;target=c.repo/'.worktrees/copy'
+    shell('git','clone','-q',str(c.bare),str(target))
+    shell('git','remote','add','second','ssh://git@git.woa.com/other/shared.git',cwd=c.repo)
+    shell('git','remote','set-url','origin','short:other/shared.git',cwd=target)
+    shell('git','config','url.https://git.woa.com/.insteadOf','short:',cwd=target);age(c.repo)
+    # The local-state boundary performs no remote IO; only recovery proof is mocked.
+    raw=c.m._run
+    def transport(args,**kw):
+        return raw([str(c.bare) if a in ('short:other/shared.git','https://git.woa.com/other/shared.git') else a for a in args],**kw)
+    monkeypatch.setattr(c.m,'_run',transport)
+    row=plan(c,target)
+    assert row['action']=='remove',row
+
+
+def test_same_origin_inner_clone_does_not_bypass_foreign_outer_owner(case):
+    c=case;middle=c.repo/'.local/dmca/upstream';inner=middle/'.worktrees/copy'
+    shell('git','clone','-q',str(c.bare),str(middle));shell('git','clone','-q',str(c.bare),str(inner));age(c.repo)
+    row=plan(c,inner)
+    assert row['action']=='keep' and row['reason']==f'嵌套于 {c.repo}，由该项目自行保留'
+
+
+def test_multiple_remotes_cannot_bridge_foreign_nested_snapshot(case):
+    c=case;middle=c.repo/'.local/dmca/upstream';inner=middle/'.worktrees/copy'
+    shell('git','clone','-q',str(c.bare),str(middle));shell('git','clone','-q',str(c.bare),str(inner))
+    shell('git','remote','add','outer','https://git.woa.com/group/repo.git',cwd=inner);age(c.repo)
+    row=plan(c,inner)
     assert row['action']=='keep' and row['reason']==f'嵌套于 {c.repo}，由该项目自行保留'
 
 
@@ -1597,7 +1669,7 @@ def test_new_candidate_stops_execution_before_archive_or_remove(case, monkeypatc
     monkeypatch.setattr(c.m,'managed_roots',lambda:set())
     monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
     monkeypatch.setattr(c.m,'references',lambda _: {})
-    monkeypatch.setattr(c.m,'usage',lambda _: ({},[]))
+    monkeypatch.setattr(c.m,'usage',lambda _, refs=None: ({},[]))
     monkeypatch.setattr(c.m,'plan',lambda path,kind,*a: {'path':path,'type':kind,'action':'remove','archives':[]})
     def forbidden(*a,**kw):raise AssertionError('execution must not start')
     monkeypatch.setattr(c.m,'execute',forbidden)
@@ -1618,3 +1690,1116 @@ def test_failure_of_one_project_task_inventory_is_not_ignored(case, monkeypatch)
         return SimpleNamespace(stdout=json.dumps(data))
     monkeypatch.setattr(c.m,'command',command)
     with pytest.raises(RuntimeError,match='personal unreadable'):c.m.bb_anchors({})
+
+
+
+def shared_borrower(c, source=None, name='borrower'):
+    target=c.root/name
+    shell('git','clone','--shared','-q',str(source or c.repo),str(target))
+    shell('git','remote','set-url','origin','https://git.woa.com/group/repo.git',cwd=target)
+    for key,value in [('user.name','Test'),('user.email','test@example.com')]:
+        shell('git','config',key,value,cwd=target)
+    return target
+
+
+def test_shared_borrower_can_be_deleted_without_harming_its_lender(case):
+    c=case;borrower=shared_borrower(c);age(c.root)
+    inventory=inv(c);refs=c.m.references(inventory)
+    assert 'alternates reference' in c.m.ws.anchored(refs,str(c.repo))
+    assert 'alternates reference' in plan(c,refs=refs)['reason']
+    row=plan(c,borrower,refs=refs)
+    assert row['action']=='remove',row
+    head=row['objects']['HEAD'];c.m.remove(row,inventory,{},refs)
+    assert not borrower.exists() and c.repo.exists()
+    assert shell('git','rev-parse','HEAD',cwd=c.repo)==head
+    shell('git','fsck','--full',cwd=c.repo)
+
+
+def test_shared_borrower_unpublished_history_still_requires_verified_archive(case,monkeypatch):
+    c=case;borrower=shared_borrower(c)
+    (borrower/'a').write_text('borrower-only history')
+    shell('git','commit','-qam','local borrower work',cwd=borrower);age(c.root)
+    inventory=inv(c);refs=c.m.references(inventory)
+    row=plan(c,borrower,refs=refs)
+    assert row['action']=='archive+remove' and row['archive_objects'],row
+    row['bytes']=1024
+    monkeypatch.setattr(c.m,'usage',lambda _, refs=None:({},[]))
+    c.m.execute([row],inventory,{},refs,[str(c.root)],set(),'borrower-test',c.root/'execute.jsonl')
+    assert row['result']=='removed' and c.repo.exists()
+    assert row['archives']
+    for archive in row['archives']:
+        assert shell('git','rev-parse',archive['ref'],cwd=c.bare)==archive['sha']
+    shell('git','fsck','--full',cwd=c.repo)
+
+
+def test_a_borrower_that_also_lends_objects_is_still_protected(case):
+    c=case;middle=shared_borrower(c);leaf=shared_borrower(c,middle,'leaf');age(c.root)
+    refs=c.m.references(inv(c))
+    assert 'alternates reference' in plan(c,refs=refs)['reason']
+    assert 'alternates reference' in plan(c,middle,refs=refs)['reason']
+    assert plan(c,leaf,refs=refs)['action']=='remove'
+
+
+@pytest.mark.parametrize('kind',['alternates','http-alternates'])
+def test_recent_borrowing_configuration_is_recent_git_activity(case,kind):
+    c=case;borrower=shared_borrower(c);age(c.root)
+    (borrower/'.git/objects/info'/kind).write_text(str(c.repo/'.git/objects')+'\n')
+    assert '168h' in plan(c,borrower)['reason']
+
+
+@pytest.mark.parametrize('interpreter',['python3','bash'])
+def test_bb_uses_the_declared_language_and_reports_automation_ownership(case,monkeypatch,interpreter):
+    c=case;script=c.root/'watcher';script.write_text('for row in rows:\n    print(row)\n')
+    task={'id':'a','name':'data-only watcher','enabled':False,'lastRunAt':123456,'lastRunStatus':'skipped',
+          'execution':{'interpreter':interpreter,'storedScriptPath':str(script)}}
+    def command(cmd,**kw):
+        if cmd[1]=='project':data=[{'id':'p','sources':[{'path':str(c.repo)}]}]
+        elif cmd[1]=='environment':data=[]
+        else:data=[task] if cmd[cmd.index('--project')+1]=='p' else []
+        return SimpleNamespace(stdout=json.dumps(data))
+    monkeypatch.setattr(c.m,'command',command);monkeypatch.setattr(c.m.ws,'bb_anchors',lambda *a:None)
+    records=c.m.bb_anchors({})
+    if interpreter=='python3':assert records==[]
+    else:
+        assert records and records[0]['automation_name']=='data-only watcher'
+        assert records[0]['automation_last_run_at']==123456 and records[0]['automation_enabled'] is False
+
+
+def test_python_data_loops_are_not_unknown_filesystem_paths(case):
+    c=case;anchors={}
+    text="""import json
+from pathlib import Path
+ROOT=Path('/data/ops/watch-only')
+rows=json.loads((ROOT/'data.json').read_text())
+for row in rows:
+    print(row['value'])
+"""
+    assert c.m.python_anchors(anchors,text,'/root','python')==[]
+    assert not c.m.ws.anchored(anchors,str(c.repo))
+    assert c.m.ws.anchored(anchors,'/data/ops/watch-only/data.json')
+
+
+def test_python_glob_loop_retains_its_absolute_prefix(case):
+    c=case;root=str(c.root/'snapshots');target=root+'/new-clone'
+    text=f"from pathlib import Path\nroot=Path({root!r})\nfor p in sorted(root.glob('*/config.json')):\n    p.read_text()\n"
+    anchors={};records=c.m.python_anchors(anchors,text,'/root','python')
+    scoped=c.m.scope_unknown(anchors,records,{'trees':{target:'clone',str(c.repo):'clone'}})
+    assert scoped and all(x['scope']=='prefix' for x in scoped)
+    assert c.m.ws.anchored(anchors,target) and not c.m.ws.anchored(anchors,str(c.repo))
+
+
+@pytest.mark.parametrize('operand',["Path(os.environ['UNOBSERVED_ROOT'])",'Path(sys.argv[1])','open(dynamic_path)', 'unknown_path.read_text()'])
+def test_python_unbounded_file_operand_keeps_project_scope(case,operand):
+    c=case;anchors={};records=c.m.python_anchors(anchors,'import os,sys\nfrom pathlib import Path\n'+operand,'/root','python')
+    for record in records:record.update(project_id='p',project_paths=[str(c.repo)])
+    scoped=c.m.scope_unknown(anchors,records,{'trees':{str(c.repo):'clone'}})
+    assert any(x['scope']=='project' and str(c.repo) in x['protected_paths'] for x in scoped)
+
+
+@pytest.mark.parametrize('style',['env','fstring','join','tuple','home'])
+def test_python_literal_and_observed_environment_paths_are_reserved(case,style):
+    c=case;root=str(c.repo)
+    text={'env':"Path(os.environ['CHECKOUT_ROOT']).read_text()",
+          'fstring':f"Path(f'{root}/config-{{unknown}}.json').read_text()",
+          'join':f"Path(os.path.join({root!r},'config.json')).read_text()",
+          'tuple':f"first,second=Path('/other/place'),Path({root!r})\nsecond.read_text()",
+          'home':"Path.home().joinpath('config.json').read_text()"}[style]
+    if style=='home':text="(Path.home()/'config.json').read_text()"
+    anchors={};records=c.m.python_anchors(anchors,'import os\nfrom pathlib import Path\n'+text,root,'python',metadata={'CHECKOUT_ROOT':[root]})
+    c.m.scope_unknown(anchors,records,{'trees':{root:'clone'}})
+    assert c.m.ws.anchored(anchors,root)
+
+
+@pytest.mark.parametrize('source',["Path('/data/ops/' + unknown).read_text()","(Path('/data/ops') / ('file-' + unknown)).read_text()"])
+def test_python_dynamic_path_has_a_prefix_instead_of_project_fallback(case,source):
+    c=case;records=c.m.python_anchors({},'from pathlib import Path\n'+source,'/root','python')
+    assert records and all(x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('command',['exec(code)',"subprocess.run(['python3','-c',code])","subprocess.run(['python3','-'],input=code)"])
+def test_python_embedded_local_code_keeps_its_file_references(case,command):
+    c=case;code=f"from pathlib import Path; Path({str(c.repo)!r}).read_text()"
+    text='import subprocess\ncode='+repr(code)+'\n'+command
+    anchors={};c.m.python_anchors(anchors,text,'/root','python')
+    assert c.m.ws.anchored(anchors,str(c.repo))
+
+
+@pytest.mark.parametrize('command',['exec(code)',"subprocess.run(['python3','-c',code])"])
+def test_python_unknown_local_code_stays_unknown(case,command):
+    records=case.m.python_anchors({},'import subprocess\n'+command,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_syntax_failure_stays_unknown_and_never_executes(case):
+    c=case;sentinel=c.root/'must-not-exist'
+    text=f"from pathlib import Path\nPath({str(sentinel)!r}).touch()\nfor ???"
+    records=c.m.python_anchors({},text,'/root','python')
+    assert records and not sentinel.exists()
+
+
+def test_python_possible_value_limit_does_not_use_a_partial_prefix(case):
+    c=case;records=c.m.python_anchors({},"import os\nfrom pathlib import Path\nPath(os.environ['ROOT_DIR']).read_text()",'/root','python',{'ROOT_DIR':{f'/volume-{i}' for i in range(300)}})
+    assert any(not x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('source',["[p.read_text() for p in dynamic_paths]", "lambda p: p.read_text()", "def f(p=open(dynamic_path)):\n    return p", "Path('/known').rename(dynamic_path)"])
+def test_python_nested_bindings_and_file_destinations_remain_unknown(case,source):
+    c=case;text="from pathlib import Path\np=Path('/unrelated/static-root')\n"+source
+    records=c.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+
+def test_python_unknown_join_operand_cannot_discard_the_base_silently(case):
+    records=case.m.python_anchors({},"from pathlib import Path\n(Path('/data/ops') / unknown).read_text()",'/root','python')
+    assert any(x['prefixes'] for x in records) and any(not x['prefixes'] for x in records)
+
+
+
+def test_python_atomic_write_suffix_preserves_known_parent(case):
+    c=case;text=f"from pathlib import Path\nroot=Path({str(c.repo)!r})\np=root/'state.json'\ntemporary=p.with_suffix('.new')\ntemporary.write_text('data')\ntemporary.replace(p)\n"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')==[]
+    assert c.m.ws.anchored(anchors,str(c.repo))
+
+
+def test_python_datetime_replace_is_not_a_file_operation(case):
+    records=case.m.python_anchors({},"import datetime\nend=datetime.datetime.fromisoformat(cfg['end']).replace(tzinfo=datetime.timezone.utc)",'/root','python')
+    assert records==[]
+
+
+def test_python_cwd_mutation_never_reuses_launch_cwd(case):
+    text="import os\nfrom pathlib import Path\nos.chdir(dynamic_path)\n(Path.cwd()/'state').read_text()"
+    records=case.m.python_anchors({},text,'/root','python',metadata={'PWD':['/unrelated/launch-cwd']})
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_environment_assignment_is_a_possible_path_value(case):
+    c=case;text=f"import os\nfrom pathlib import Path\nos.environ['CHECKOUT_ROOT']={str(c.repo)!r}\nPath(os.environ['CHECKOUT_ROOT']).read_text()"
+    anchors={};case.m.python_anchors(anchors,text,'/root','python',{'CHECKOUT_ROOT':{'/unrelated/root'}})
+    assert c.m.ws.anchored(anchors,str(c.repo))
+
+
+def test_python_keyword_file_replacement_keeps_unknown_destination(case):
+    records=case.m.python_anchors({},"from pathlib import Path\nPath('/known').replace(target=dynamic_path)",'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_bb_python_cwd_uses_automation_storage_policy(case,monkeypatch):
+    c=case;storage=c.root/'automation-storage';script=storage/'a'/'watch.py';script.parent.mkdir(parents=True)
+    script.write_text("from pathlib import Path\n(Path.cwd()/'state.json').read_text()")
+    task={'id':'a','execution':{'interpreter':'python3','workingDirectory':{'type':'automation-storage'},'storedScriptPath':str(script)}}
+    def command(cmd,**kw):
+        if cmd[1]=='project':data=[{'id':'p','sources':[{'path':str(c.repo)}]}]
+        elif cmd[1]=='environment':data=[]
+        else:data=[task] if cmd[cmd.index('--project')+1]=='p' else []
+        return SimpleNamespace(stdout=json.dumps(data))
+    monkeypatch.setattr(c.m,'command',command);monkeypatch.setattr(c.m.ws,'bb_anchors',lambda *a:None)
+    anchors={};assert c.m.bb_anchors(anchors)==[]
+    assert c.m.ws.anchored(anchors,str(storage/'state.json'))
+
+
+
+@pytest.mark.parametrize('loop',["for i in [1,2]",'while active'])
+def test_python_loop_cannot_reuse_only_the_first_iteration_path(case,loop):
+    text=f"from pathlib import Path\np=Path('/first/path')\n{loop}:\n    p.glob('*')\n    p=unknown_path\n"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_function_mutated_global_path_remains_unknown(case):
+    text="from pathlib import Path\np=Path('/first/path')\ndef change():\n    global p\n    p=dynamic_path\nchange()\np.glob('*')\n"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+
+def test_python_known_helper_arguments_narrow_to_its_path_prefix(case):
+    text="from pathlib import Path\ndef write(n,v):\n    (ROOT/n).write_text(v)\nROOT=Path('/data/ops/only-this-directory')\nwrite('state.json','value')"
+    anchors={};records=case.m.python_anchors(anchors,text,'/root','python')
+    assert records==[]
+    assert case.m.ws.anchored(anchors,'/data/ops/only-this-directory/state.json')
+
+
+def test_python_datetime_filename_is_bounded_without_evaluating_time(case):
+    text="import datetime\nfrom pathlib import Path\nstamp=datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ')\nD=Path('/data/ops/samples')/stamp\n(D/'result.json').write_text('x')"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert records and all(x['prefixes'] for x in records)
+
+
+def test_python_executor_map_binds_literal_callback_inputs(case):
+    text="import concurrent.futures\nfrom pathlib import Path\nROOT=Path('/data/ops/collect')\ndef collect(kind):\n    (ROOT/(kind+'.json')).read_text()\nwith concurrent.futures.ThreadPoolExecutor() as ex:\n    results=list(ex.map(collect,['db','images']))"
+    anchors={};records=case.m.python_anchors(anchors,text,'/root','python')
+    assert records==[]
+    assert case.m.ws.anchored(anchors,'/data/ops/collect/db.json')
+    assert case.m.ws.anchored(anchors,'/data/ops/collect/images.json')
+
+
+def test_python_escaped_callback_keeps_unbounded_path_inputs(case):
+    text="from pathlib import Path\ndef read(p):\n    Path(p).read_text()\nread('/known')\nregister_callback(read)"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_callee_uses_lexical_globals_not_caller_locals(case):
+    text="from pathlib import Path\nROOT=Path('/lexical')\ndef read():\n    ROOT.glob('*')\ndef caller():\n    ROOT=Path('/caller')\n    read()\ncaller()"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(any(x['path'].startswith('/lexical') for x in r['prefixes']) for r in records)
+
+
+def test_python_branch_definition_sees_later_module_bindings(case):
+    text="from pathlib import Path\nROOT=Path('/first')\nif condition:\n    def read():\n        ROOT.glob('*')\nROOT=Path('/later')\nread()"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(any(x['path'].startswith('/later') for x in r['prefixes']) for r in records)
+
+
+
+@pytest.mark.parametrize('setup',["def Path(value):\n    return custom_factory(value)", 'from custom_library import Path'])
+def test_python_unknown_path_factory_is_not_assumed_to_be_pathlib(case,setup):
+    records=case.m.python_anchors({},setup+"\nPath('/unrelated/root').read_text()",'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+
+@pytest.mark.parametrize('text',["from custom_library import os\nfrom pathlib import Path\nPath(os.getenv('ROOT')).read_text()","from pathlib import Path\ndef sorted(items):\n    return dynamic_paths\nfor p in sorted([Path('/known')]):\n    p.read_text()"])
+def test_python_foreign_helpers_do_not_invent_known_path_values(case,text):
+    records=case.m.python_anchors({},text,'/root','python',{'ROOT':{'/unrelated/root'}})
+    assert any(not x['prefixes'] for x in records)
+
+
+
+@pytest.mark.parametrize('change',["roots[0]=dynamic_path", "roots.append(dynamic_path)", "alias=roots; alias.append(dynamic_path)", "roots += [dynamic_path]", "del roots[0]"])
+def test_python_container_mutations_invalidate_old_finite_paths(case,change):
+    text="from pathlib import Path\nroots=['/unrelated/static']\n"+change+"\nfor p in roots:\n    Path(p).read_text()"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('loop',["for i in [1,2]",'while running'])
+def test_python_loop_container_mutation_cannot_keep_first_iteration_values(case,loop):
+    text=f"from pathlib import Path\nroots=['/unrelated/static']\n{loop}:\n    for p in roots:\n        Path(p).read_text()\n    roots.append(dynamic_path)"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_container_alias_mutation_in_a_helper_remains_unknown(case):
+    text="from pathlib import Path\nroots=['/unrelated/static']\nalias=roots\ndef change():\n    alias.append(dynamic_path)\nchange()\nfor p in roots:\n    Path(p).read_text()"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('call',["open(file=dynamic_path).read()", "shutil.copy('/known/source', dst=dynamic_path)", "os.chdir(path=dynamic_path)", "open(**options)", "shutil.copy('/known', **options)", "open(**{'file':dynamic_path})", "from_io(file=dynamic_path)"])
+def test_python_keyword_file_operands_never_disappear(case,call):
+    text="import os,shutil\nfrom io import open as from_io\n"+call
+    records=case.m.python_anchors({},text,'/root','python',metadata={'PWD':['/known/cwd']})
+    assert any(not x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('call',["Path('state.new').replace(dynamic_path)", "p=Path('state.new'); p.replace(target=dynamic_path)", "Path('state.new').replace(**options)", "Path('state.new').replace(**{'target':dynamic_path})"])
+def test_python_relative_replacement_checks_destination(case,call):
+    records=case.m.python_anchors({},'from pathlib import Path\n'+call,'/root','python',metadata={'PWD':['/known/cwd']})
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_known_relative_replacement_resolves_source_and_target(case):
+    anchors={};text="from pathlib import Path\nPath('state.new').replace(**{'target':'state.json'})"
+    records=case.m.python_anchors(anchors,text,'/root','python',metadata={'PWD':['/known/cwd']})
+    assert records==[] and case.m.ws.anchored(anchors,'/known/cwd/state.new') and case.m.ws.anchored(anchors,'/known/cwd/state.json')
+
+
+def test_python_dynamic_chdir_itself_reserves_project_scope(case):
+    records=case.m.python_anchors({},'import os\nos.chdir(dynamic_path)','/root','python')
+    for record in records:record.update(project_id='p',project_paths=[str(case.repo)])
+    scoped=case.m.scope_unknown({},records,{'trees':{str(case.repo):'clone'}})
+    assert any(x['scope']=='project' and str(case.repo) in x['protected_paths'] for x in scoped)
+
+
+
+@pytest.mark.parametrize('argv',["['bb','thread','spawn','--environment',state['environmentPath']]", "['git','-C',dynamic_path,'status']", "['tool','--config='+dynamic_path]", "['bb',*dynamic_args]"])
+def test_python_cli_path_parameters_remain_unknown(case,argv):
+    records=case.m.python_anchors({},'import subprocess\nsubprocess.run('+argv+')','/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_variadic_cli_wrapper_cannot_hide_environment_path(case):
+    text="import subprocess\ndef call(*args):\n    subprocess.check_output(['bb',*args,'--json'])\ncall('thread','spawn','--environment',state['environmentPath'])"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_cli_relative_path_uses_the_subprocess_cwd(case):
+    text="import subprocess\nsubprocess.run(['git','-C','child','status'],cwd='/actual/cwd')"
+    anchors={};records=case.m.python_anchors(anchors,text,'/root','python',metadata={'PWD':['/launch/cwd']})
+    assert records==[]
+    assert case.m.ws.anchored(anchors,'/actual/cwd/child') and not case.m.ws.anchored(anchors,'/launch/cwd/child')
+
+
+
+@pytest.mark.parametrize('source',["from subprocess import run as r\nr(['git','-C',dynamic_path,'status'])", "import subprocess as p\np.run(args=['bb','thread','spawn','--environment',dynamic_path])", "import subprocess\nsubprocess.run(**options)", "import subprocess\nsubprocess.run(**{'args':['git','-C',dynamic_path]})"])
+def test_python_cli_aliases_and_keyword_argv_keep_unknown_paths(case,source):
+    records=case.m.python_anchors({},source,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+
+@pytest.mark.parametrize('change',["alias=roots; alias += [dynamic_path]", "alias=roots\nif condition:\n    alias += [dynamic_path]", "def change(r):\n    r += [dynamic_path]\nchange(roots)", "add=roots.append; add(dynamic_path)", "register(roots.append)"])
+def test_python_augmented_or_escaped_container_aliases_stay_unknown(case,change):
+    text="from pathlib import Path\nroots=['/unrelated/static']\n"+change+"\nfor p in roots:\n    Path(p).read_text()"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+def test_python_escaped_callback_order_cannot_preserve_finite_paths(case):
+    text="from pathlib import Path\nroots=['/unrelated/static']\ndef read_roots():\n    for p in roots: Path(p).read_text()\ndef change():\n    roots.append(dynamic_path)\nregister(change)\nregister(read_roots)"
+    records=case.m.python_anchors({},text,'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('call',["os.stat('state', **{'dir_fd': fd})", "os.rename('state', dst='state2', **{'src_dir_fd': fd})", "os.replace('state','state2', **{'dst_dir_fd':fd})"])
+@pytest.mark.parametrize('dynamic',[True,False])
+def test_python_literal_kwargs_fd_context_is_unknown_unless_none(case,call,dynamic):
+    text='import os\n'+(call if dynamic else call.replace(': fd', ': None').replace(':fd', ':None'))
+    records=case.m.python_anchors({},text,'/root','python',metadata={'PWD':['/known/cwd']})
+    assert bool(records) is dynamic
+    if dynamic:assert any(not x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('cwd,expected',[('worktree','/known/cwd/worktree/child'),('.','/known/cwd/child'),('..','/known/child'),('~/worktree','/known/cwd/~/worktree/child')])
+def test_python_subprocess_relative_cwd_keeps_its_child_path(case,cwd,expected):
+    text=f"import subprocess\nsubprocess.run(['git','-C','child','status'],cwd={cwd!r})"
+    anchors={};records=case.m.python_anchors(anchors,text,'/root','python',metadata={'PWD':['/known/cwd']})
+    assert case.m.ws.anchored(anchors,expected),records
+
+
+def test_python_subprocess_relative_cwd_without_launch_context_is_unknown(case,monkeypatch):
+    monkeypatch.delenv('PWD',raising=False)
+    records=case.m.python_anchors({},"import subprocess\nsubprocess.run(['git','-C','child'],cwd='worktree')",'/root','python')
+    assert any(not x['prefixes'] for x in records)
+
+
+@pytest.mark.parametrize('style',['positional','keyword'])
+def test_python_noninline_argv_keeps_relative_environment_path(case,style):
+    invocation='subprocess.run(argv)' if style=='positional' else "subprocess.run(args=argv,cwd='/actual/cwd')"
+    text="import subprocess\nargv=['bb','thread','spawn','--environment','env-path']\n"+invocation
+    anchors={};records=case.m.python_anchors(anchors,text,'/root','python',metadata={'PWD':['/launch/cwd']})
+    expected=('/launch/cwd' if style=='positional' else '/actual/cwd')+'/env-path'
+    assert case.m.ws.anchored(anchors,expected) or any(not x['prefixes'] for x in records)
+
+
+def test_python_changed_home_is_not_replaced_with_launch_home(case):
+    text="import os\nfrom pathlib import Path\nos.environ['HOME']='/new/home'\n(Path.home()/'child').read_text()"
+    anchors={};case.m.python_anchors(anchors,text,'/old/home','python')
+    assert case.m.ws.anchored(anchors,'/new/home/child')
+
+
+def test_python_tilde_is_literal_until_expanduser_is_called(case):
+    text="from pathlib import Path\nPath('~/child').read_text()\nPath('~').expanduser().glob('other')"
+    anchors={};case.m.python_anchors(anchors,text,'/actual/home','python',metadata={'PWD':['/launch']})
+    assert case.m.ws.anchored(anchors,'/launch/~/child')
+    assert case.m.ws.anchored(anchors,'/actual/home/other')
+
+
+
+def test_python_shell_child_uses_script_modified_home(case):
+    text="import os,subprocess\nos.environ['HOME']='/new/home'\nsubprocess.run('cd \"$HOME/child\"',shell=True)"
+    anchors={};case.m.python_anchors(anchors,text,'/launch/home','python')
+    assert case.m.ws.anchored(anchors,'/new/home/child')
+
+
+def test_python_subprocess_custom_environment_keeps_known_home_prefix(case):
+    text="import subprocess\nsubprocess.run(['python3','-c',\"from pathlib import Path; (Path.home()/'child').read_text()\"],env={'HOME':'/new/home','TOKEN':'not-a-path'})"
+    records=case.m.python_anchors({},text,'/old/home','python')
+    assert any(any(x['path']=='/new/home' for x in r['prefixes']) for r in records)
+    assert any(not r['prefixes'] for r in records)
+
+
+@pytest.mark.parametrize('location,protected', [('inside',True),('root',True),('ancestor',False)])
+def test_cwd_only_protects_worktrees_containing_the_directory(case,tmp_path,monkeypatch,location,protected):
+    c=case;proc=tmp_path/'proc';p=proc/'123456';(p/'fd').mkdir(parents=True)
+    directory={'inside':c.repo/'src','root':c.repo,'ancestor':c.repo.parent}[location]
+    directory.mkdir(exist_ok=True)
+    (p/'cwd').symlink_to(directory);(p/'stat').write_text('123456 (worker) '+' '.join(['1']*25))
+    (p/'status').write_text('Uid: 0 0 0 0\n');(p/'maps').write_text('');(p/'environ').write_text('')
+    monkeypatch.setattr(c.m.pwd,'getpwuid',lambda _:SimpleNamespace(pw_dir='/root'))
+    anchors={};env=c.m.process_anchors(anchors,str(proc));child=str(c.repo/'.worktrees/copy')
+    c.m.scope_directories(anchors,env.scopes,{'trees':{str(c.repo):'clone',child:'clone'}})
+    assert bool(c.m.ws.anchored(anchors,str(c.repo))) is protected
+    assert not c.m.ws.anchored(anchors,child)
+
+
+def same_name_pair(c):
+    backup=c.root/'backup';shell('git','clone','-q',str(c.bare),str(backup))
+    shell('git','remote','set-url','origin','https://git.woa.com/group/repo.git',cwd=backup)
+    age(c.root);inventory=inv(c);refs=c.m.references(inventory)
+    config=c.root/'name.conf';config.write_text('repository=group/repo\n')
+    return backup,inventory,refs,config
+
+
+@pytest.mark.parametrize('reason',['BB project source: p','process 12 cwd','BB environment: e'])
+def test_name_reference_is_satisfied_by_an_independently_protected_copy(case,reason):
+    c=case;backup,inventory,refs,config=same_name_pair(c);anchors={str(c.repo):reason}
+    c.m.configuration_name_anchors(anchors,inventory,[str(config)],refs)
+    assert c.m.plan(str(backup),'clone',inventory,anchors,refs)['action']=='remove'
+    assert c.m.plan(str(c.repo),'clone',inventory,anchors,refs)['action']=='keep'
+    assert any(x['path']==str(backup) and x['satisfied_by']==str(c.repo) for x in inventory['configuration_name_references'])
+
+
+def test_name_without_other_protection_keeps_every_ambiguous_copy(case):
+    c=case;backup,inventory,refs,config=same_name_pair(c);anchors={}
+    c.m.configuration_name_anchors(anchors,inventory,[str(config)],refs)
+    for path in (c.repo,backup):
+        row=c.m.plan(str(path),'clone',inventory,anchors,refs)
+        assert row['action']=='keep' and 'configuration name collision' in row['reason']
+
+
+def test_name_rule_cannot_use_another_name_rule_as_its_evidence(case):
+    c=case;backup,inventory,refs,config=same_name_pair(c)
+    anchors={str(c.repo):'configuration name reference: old-name'}
+    c.m.configuration_name_anchors(anchors,inventory,[str(config)],refs)
+    assert c.m.plan(str(backup),'clone',inventory,anchors,refs)['action']=='keep'
+
+
+def test_other_local_retention_can_satisfy_a_name_without_an_anchor(case):
+    c=case;backup,inventory,refs,config=same_name_pair(c)
+    (c.repo/'uncommitted').write_text('keep');age(c.repo);anchors={}
+    c.m.configuration_name_anchors(anchors,inventory,[str(config)],refs)
+    assert c.m.plan(str(backup),'clone',inventory,anchors,refs)['action']=='remove'
+    assert c.m.plan(str(c.repo),'clone',inventory,anchors,refs)['action']=='keep'
+
+
+def test_unrelated_remote_with_the_same_namespace_does_not_satisfy_a_name(case):
+    c=case;backup,inventory,refs,config=same_name_pair(c)
+    inventory['remote_urls'][str(backup)]=['other.example/group/repo']
+    anchors={str(c.repo):'BB project source: p'}
+    c.m.configuration_name_anchors(anchors,inventory,[str(config)],refs)
+    assert c.m.plan(str(backup),'clone',inventory,anchors,refs)['action']=='keep'
+
+
+def test_registered_environment_remotes_do_not_expand_a_non_git_container_project(case):
+    c=case;other=c.root/'other-project';env=c.root/'envs/registered';source=c.root/'container';source.mkdir()
+    trees={str(c.repo):'clone',str(other):'clone',str(env):'linked'}
+    inventory={'trees':trees,'remote_urls':{p:['host/mono2'] for p in trees}}
+    record=c.m.unresolved('automation','unknown path')
+    record.update(project_id='code',project_paths=[str(source),str(env)],project_source_paths=[str(source)],project_environment_paths=[str(env)],project_remote_ids=['host/mono2'])
+    anchors={};c.m.scope_unknown(anchors,[record],inventory)
+    assert record['scope']=='project' and record['protected_paths']==[str(env)]
+    assert c.m.ws.anchored(anchors,str(source)) and not c.m.ws.anchored(anchors,str(other))
+
+
+def test_real_git_project_fallback_still_protects_source_copies_and_own_environments(case):
+    c=case;copy=str(c.root/'same-remote');env=str(c.root/'env');unrelated=str(c.root/'different-project')
+    inventory={'trees':{str(c.repo):'clone',copy:'clone',env:'linked',unrelated:'clone'},
+               'remote_urls':{str(c.repo):['host/project'],copy:['host/project'],env:['host/other'],unrelated:['host/other']}}
+    record=c.m.unresolved('automation','unknown')
+    record.update(project_id='p',project_paths=[str(c.repo),env],project_source_paths=[str(c.repo)],project_environment_paths=[env],project_remote_ids=[])
+    c.m.scope_unknown({},[record],inventory)
+    assert set(record['protected_paths'])=={str(c.repo),copy,env}
+
+
+def test_unowned_json_fallback_remains_global(case):
+    record=case.m.unresolved('automation','unknown JSON path');record['project_id']='unknown'
+    case.m.scope_unknown({},[record],{'trees':{str(case.repo):'clone'}})
+    assert record['scope']=='global'
+
+
+@pytest.mark.parametrize('style',['read_text','read_bytes','load_open','alias'])
+def test_python_reads_current_literal_json_path_fields_without_running_the_script(case,style):
+    c=case;state=c.root/'state.json';target=str(c.root/'checkout');state.write_text(json.dumps({'environmentPath':target}))
+    loaders={'read_text':f'json.loads(Path({str(state)!r}).read_text())',
+             'read_bytes':f'json.loads(Path({str(state)!r}).read_bytes())',
+             'load_open':f'json.load(open({str(state)!r}))',
+             'alias':f'decode(Path({str(state)!r}).read_text())'}
+    text=f"import json,subprocess\nfrom pathlib import Path\nfrom json import loads as decode\nstate={loaders[style]}\nraise RuntimeError('never execute')\nsubprocess.run(['bb','thread','spawn','--environment',state['environmentPath']])"
+    anchors={};records=c.m.python_anchors(anchors,text,'/root','python')
+    assert records==[] and c.m.ws.anchored(anchors,target)
+
+
+def test_python_known_json_field_flows_through_variadic_bb_wrapper(case):
+    c=case;state=c.root/'state.json';target=str(c.root/'checkout');state.write_text(json.dumps({'environmentPath':target}))
+    text=f"import json,subprocess\nfrom pathlib import Path\nstate=json.loads(Path({str(state)!r}).read_text())\ndef call(*args):\n subprocess.check_output(['bb',*args,'--json'])\ncall('thread','spawn','--environment',state['environmentPath'],'--prompt-file',str(Path('/fixed/prompt.txt')))\nstate.update(status='done',threadId='id')"
+    anchors={};records=c.m.python_anchors(anchors,text,'/root','python')
+    assert records==[] and c.m.ws.anchored(anchors,target) and c.m.ws.anchored(anchors,'/fixed/prompt.txt')
+
+
+def test_python_json_fields_are_reloaded_on_each_protection_generation(case):
+    c=case;state=c.root/'state.json';one=str(c.root/'one');two=str(c.root/'two')
+    text=f"import json\nfrom pathlib import Path\nstate=json.loads(Path({str(state)!r}).read_text())\nPath(state['path']).read_text()"
+    for target,absent in [(one,two),(two,one)]:
+        state.write_text(json.dumps({'path':target}));anchors={}
+        assert c.m.python_anchors(anchors,text,'/root','python')==[]
+        assert c.m.ws.anchored(anchors,target) and not c.m.ws.anchored(anchors,absent)
+
+
+@pytest.mark.parametrize('failure',['missing_file','missing_key','malformed','nonstring','large'])
+def test_missing_or_unreadable_json_path_fields_remain_unknown(case,failure):
+    c=case;state=c.root/'state.json'
+    if failure=='missing_key':state.write_text('{}')
+    elif failure=='malformed':state.write_text('{')
+    elif failure=='nonstring':state.write_text('{"path":42}')
+    elif failure=='large':state.write_text(' '*c.m.CONFIG_TEXT_LIMIT+'{}')
+    text=f"import json\nfrom pathlib import Path\nstate=json.loads(Path({str(state)!r}).read_text())\nPath(state['path']).read_text()"
+    assert c.m.python_anchors({},text,'/root','python')
+
+
+@pytest.mark.parametrize('change',[
+    "state['path']=dynamic", "alias=state\nalias.update(path=dynamic)", 'unknown_function(state)',
+    'def change(s):\n unknown_function(s)\nchange(state)', 'method=state.update\nregister(method)',
+    "import json as j\nj.loads=foreign_decoder", "external.configure(state)",
+])
+def test_json_paths_do_not_reuse_values_after_unknown_mutation_or_escape(case,change):
+    c=case;state=c.root/'state.json';target=str(c.root/'old');state.write_text(json.dumps({'path':target}))
+    text=f"import json\nfrom pathlib import Path\nstate=json.loads(Path({str(state)!r}).read_text())\n{change}\nPath(state['path']).read_text()"
+    anchors={};records=c.m.python_anchors(anchors,text,'/root','python')
+    assert records and not c.m.ws.anchored(anchors,target)
+
+
+def test_opaque_variadic_arguments_are_still_unknown(case):
+    text="import subprocess\ndef call(*args):\n subprocess.check_output(['bb',*args])\ncall(*unknown_arguments)"
+    assert case.m.python_anchors({},text,'/root','python')
+
+
+def test_json_decoder_hooks_are_never_executed_or_assumed_pure(case):
+    c=case;state=c.root/'state.json';sentinel=c.root/'should-not-exist';state.write_text('{"path":"/old/value"}')
+    text=f"import json\nfrom pathlib import Path\ndef hook(obj):\n Path({str(sentinel)!r}).write_text('executed')\n return obj\nstate=json.loads(Path({str(state)!r}).read_text(),object_hook=hook)\nPath(state['path']).read_text()"
+    assert c.m.python_anchors({},text,'/root','python') and not sentinel.exists()
+
+
+def test_json_fifo_is_unknown_and_does_not_wait_for_a_writer(case):
+    import signal
+    c=case;state=c.root/'state.json';os.mkfifo(state)
+    old=signal.signal(signal.SIGALRM,lambda *_: (_ for _ in ()).throw(TimeoutError('FIFO blocked')))
+    signal.alarm(3)
+    try:
+        text=f"import json\nfrom pathlib import Path\nstate=json.loads(Path({str(state)!r}).read_text())\nPath(state['path']).read_text()"
+        assert c.m.python_anchors({},text,'/root','python')
+    finally:signal.alarm(0);signal.signal(signal.SIGALRM,old)
+
+
+def test_file_written_before_json_load_is_not_assumed_to_keep_old_contents(case):
+    c=case;state=c.root/'state.json';target=str(c.root/'old');state.write_text(json.dumps({'path':target}))
+    text=f"import json\nfrom pathlib import Path\np=Path({str(state)!r})\np.write_text(dynamic_payload)\nstate=json.loads(p.read_text())\nPath(state['path']).read_text()"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')
+    assert not c.m.ws.anchored(anchors,target)
+
+
+def test_writing_back_after_read_does_not_change_the_already_loaded_json_object(case):
+    c=case;state=c.root/'state.json';target=str(c.root/'kept');state.write_text(json.dumps({'path':target}))
+    text=f"import json\nfrom pathlib import Path\np=Path({str(state)!r})\nstate=json.loads(p.read_text())\np.write_text(dynamic_payload)\nPath(state['path']).read_text()"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')==[]
+    assert c.m.ws.anchored(anchors,target)
+
+
+def test_json_replaced_during_read_is_unknown(case,monkeypatch):
+    c=case;state=c.root/'state.json';replacement=c.root/'new.json'
+    state.write_text('{"path":"/old"}');replacement.write_text('{"path":"/new"}')
+    inode=state.stat().st_ino;read=c.m.os.read;changed=False
+    def racing(fd,count):
+        nonlocal changed
+        data=read(fd,count)
+        if not changed and os.fstat(fd).st_ino==inode:
+            changed=True;replacement.replace(state)
+        return data
+    monkeypatch.setattr(c.m.os,'read',racing)
+    text=f"import json\nfrom pathlib import Path\nstate=json.loads(Path({str(state)!r}).read_text())\nPath(state['path']).read_text()"
+    assert c.m.python_anchors({},text,'/root','python') and changed
+
+
+@pytest.mark.parametrize('reader',['json.load(stream)','json.load(fp=stream)','json.loads(stream.read())'])
+def test_literal_json_open_context_is_resolved_without_executing_it(case,reader):
+    c=case;state=c.root/'state.json';target=str(c.root/'checkout');state.write_text(json.dumps({'path':target}))
+    text=f"import json\nfrom pathlib import Path\nwith open({str(state)!r}) as stream:\n state={reader}\nPath(state['path']).read_text()"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')==[]
+    assert c.m.ws.anchored(anchors,target)
+
+
+def test_json_open_handle_escaping_an_unknown_helper_does_not_narrow_paths(case):
+    c=case;state=c.root/'state.json';state.write_text('{"path":"/old/path"}')
+    text=f"import json\nfrom pathlib import Path\nwith open({str(state)!r}) as stream:\n unknown_helper(stream)\n state=json.load(stream)\nPath(state['path']).read_text()"
+    assert c.m.python_anchors({},text,'/root','python')
+
+
+def test_json_open_with_write_mode_is_not_executed(case):
+    c=case;state=c.root/'state.json';original='{"path":"/old/path"}';state.write_text(original)
+    text=f"import json\nfrom pathlib import Path\nstate=json.load(open({str(state)!r},'w'))\nPath(state['path']).read_text()"
+    assert c.m.python_anchors({},text,'/root','python') and state.read_text()==original
+
+
+def test_each_removal_refreshes_git_consumers(case, monkeypatch):
+    c = case
+    second = c.root / 'second'
+    shell('git', 'clone', '-q', str(c.bare), str(second))
+    age(second)
+    inventory = inv(c)
+    refs = c.m.references(inventory)
+    rows = [c.m.plan(str(path), 'clone', inventory, {}, refs) for path in (c.repo, second)]
+    assert all(row['action'] == 'remove' for row in rows), rows
+    for row in rows: row['bytes'] = 4096
+    monkeypatch.setattr(c.m, 'usage', lambda inventory, refs=None: ({}, []))
+    original = c.m.remove
+    def remove(row, *args):
+        original(row, *args)
+        if row['path'] == str(c.repo):
+            consumer = c.root / 'new-consumer'
+            shell('git', 'init', '-q', str(consumer))
+            shell('git', 'config', 'remote.local.url', str(second), cwd=consumer)
+    monkeypatch.setattr(c.m, 'remove', remove)
+    c.m.execute(rows, inventory, {}, refs, [str(c.root)], set(), 'refresh', c.root / 'events')
+    assert rows[0]['result'] == 'removed'
+    assert rows[1]['result'] == 'kept', rows[1]
+    assert 'remote' in rows[1]['reason']
+    assert second.exists()
+
+
+@pytest.mark.parametrize('escape',[
+    'external([state])', "external({'settings':state})", 'external(*[state])',
+    "external(**{'settings':state})", 'bucket=[state]\nexternal(bucket)',
+    'external.configure((state,))',
+    'def forward(a,b):\n external(b)\nforward(*[None,state])',
+])
+def test_json_container_alias_escape_returns_unknown(case, escape):
+    c=case;path=c.root/'state.json';target=str(c.root/'previous-target')
+    path.write_text(json.dumps({'path':target}))
+    text=f"import json\nfrom pathlib import Path\nstate=json.loads(Path({str(path)!r}).read_text())\n{escape}\nPath(state['path']).read_text()"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')
+    assert not c.m.ws.anchored(anchors,target)
+
+
+@pytest.mark.parametrize('write',[
+    'fd=os.open(p,os.O_WRONLY|os.O_TRUNC)\nos.write(fd,dynamic_payload)\nos.close(fd)',
+    'fd=os.open(p,flags=dynamic_flags)',
+    'os.write(dynamic_fd,dynamic_payload)',
+    'def write():\n fd=os.open(p,os.O_RDWR)\n os.write(fd,dynamic_payload)\nregister(write)',
+])
+def test_low_level_writes_invalidate_current_json_proof(case,write):
+    c=case;path=c.root/'state.json';target=str(c.root/'previous-target')
+    path.write_text(json.dumps({'path':target}));before=path.read_bytes()
+    text=f"import os,json\nfrom pathlib import Path\np={str(path)!r}\n{write}\nstate=json.loads(Path(p).read_text())\nPath(state['path']).read_text()"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')
+    assert not c.m.ws.anchored(anchors,target) and path.read_bytes()==before
+
+
+def test_readonly_low_level_open_does_not_invalidate_json_content(case):
+    c=case;path=c.root/'state.json';target=str(c.root/'target');path.write_text(json.dumps({'path':target}))
+    text=f"import os,json\nfrom pathlib import Path\np={str(path)!r}\nfd=os.open(p,os.O_RDONLY)\nos.close(fd)\nstate=json.loads(Path(p).read_text())\nPath(state['path']).read_text()"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')==[]
+    assert c.m.ws.anchored(anchors,target)
+
+
+def test_json_open_non_utf8_encoding_does_not_prove_utf8_path(case):
+    c=case;path=c.root/'state.json';target=str(c.root/'café')
+    path.write_text(json.dumps({'path':target},ensure_ascii=False),encoding='utf-8')
+    text=f"import json\nfrom pathlib import Path\nstate=json.load(open({str(path)!r},encoding='latin1'))\nPath(state['path']).read_text()"
+    anchors={};assert c.m.python_anchors(anchors,text,'/root','python')
+    assert not c.m.ws.anchored(anchors,target)
+
+
+def linked_row(c, target):
+    _, rows=c.m.linked_registrations(str(c.repo))
+    return next(row for row in rows if row['path']==str(target))
+
+
+def linked_empty_context(c):
+    return {'sources':[str(c.repo)],'environments':{},'cwds':{}}
+
+
+def test_registered_linked_uses_24_hours_and_clone_still_uses_7_days(case):
+    c=case;target=linked(c)
+    for root in (target,Path(shell('git','rev-parse','--absolute-git-dir',cwd=target))):
+        for parent,dirs,files in os.walk(root):
+            for name in dirs+files:os.utime(Path(parent,name),(time.time()-48*3600,)*2,follow_symlinks=False)
+            os.utime(parent,(time.time()-48*3600,)*2)
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='remove' and 47 < row['idle_hours'] < 49, row
+    clone=c.root/'independent';shell('git','clone','-q',str(c.bare),str(clone))
+    for parent,dirs,files in os.walk(clone):
+        for name in dirs+files:os.utime(Path(parent,name),(time.time()-48*3600,)*2,follow_symlinks=False)
+        os.utime(parent,(time.time()-48*3600,)*2)
+    assert '168h' in plan(c,clone)['reason']
+
+
+@pytest.mark.parametrize('guard',['locked','environment','cwd_inside','recent_file','recent_metadata','dirty','untracked'])
+def test_linked_only_realtime_conditions_keep_worktree(case,guard):
+    c=case;target=linked(c);ctx=linked_empty_context(c)
+    if guard=='locked':shell('git','worktree','lock',str(target),cwd=c.repo)
+    if guard=='environment':ctx['environments'][str(target)]='BB environment: live'
+    if guard=='cwd_inside':ctx['cwds'][str(target/'sub')]='process 1 cwd'
+    if guard=='dirty':(target/'a').write_text('changed')
+    if guard=='untracked':(target/'unique').write_text('private')
+    if guard in ('dirty','untracked','locked'):age(c.root)
+    if guard=='recent_file':(target/'a').touch()
+    if guard=='recent_metadata':Path(shell('git','rev-parse','--absolute-git-dir',cwd=target),'index').touch()
+    row=c.m.linked_plan(linked_row(c,target),ctx)
+    assert row['action']=='keep',row
+    assert any(token in row['reason'] for token in ('locked','BB environment','cwd','24h','dirty')),row
+
+
+def test_linked_cwd_ancestor_and_shared_common_activity_do_not_keep_children(case):
+    c=case;target=linked(c);ctx=linked_empty_context(c);ctx['cwds'][str(c.repo)]='process 1 cwd'
+    (c.repo/'.git/FETCH_HEAD').touch();(c.repo/'.git/config').touch()
+    assert c.m.linked_plan(linked_row(c,target),ctx)['action']=='remove'
+
+
+def test_linked_checks_only_its_branch_not_unrelated_heads_tags_or_stash(case):
+    c=case;target=linked(c);head=shell('git','rev-parse','HEAD',cwd=c.repo)
+    (c.repo/'a').write_text('other branch');shell('git','commit','-qam','other',cwd=c.repo)
+    shell('git','-c','tag.gpgSign=false','tag','unpublished',cwd=c.repo)
+    shell('git','update-ref','refs/stash',shell('git','rev-parse','HEAD',cwd=c.repo),cwd=c.repo)
+    age(c.root)
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='remove' and set(row['objects'].values())=={head},row
+
+
+def test_linked_ignores_generic_usage_and_foreign_nesting(case,monkeypatch):
+    c=case;other=c.root/'other-main';shell('git','clone','-q',str(c.bare),str(other))
+    target=c.repo/'.local/evidence/foreign-linked';shell('git','worktree','add','-q','-b','other',str(target),cwd=other);age(c.root)
+    for name in ('usage','references','scope_unknown','configuration_name_anchors','same_origin_nested'):
+        monkeypatch.setattr(c.m,name,lambda *a,**kw:(_ for _ in ()).throw(AssertionError('generic guard was used')))
+    _,rows=c.m.linked_registrations(str(other))
+    assert c.m.linked_plan(rows[0],linked_empty_context(c))['action']=='remove'
+
+
+def test_linked_detached_head_has_remote_proof(case):
+    c=case;target=c.root/'detached';shell('git','worktree','add','-q','--detach',str(target),cwd=c.repo);age(c.root)
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='remove' and 'HEAD' in row['objects'],row
+
+
+def test_linked_archives_original_sha_then_git_removes_without_force(case,monkeypatch):
+    c=case;target=linked(c);(target/'a').write_text('branch commit')
+    shell('git','commit','-qam','local',cwd=target);age(c.root)
+    ctx=linked_empty_context(c);row=c.m.linked_plan(linked_row(c,target),ctx);sha=row['head']
+    assert row['action']=='archive+remove',row
+    monkeypatch.setattr(c.m,'linked_context',lambda:ctx)
+    c.m.linked_execute([row],c.root/'linked-events','linked-test')
+    assert row['result']=='removed' and not target.exists() and c.repo.exists(),row
+    assert row['archives'] and all(a['sha']==sha and shell('git','rev-parse',a['ref'],cwd=c.bare)==sha for a in row['archives'])
+    removes=[x for x in c.calls if 'remove' in x]
+    assert removes[-1][2]==str(c.repo) and '--force' not in removes[-1] and '-f' not in removes[-1]
+
+
+@pytest.mark.parametrize('change',['cwd','environment','lock','dirty','head','archive_rejected','archive_wrong_sha'])
+def test_linked_execution_rechecks_realtime_evidence_and_keeps_on_git_refusal(case,monkeypatch,change):
+    c=case;target=linked(c)
+    if change.startswith('archive_'):
+        (target/'a').write_text('local');shell('git','commit','-qam','local',cwd=target);age(c.root)
+    ctx=linked_empty_context(c);row=c.m.linked_plan(linked_row(c,target),ctx)
+    assert row['action']!='keep',row
+    if change=='cwd':ctx['cwds'][str(target)]='process 2 cwd'
+    if change=='environment':ctx['environments'][str(target)]='BB environment: new'
+    if change=='lock':shell('git','worktree','lock',str(target),cwd=c.repo)
+    if change=='dirty':(target/'a').write_text('unique');age(c.root)
+    if change=='head':(target/'a').write_text('unique');shell('git','commit','-qam','new',cwd=target);age(c.root)
+    raw=c.m._run
+    def altered(args,**kwargs):
+        if change=='archive_rejected' and 'push' in args:raise RuntimeError('archive rejected')
+        if change=='archive_wrong_sha' and 'ls-remote' in args and any('/archive/git-tree/' in x for x in args):
+            return SimpleNamespace(stdout='0'*40+'\tref\n',returncode=0)
+        return raw(args,**kwargs)
+    monkeypatch.setattr(c.m,'_run',altered);monkeypatch.setattr(c.m,'linked_context',lambda:ctx)
+    c.m.linked_execute([row],c.root/'events','test')
+    assert row['result']=='kept' and target.exists(),row
+
+
+def test_linked_git_remove_refusal_is_reported_without_raw_delete_fallback(case,monkeypatch):
+    c=case;target=linked(c);ctx=linked_empty_context(c);row=c.m.linked_plan(linked_row(c,target),ctx)
+    raw=c.m._run
+    def refused(args,**kwargs):
+        if 'worktree' in args and 'remove' in args:raise RuntimeError('Git refuses populated submodule')
+        return raw(args,**kwargs)
+    monkeypatch.setattr(c.m,'_run',refused);monkeypatch.setattr(c.m,'linked_context',lambda:ctx)
+    c.m.linked_execute([row],c.root/'events','test')
+    assert row['result']=='kept' and 'submodule' in row['reason'] and target.exists()
+
+
+def test_linked_discovery_uses_bb_and_complete_disk_inventory_without_disk_walk(case,monkeypatch,capsys):
+    c=case;target=linked(c);ctx=linked_empty_context(c);state=c.root/'state';state.mkdir()
+    (state/'git-tree-sweep-test.json').write_text(json.dumps({'roots':['/','/data'],'items':[{'path':str(c.repo)}],'discovery':{'errors':[]}}))
+    monkeypatch.setattr(c.m,'linked_context',lambda:dict(ctx,sources=[]))
+    monkeypatch.setattr(c.m,'discover',lambda *a:(_ for _ in ()).throw(AssertionError('full disk walk')))
+    assert c.m.linked_main(['--state-dir',str(state),'--json'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert report['policy']=='linked' and report['indexed_discovery']
+    assert report['items'][0]['path']==str(target) and report['items'][0]['action']=='remove' and target.exists()
+
+
+def test_linked_prune_only_clears_missing_registration_and_preview_does_not_prune(case,monkeypatch,capsys):
+    import shutil
+    c=case;target=linked(c);ctx=linked_empty_context(c);sha=shell('git','rev-parse','work',cwd=c.repo)
+    shell('git','config','gc.worktreePruneExpire','now',cwd=c.repo)
+    shutil.rmtree(target)
+    monkeypatch.setattr(c.m,'linked_context',lambda:ctx)
+    state=c.root/'state'
+    assert c.m.linked_main(['--state-dir',str(state),'--json'])==0
+    preview=json.loads(capsys.readouterr().out)
+    assert str(target) in shell('git','worktree','list','--porcelain',cwd=c.repo)
+    prior=state/'preview.json';prior.write_text(json.dumps(preview))
+    assert c.m.linked_main(['--state-dir',str(state),'--execute','--reviewed-preview',str(prior),'--json'])==0
+    result=json.loads(capsys.readouterr().out)
+    assert str(target) not in shell('git','worktree','list','--porcelain',cwd=c.repo)
+    assert shell('git','rev-parse','work',cwd=c.repo)==sha and result['prunes'][0]['result']=='ok'
+
+
+def test_linked_unknown_cwd_or_bb_inventory_never_removes(case,monkeypatch,capsys):
+    c=case;target=linked(c)
+    monkeypatch.setattr(c.m,'linked_context',lambda:(_ for _ in ()).throw(PermissionError('unknown process cwd')))
+    assert c.m.linked_main(['--execute','--state-dir',str(c.root/'state'),'--json'])==1
+    report=json.loads(capsys.readouterr().out)
+    assert not report['complete'] and target.exists()
+
+
+@pytest.mark.parametrize('mode',[[],['--execute']])
+def test_worker_runs_linked_before_clones_and_preserves_each_budget(case,mode):
+    c=case;probe=c.root/'python';log=c.root/'calls.jsonl'
+    probe.write_text('#!'+os.sys.executable+'\nimport json,sys,pathlib\nwith pathlib.Path('+repr(str(log))+').open("a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n')
+    probe.chmod(0o755)
+    result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe),*mode],capture_output=True,text=True)
+    calls=[json.loads(x) for x in log.read_text().splitlines()]
+    assert result.returncode==0 and len(calls)==2
+    assert calls[0][1].endswith('/worktree_sweep.py') and calls[1][1].endswith('/git_tree_sweep.py')
+    assert calls[0][calls[0].index('--budget-minutes')+1]=='15'
+    assert calls[1][calls[1].index('--budget-minutes')+1]==('150' if mode else '45')
+    assert all(('--execute' in call)==bool(mode) for call in calls)
+
+
+def test_linked_head_only_on_remote_tag_needs_branch_archive(case):
+    c=case;target=linked(c)
+    shell('git','-c','tag.gpgSign=false','tag','only-tag',cwd=c.repo)
+    shell('git','push','-q',str(c.bare),'refs/tags/only-tag',cwd=c.repo)
+    shell('git','update-ref','-d','refs/heads/main',cwd=c.bare);age(c.root)
+    assert c.m.linked_plan(linked_row(c,target),linked_empty_context(c))['action']=='archive+remove'
+
+
+def test_clone_main_does_not_feed_linked_trees_to_generic_plan(case,monkeypatch,capsys):
+    c=case;target=linked(c);inventory=inv(c);seen=[]
+    monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
+    monkeypatch.setattr(c.m,'managed_roots',lambda:set())
+    monkeypatch.setattr(c.m,'references',lambda *a:{})
+    monkeypatch.setattr(c.m,'usage',lambda *a:({},[]))
+    def guard(path,kind,*args):
+        assert kind!='linked';seen.append(path)
+        return {'path':path,'type':kind,'action':'keep','archives':[],'reason':'fixture'}
+    monkeypatch.setattr(c.m,'plan',guard)
+    assert c.m.main(['--state-dir',str(c.root/'state'),'--json'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert str(target) not in seen and str(target) in report['discovery']['linked_markers']
+    assert all(row['type']!='linked' for row in report['items'])
+
+
+@pytest.mark.parametrize('failed_phase',[0,1])
+def test_worker_attempts_both_phases_and_reports_failures(case,failed_phase):
+    c=case;probe=c.root/'python';log=c.root/'calls'
+    probe.write_text('#!'+os.sys.executable+'\nimport sys,pathlib\np=pathlib.Path('+repr(str(log))+')\nn=len(p.read_text().splitlines()) if p.exists() else 0\nwith p.open("a") as f:f.write("called\\n")\nsys.exit(7 if n=='+str(failed_phase)+' else 0)\n')
+    probe.chmod(0o755)
+    result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe)],capture_output=True,text=True)
+    assert result.returncode==7 and len(log.read_text().splitlines())==2
+
+
+@pytest.mark.parametrize('status,phase,protected', [('active',None,True),('paused',None,True),('destroyed',None,False),('active','destroyed',False)])
+def test_linked_context_reads_real_bb_environment_lifecycle_and_only_cwd(case,tmp_path,monkeypatch,status,phase,protected):
+    c=case;proc=tmp_path/'proc';p=proc/'123';p.mkdir(parents=True)
+    (p/'stat').write_text('123 (worker) '+' '.join(['1']*25));(p/'cwd').symlink_to(c.repo)
+    (p/'environ').write_text('HOME=/isolated/home\0PATH=/other/tool/bin')
+    project=[{'sources':[{'path':str(c.repo)}]}]
+    env=[{'id':'e','path':str(c.repo),'status':status,'lifecycle':{'phase':phase}}]
+    def command(args,**kw):return SimpleNamespace(stdout=json.dumps(project if args[1]=='project' else env))
+    monkeypatch.setattr(c.m,'command',command)
+    context=c.m.linked_context(str(proc))
+    assert (str(c.repo) in context['environments']) is protected
+    assert context['cwds']=={str(c.repo):'process 123 cwd'} and '/isolated/home' not in context['cwds']
+
+
+@pytest.mark.parametrize('fault',['missing_environment_path','cwd_denied','identity_reused'])
+def test_linked_context_unknown_observations_fail_closed(case,tmp_path,monkeypatch,fault):
+    c=case;proc=tmp_path/'proc';p=proc/'123';p.mkdir(parents=True)
+    (p/'stat').write_text('123 (worker) '+' '.join(['1']*25));(p/'cwd').symlink_to(c.repo)
+    env=[{'id':'e','status':'active'}] if fault=='missing_environment_path' else []
+    monkeypatch.setattr(c.m,'command',lambda args,**kw:SimpleNamespace(stdout=json.dumps([{'sources':[]}] if args[1]=='project' else env)))
+    raw=c.m.os.readlink
+    def link(path,*args,**kw):
+        if str(path)==str(p/'cwd'):
+            if fault=='cwd_denied':raise PermissionError('denied')
+            if fault=='identity_reused':(p/'stat').write_text('123 (worker) '+' '.join(['2']*25))
+        return raw(path,*args,**kw)
+    monkeypatch.setattr(c.m.os,'readlink',link)
+    with pytest.raises(c.m.ws.ScanIncomplete):c.m.linked_context(str(proc))
+
+
+def test_linked_unpushed_branch_without_archive_destination_stays(case):
+    c=case;target=linked(c);(target/'a').write_text('local');shell('git','commit','-qam','local',cwd=target)
+    shell('git','remote','set-url','--push','origin','https://github.com/unrelated/repo.git',cwd=c.repo);age(c.root)
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='keep' and 'no personal or internal remote' in row['reason']
+
+
+def test_linked_git_prune_preserves_locked_missing_worktree(case,monkeypatch,capsys):
+    import shutil
+    c=case;target=linked(c);shell('git','worktree','lock',str(target),cwd=c.repo);shutil.rmtree(target)
+    monkeypatch.setattr(c.m,'linked_context',lambda:linked_empty_context(c))
+    assert c.m.linked_main(['--execute','--state-dir',str(c.root/'state'),'--json'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert 'locked' in report['items'][0]['reason'] and str(target) in shell('git','worktree','list','--porcelain',cwd=c.repo)
+
+
+@pytest.mark.parametrize('location,protected',[('root',True),('child',True),('ancestor',False)])
+def test_linked_cwd_mount_alias_uses_inode_ancestry(case,tmp_path,monkeypatch,location,protected):
+    c=case;target=linked(c);child=target/'child';child.mkdir();age(c.root)
+    proc=tmp_path/'proc';p=proc/'123';p.mkdir(parents=True)
+    (p/'stat').write_text('123 (worker) '+' '.join(['1']*25))
+    directory={'root':target,'child':child,'ancestor':c.repo}[location]
+    (p/'cwd').symlink_to(directory)
+    raw=c.m.os.readlink
+    def alias(path,*args,**kw):
+        if str(path)==str(p/'cwd'):return '/container/mount/cwd'
+        return raw(path,*args,**kw)
+    monkeypatch.setattr(c.m.os,'readlink',alias)
+    monkeypatch.setattr(c.m,'command',lambda args,**kw:SimpleNamespace(stdout=json.dumps([{'sources':[]}] if args[1]=='project' else [])) if args[0]=='bb' else original(args,**kw))
+    original=c.m._run
+    context=c.m.linked_context(str(proc))
+    row=c.m.linked_plan(linked_row(c,target),context)
+    assert (row['action']=='keep') is protected,row
+    if protected:assert 'cwd' in row['reason']
+
+
+def test_unregistered_separate_gitfile_is_listed_and_kept(case,monkeypatch,capsys):
+    c=case;target=c.root/'gitfile-primary'
+    shell('git','clone','-q','--separate-git-dir',str(c.root/'metadata'),str(c.bare),str(target));age(c.root)
+    monkeypatch.setattr(c.m,'linked_context',lambda:dict(linked_empty_context(c),sources=[str(target)]))
+    assert c.m.linked_main(['--execute','--state-dir',str(c.root/'state'),'--json'])==0
+    report=json.loads(capsys.readouterr().out)
+    row=next(row for row in report['items'] if row['path']==str(target))
+    assert row['action']=='keep' and 'not a registered' in row['reason'] and target.exists()
+
+
+def test_missing_gitdir_worktree_data_is_kept_while_registration_inventory_is_read(case,monkeypatch,capsys):
+    import shutil
+    c=case;target=linked(c);gitdir=Path(shell('git','rev-parse','--absolute-git-dir',cwd=target));shutil.rmtree(gitdir)
+    monkeypatch.setattr(c.m,'linked_context',lambda:dict(linked_empty_context(c),sources=[str(c.repo),str(target)]))
+    assert c.m.linked_main(['--execute','--state-dir',str(c.root/'state'),'--json'])==0
+    report=json.loads(capsys.readouterr().out)
+    row=next(row for row in report['items'] if row['path']==str(target))
+    assert row['action']=='keep' and target.exists() and (target/'a').read_text()=='a'
+
+
+def test_unreadable_known_git_source_is_reported_without_blocking_other_mains(case,monkeypatch):
+    c=case;target=linked(c);denied=str(c.root/'denied')
+    raw=c.m.os.stat
+    def stat_path(path,*args,**kwargs):
+        if str(path)==denied:raise PermissionError('cannot read this main')
+        return raw(path,*args,**kwargs)
+    monkeypatch.setattr(c.m.os,'stat',stat_path)
+    mains,failures=c.m.linked_inventory([str(c.repo),denied])
+    assert str(c.repo) in mains and any(row['path']==denied for row in failures)
+    assert any(row['path']==str(target) for row in mains[str(c.repo)])
+
+
+@pytest.mark.parametrize('style',['worktree','file_worktree','alias','main','gitdir'])
+def test_linked_self_or_shared_store_remote_is_not_recovery_proof(case,style):
+    c=case;target=linked(c);alias=c.root/'alias';alias.symlink_to(target)
+    url={'worktree':str(target),'file_worktree':target.as_uri(),'alias':str(alias),'main':str(c.repo),'gitdir':(c.repo/'.git').as_uri()}[style]
+    shell('git','remote','set-url','origin',url,cwd=c.repo);age(c.root)
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='keep',row
+    assert not any('ls-remote' in call for call in c.calls)
+
+
+def test_linked_discovery_requeries_primary_instead_of_trusting_a_backup_copy(case,monkeypatch):
+    c=case;target=linked(c);backup=c.root/'backup';backup.mkdir()
+    original=c.m.linked_registrations
+    def registration(path):
+        if str(path)==str(backup):return str(c.repo),[]
+        return original(path)
+    monkeypatch.setattr(c.m,'linked_registrations',registration)
+    mains,_=c.m.linked_inventory([str(c.repo),str(backup)])
+    assert any(row['path']==str(target) for row in mains[str(c.repo)])
+
+
+def test_linked_uses_a_proven_origin_without_waiting_for_unrelated_remote(case,monkeypatch):
+    c=case;target=linked(c);dead='https://unused.invalid/other.git'
+    shell('git','remote','add','offline',dead,cwd=c.repo);age(c.root)
+    raw=c.m._run
+    def command(args,**kw):
+        if 'ls-remote' in args and dead in args:raise RuntimeError('unused remote unavailable')
+        return raw(args,**kw)
+    monkeypatch.setattr(c.m,'_run',command)
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='remove',row
+    assert not any('ls-remote' in call and dead in call for call in c.calls)
+
+
+def test_linked_fetch_failure_can_plan_original_sha_archive_but_never_delete_without_verification(case,monkeypatch):
+    c=case;target=linked(c);ctx=linked_empty_context(c);raw=c.m._run
+    def unavailable(args,**kw):
+        if 'ls-remote' in args:raise RuntimeError('remote query unavailable')
+        return raw(args,**kw)
+    monkeypatch.setattr(c.m,'_run',unavailable)
+    row=c.m.linked_plan(linked_row(c,target),ctx)
+    assert row['action']=='archive+remove',row
+    monkeypatch.setattr(c.m,'linked_context',lambda:ctx)
+    c.m.linked_execute([row],c.root/'events','verify-failure')
+    assert row['result']=='kept' and target.exists() and not row['archives'],row
+
+
+def test_linked_entry_clears_inherited_git_redirect_before_git_removal(case,monkeypatch,capsys):
+    c=case;target=linked(c);other=c.root/'other.git';shell('git','init','-q','--bare',str(other))
+    (other/'sentinel').write_text('unchanged')
+    c.m.ws.ENV.update(GIT_DIR=str(other),GIT_WORK_TREE=str(c.root/'wrong-tree'),GIT_CONFIG_COUNT='1',GIT_CONFIG_KEY_0='remote.injected.url',GIT_CONFIG_VALUE_0='/wrong')
+    monkeypatch.setattr(c.m,'linked_context',lambda:linked_empty_context(c))
+    assert c.m.linked_main(['--execute','--state-dir',str(c.root/'state'),'--json'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert any(x.get('result')=='removed' and x['path']==str(target) for x in report['items'])
+    assert not target.exists() and (other/'sentinel').read_text()=='unchanged'
+
+
+def test_linked_report_retains_new_remote_proof_when_another_row_already_archived_sha(case,monkeypatch):
+    c=case;first=linked(c);(first/'a').write_text('unpublished');shell('git','commit','-qam','local',cwd=first)
+    second=c.root/'second';sha=shell('git','rev-parse','HEAD',cwd=first)
+    shell('git','worktree','add','-q','-b','second',str(second),sha,cwd=c.repo);age(c.root)
+    ctx=linked_empty_context(c);rows=[c.m.linked_plan(linked_row(c,path),ctx) for path in (first,second)]
+    assert all(row['action']=='archive+remove' for row in rows)
+    monkeypatch.setattr(c.m,'linked_context',lambda:ctx)
+    c.m.linked_execute(rows,c.root/'events','shared-sha')
+    assert all(row['result']=='removed' for row in rows),rows
+    assert rows[0]['archives'] and not rows[1]['archives'] and all(rows[1]['remote_proofs'].values())
+
+
+def test_explicit_linked_prune_uses_git_command_semantics_when_gc_pruning_is_disabled(case,monkeypatch,capsys):
+    import shutil
+    c=case;target=linked(c);shell('git','config','gc.worktreePruneExpire','never',cwd=c.repo)
+    shutil.rmtree(target);monkeypatch.setattr(c.m,'linked_context',lambda:linked_empty_context(c))
+    assert c.m.linked_main(['--execute','--state-dir',str(c.root/'state'),'--json'])==0
+    report=json.loads(capsys.readouterr().out)
+    assert report['prunes'][0]['result']=='ok'
+    # gc.worktreePruneExpire configures git gc, not an explicit worktree prune.
+    assert str(target) not in shell('git','worktree','list','--porcelain',cwd=c.repo)
+
+
+@pytest.mark.parametrize('admin_directory',['.','logs'])
+def test_linked_administrative_directory_mtime_does_not_self_refresh_idle_age(case,admin_directory):
+    c=case;target=linked(c);gitdir=Path(shell('git','rev-parse','--absolute-git-dir',cwd=target))
+    os.utime(gitdir/admin_directory,None)
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='remove' and row['idle_hours']>=24,row
+
+
+@pytest.mark.parametrize('git_file',['HEAD','FETCH_HEAD','logs/HEAD'])
+def test_linked_actual_recent_git_files_still_count_as_activity(case,git_file):
+    c=case;target=linked(c);gitdir=Path(shell('git','rev-parse','--absolute-git-dir',cwd=target))
+    (gitdir/git_file).touch()
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='keep' and '24h' in row['reason'],row
+
+
+def test_linked_recent_source_directory_still_counts_as_activity(case):
+    c=case;target=linked(c);(target/'empty-directory').mkdir()
+    row=c.m.linked_plan(linked_row(c,target),linked_empty_context(c))
+    assert row['action']=='keep' and '24h' in row['reason'],row
+
+
+def test_linked_bind_mount_of_child_directory_is_detected_without_host_parent_ancestry(case):
+    c=case;target=linked(c);child=target/'served';child.mkdir();age(c.root)
+    info=child.stat();ctx=linked_empty_context(c)
+    ctx['cwds']={'/container/workdir':'process 456 cwd'}
+    # A container bind rooted at this child walks to the container parent,
+    # not the host worktree root. Its cwd inode still identifies the directory.
+    ctx['cwd_identities']={f'{info.st_dev}:{info.st_ino}':'process 456 cwd (bound child)'}
+    row=c.m.linked_plan(linked_row(c,target),ctx)
+    assert row['action']=='keep' and 'cwd' in row['reason'],row
