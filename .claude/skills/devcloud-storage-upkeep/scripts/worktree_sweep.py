@@ -918,4 +918,4 @@ if __name__ == "__main__":
     entry = Path(__file__).with_name('git_tree_sweep.py')
     namespace = {'__name__': 'git_tree_sweep_cli', '__file__': str(entry)}
     exec(compile(entry.read_bytes(), str(entry), 'exec'), namespace)
-    sys.exit(namespace['main']())
+    sys.exit(namespace['linked_main']())

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inventory all local Git working trees; dry-run unless --execute is supplied.
+"""Full-disk independent clones; worktree_sweep.py handles registered linked trees.
 
 Owner policy 2026-11-17. Discovery is physical, unbounded in depth and -xdev
 per disk. Legacy entrypoints supply helpers only; they are not scheduled.
@@ -7,6 +7,7 @@ per disk. Legacy entrypoints supply helpers only; they are not scheduled.
 from __future__ import annotations
 
 import argparse
+import ast
 import concurrent.futures as cf
 import contextlib
 import fcntl
@@ -257,15 +258,27 @@ def scope_unknown(anchors, records, inventory):
                 path = prefix['path']
                 protected.update(tree for tree in trees if inside(path, tree) or
                                  (tree.startswith(path) if prefix['partial'] else inside(tree, path)))
-        elif record.get('project_id') and (record.get('project_paths') or record.get('project_remote_ids')):
+        elif record.get('project_id') and (record.get('project_paths') or record.get('project_source_paths') or
+                                           record.get('project_environment_paths') or record.get('project_remote_ids')):
             record['scope'] = 'project'
-            paths = record.get('project_paths', [])
+            paths = record.get('project_source_paths', record.get('project_paths', []))
+            environment_paths = record.get('project_environment_paths', [])
             identities = set(record.get('project_remote_ids', []))
             source_trees = {tree for tree in trees if any(inside(path, tree) for path in paths)}
+            if paths and not source_trees:
+                # A non-Git project container (e.g. /data/code) does not own
+                # every repository below it, or its environments' remotes.
+                identities.clear()
+                record['project_scope_kind'] = 'source-points-and-environments'
+            else:
+                record['project_scope_kind'] = 'git-source-and-matching-remotes'
             for tree in source_trees:
                 identities.update(urls.get(tree, []))
             protected.update(source_trees)
+            protected.update(tree for tree in trees if any(inside(path, tree) for path in environment_paths))
             protected.update(tree for tree, remotes in urls.items() if identities.intersection(remotes) and tree in trees)
+            for point in paths + environment_paths:
+                anchor(anchors, point, f'unresolved project reference: {record["source"]}')
         else:
             record['scope'] = 'global'
             protected.update(trees)
@@ -489,7 +502,7 @@ def process_anchors(anchors, proc='/proc'):
                     target = os.readlink(link).removesuffix(' (deleted)')
                     if link == base / 'cwd':
                         cwd = target
-                        process_directory(anchors, environments.scopes, target, login_home, mounts, f'process {pid} cwd')
+                        anchor(anchors, target, f'process {pid} cwd')
                     anchor(anchors, target, f'process {pid}')
                 except FileNotFoundError:
                     pass
@@ -859,6 +872,743 @@ def environment_references(anchors, text, home, reason, environments=None, metad
     return unique_unknown(records)
 
 
+def read_json_state(path):
+    """Read one current regular JSON file; never call script decoder hooks."""
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_size > CONFIG_TEXT_LIMIT:
+            raise ValueError('JSON state is not bounded regular text')
+        data = bytearray()
+        while len(data) <= CONFIG_TEXT_LIMIT:
+            checkpoint()
+            block = os.read(fd, min(65536, CONFIG_TEXT_LIMIT + 1 - len(data)))
+            if not block: break
+            data.extend(block)
+        def identity(info):
+            return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+        if len(data) > CONFIG_TEXT_LIMIT or identity(before) != identity(os.fstat(fd)) or identity(before) != identity(os.stat(path)):
+            raise ValueError('JSON state changed while reading')
+        return json.loads(data.decode('utf-8'))
+    finally:
+        os.close(fd)
+
+
+def python_anchors(anchors, text, home, reason, environments=None, metadata=None, _depth=0):
+    """Read declared Python scripts as syntax, without importing or executing them.
+
+    Data loops are not shell path expressions. Track literal path construction,
+    bounded glob iterations and observed environment values; an unbounded file
+    operand still falls back to its BB project, just like an unknown shell path.
+    """
+    if _depth > 8:
+        return [unresolved(reason, 'Python expansion limit')]
+    try:
+        module = ast.parse(text)
+    except SyntaxError:
+        text_anchors(anchors, text, home, reason, strict=False)
+        return [unresolved(reason, 'Python syntax unresolved')]
+    pools = {key: set(values) for key, values in (environments or {}).items()}
+    for key, value in os.environ.items():
+        pools.setdefault(key, set()).add(value)
+    for key, values in (metadata or {}).items():
+        pools[key] = set(values)
+    pools['HOME'] = {home}
+    if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and
+           isinstance(node.func.value, ast.Name) and node.func.value.id == 'os' and node.func.attr == 'chdir'
+           for node in ast.walk(module)):
+        pools.setdefault('PWD', set()).add('$PWD')  # May differ from its launch cwd.
+    unknown = []
+    mutable_globals = {key for node in ast.walk(module) if isinstance(node, (ast.Global, ast.Nonlocal)) for key in node.names}
+    definitions, visited_functions, bounded_callbacks = [], set(), set()
+    call_depth = 0
+    container_names, container_tainted = set(), False
+    mutators = {'append', 'extend', 'insert', 'pop', 'remove', 'clear', 'sort', 'reverse', 'add', 'update',
+                'discard', 'setdefault', 'popitem', 'difference_update', 'intersection_update', 'symmetric_difference_update', '__setitem__', '__delitem__'}
+    def bindings_from(target, value):
+        if isinstance(target, (ast.Tuple, ast.List)) and isinstance(value, (ast.Tuple, ast.List)) and len(target.elts) == len(value.elts):
+            return [pair for left, right in zip(target.elts, value.elts) for pair in bindings_from(left, right)]
+        return [(target, value)]
+    assignments = [pair for node in ast.walk(module) if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None
+                   for target in (node.targets if isinstance(node, ast.Assign) else [node.target]) for pair in bindings_from(target, node.value)]
+    for _ in range(len(assignments) + 1):
+        before = len(container_names)
+        for target, value in assignments:
+            container = isinstance(value, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.ListComp, ast.SetComp, ast.DictComp)) or (
+                isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id in ('list', 'set', 'dict', 'tuple', 'sorted'))
+            if container or isinstance(value, ast.Name) and value.id in container_names:
+                container_names.update(node.id for node in ast.walk(target) if isinstance(node, ast.Name))
+        if before == len(container_names): break
+
+    def mutation(node):
+        return any(isinstance(part, ast.Subscript) and isinstance(part.ctx, (ast.Store, ast.Del)) or
+                   isinstance(part, ast.Attribute) and part.attr in mutators or isinstance(part, ast.AugAssign)
+                   for part in ast.walk(node))
+    # Alias/callback order is not evaluated. Once a mutator escapes or a
+    # container can change anywhere, no old finite container values may prove
+    # a path bound, including earlier definitions invoked by a later callback.
+    container_tainted = mutation(module)
+    constructors = set()
+    path_classes = {'Path', 'PurePath', 'PosixPath', 'PurePosixPath'}
+    shadowed = {node.id for node in ast.walk(module) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
+    shadowed.update(node.name for node in ast.walk(module) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)))
+    shadowed.update(node.arg for node in ast.walk(module) if isinstance(node, ast.arg))
+    assigned_attributes = {ast.unparse(node) for node in ast.walk(module) if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store)}
+    imports = {}
+    for node in ast.walk(module):
+        if isinstance(node, ast.Import):
+            for alias in node.names: imports[alias.asname or alias.name.split('.')[0]] = alias.name
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names: imports[alias.asname or alias.name] = (node.module or '') + '.' + alias.name
+        if isinstance(node, ast.ImportFrom) and node.module == 'pathlib':
+            for alias in node.names:
+                constructors.update(path_classes if alias.name == '*' else {alias.asname or alias.name} if alias.name in path_classes else set())
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == 'pathlib': constructors.update((alias.asname or alias.name) + '.' + name for name in path_classes)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            anchor(anchors, node.value, reason)
+            if '/' in node.value:
+                text_anchors(anchors, node.value, home, reason, strict=False)
+
+    path_methods = {'open', 'read_text', 'read_bytes', 'write_text', 'write_bytes', 'exists', 'is_file', 'is_dir',
+                    'stat', 'lstat', 'glob', 'rglob', 'iterdir', 'mkdir', 'unlink', 'rmdir', 'touch', 'readlink',
+                    'rename', 'replace', 'chmod', 'chown', 'symlink_to', 'hardlink_to'}
+    file_calls = {'open', 'builtins.open', 'io.open', 'os.open', 'os.stat', 'os.lstat', 'os.scandir', 'os.listdir', 'os.unlink', 'os.chdir',
+                  'os.remove', 'os.mkdir', 'os.makedirs', 'os.path.exists', 'os.path.isfile', 'os.path.isdir',
+                  'os.rename', 'os.replace', 'shutil.copy', 'shutil.copy2', 'shutil.copyfile', 'shutil.copytree',
+                  'shutil.move', 'shutil.rmtree'}
+    destinations = {'os.rename', 'os.replace', 'shutil.copy', 'shutil.copy2', 'shutil.copyfile', 'shutil.copytree', 'shutil.move'}
+    file_keywords = {'open':{'file'}, 'builtins.open':{'file'}, 'io.open':{'file'}, 'os.makedirs':{'name'}}
+    path_flags = {'-C', '--cwd', '--chdir', '--directory', '--git-dir', '--work-tree', '--environment', '--env-path',
+                  '--config', '--file', '--path', '--root', '--script', '--script-file', '--prompt-file', '--state-dir', '--output', '--output-dir'}
+
+    def bounded(items):
+        result = set()
+        for item in items:
+            result.add(item)
+            if len(result) > 256:
+                return {'$python'}  # No partial set may narrow an unknown operand.
+        return result
+
+    def name(node):
+        return ast.unparse(node) if isinstance(node, (ast.Name, ast.Attribute)) else ''
+
+    def joined(left, right):
+        # Path(base) / absolute drops base. A wholly unknown RHS therefore
+        # has both a bounded relative case and an unbounded absolute case.
+        return bounded(value for a in left for b in right
+                       for value in ([os.path.join(a, b), '$python'] if b.startswith('$') else [os.path.join(a, b)]))
+
+    def canonical_call(node):
+        called = name(node)
+        root = called.split('.')[0]
+        return imports.get(root, root) + called[len(root):]
+
+    json_objects, argv_objects, json_cache, file_objects = {}, {}, {}, {}
+    written_json_paths, unknown_json_write = set(), False
+    json_keys_changed, json_all_changed = set(), False
+    json_names = set()
+    function_nodes = {node.name: node for node in ast.walk(module) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+    def json_expression(node):
+        return (isinstance(node, ast.Name) and node.id in json_names or
+                isinstance(node, ast.Subscript) and json_expression(node.value) or
+                isinstance(node, (ast.List, ast.Tuple, ast.Set, ast.Dict, ast.Starred, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp, ast.comprehension)) and
+                    any(json_expression(child) for child in ast.iter_child_nodes(node)) or
+                isinstance(node, ast.Call) and (canonical_call(node.func) in ('json.load', 'json.loads') or
+                    isinstance(node.func, ast.Attribute) and node.func.attr == 'get' and json_expression(node.func.value)))
+
+    for _ in range(len(assignments) + 1):
+        before = len(json_names)
+        for target, value in assignments:
+            if json_expression(value):
+                json_names.update(n.id for n in ast.walk(target) if isinstance(n, ast.Name))
+        for call in ast.walk(module):
+            if not isinstance(call, ast.Call) or name(call.func) not in function_nodes: continue
+            function = function_nodes[name(call.func)]
+            parameters = [*function.args.posonlyargs, *function.args.args]
+            for index, argument in enumerate(call.args):
+                if json_expression(argument):
+                    if isinstance(argument, ast.Starred):
+                        json_names.update(arg.arg for arg in [*parameters, *function.args.kwonlyargs])
+                        if function.args.vararg: json_names.add(function.args.vararg.arg)
+                    elif index < len(parameters): json_names.add(parameters[index].arg)
+                    elif function.args.vararg: json_names.add(function.args.vararg.arg)
+            for keyword in call.keywords:
+                if keyword.arg and json_expression(keyword.value): json_names.add(keyword.arg)
+        if len(json_names) == before: break
+    parent_nodes = {id(child): node for node in ast.walk(module) for child in ast.iter_child_nodes(node)}
+    file_names = {node.id for target, value in assignments if isinstance(value, ast.Call) and canonical_call(value.func) in ('open', 'builtins.open', 'io.open')
+                  for node in ast.walk(target) if isinstance(node, ast.Name)}
+    file_names.update(node.id for part in ast.walk(module) if isinstance(part, ast.withitem) and part.optional_vars is not None and
+                      isinstance(part.context_expr, ast.Call) and canonical_call(part.context_expr.func) in ('open', 'builtins.open', 'io.open')
+                      for node in ast.walk(part.optional_vars) if isinstance(node, ast.Name))
+    tainted_files = set()
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Name) or not isinstance(node.ctx, ast.Load) or node.id not in file_names: continue
+        parent = parent_nodes.get(id(node))
+        if isinstance(parent, ast.keyword) and parent.arg == 'fp': parent = parent_nodes.get(id(parent))
+        safe = isinstance(parent, ast.Call) and canonical_call(parent.func) == 'json.load'
+        if isinstance(parent, ast.Attribute) and parent.attr == 'read':
+            call = parent_nodes.get(id(parent));outer = parent_nodes.get(id(call))
+            safe = (isinstance(call, ast.Call) and not call.args and not call.keywords and
+                    isinstance(outer, ast.Call) and canonical_call(outer.func) == 'json.loads')
+        if not safe: tainted_files.add(node.id)
+    known_functions = {node.name for node in ast.walk(module) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    file_writers = {'os.write', 'os.pwrite', 'os.ftruncate', 'os.truncate', 'os.unlink', 'os.remove', 'os.rename', 'os.replace', 'shutil.copy', 'shutil.copy2',
+                    'shutil.copyfile', 'shutil.copytree', 'shutil.move', 'shutil.rmtree'}
+    writer_methods = {'write_text', 'write_bytes', 'touch', 'unlink', 'rename', 'replace', 'symlink_to', 'hardlink_to'}
+
+    def is_file_write(call):
+        called = canonical_call(call.func)
+        if called == 'os.open':
+            flags = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == 'flags'), None)
+            return not (isinstance(flags, ast.Constant) and flags.value == 0 or flags is not None and canonical_call(flags) == 'os.O_RDONLY')
+        if called in ('open', 'builtins.open', 'io.open'):
+            mode = call.args[1] if len(call.args) > 1 else next((k.value for k in call.keywords if k.arg == 'mode'), None)
+            return mode is not None and not (isinstance(mode, ast.Constant) and mode.value in ('r', 'rt', 'rb'))
+        if isinstance(call.func, ast.Attribute) and call.func.attr == 'replace':
+            if not call.args and not any(k.arg == 'target' for k in call.keywords): return False
+            if isinstance(call.func.value, ast.JoinedStr) or isinstance(call.func.value, ast.Constant) and isinstance(call.func.value.value, str): return False
+        return called in file_writers or isinstance(call.func, ast.Attribute) and call.func.attr in writer_methods
+
+    readonly_calls = {'len', 'str', 'bool', 'int', 'float', 'isinstance', 'json.dumps', 'json.dump', 'json.load', 'json.loads',
+                      'open', 'builtins.open', 'io.open', 'subprocess.run', 'subprocess.call', 'subprocess.check_call',
+                      'subprocess.check_output', 'subprocess.Popen', *file_calls, *constructors,
+                      *('pathlib.' + cls for cls in path_classes)}
+    reader_names = {key for key, value in imports.items() if value in ('json', 'pathlib', 'io', 'builtins') or value.startswith('pathlib.')}
+    for _ in range(len(assignments) + 1):
+        before = len(reader_names)
+        for target, value in assignments:
+            if isinstance(value, ast.Name) and value.id in reader_names:
+                reader_names.update(n.id for n in ast.walk(target) if isinstance(n, ast.Name))
+        if len(reader_names) == before: break
+    # Mutation order, aliases and callbacks are not executed. Known dictionary
+    # key writes taint that key throughout; unknown writes/escapes taint all.
+    for part in ast.walk(module):
+        if isinstance(part, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)) and any(isinstance(c, ast.Call) and is_file_write(c) for c in ast.walk(part)):
+            json_all_changed = True  # Callback order may change the file before a load.
+        if isinstance(part, ast.Subscript) and isinstance(part.ctx, (ast.Store, ast.Del)):
+            if isinstance(part.slice, ast.Constant) and isinstance(part.slice.value, (str, int)):
+                json_keys_changed.add(part.slice.value)
+            else: json_all_changed = True
+        if isinstance(part, ast.AugAssign): json_all_changed = True
+        if isinstance(part, ast.Attribute) and isinstance(part.ctx, ast.Store) and (part.attr in ('load', 'loads', 'read_text', 'read_bytes', 'open') or part.attr.startswith('__')):
+            json_all_changed = True
+        if isinstance(part, ast.Call):
+            called = canonical_call(part.func)
+            if called in ('exec', 'eval', 'setattr', 'delattr', 'getattr', 'vars', 'compile', '__import__', 'globals', 'locals'):
+                json_all_changed = True
+            if any(isinstance(arg, ast.Name) and arg.id in reader_names for arg in [*part.args, *(k.value for k in part.keywords)]):
+                json_all_changed = True
+            if called not in readonly_calls and name(part.func) not in known_functions and not isinstance(part.func, ast.Attribute):
+                if any(json_expression(arg) for arg in [*part.args, *(k.value for k in part.keywords)]):
+                    json_all_changed = True
+        if isinstance(part, ast.Attribute) and part.attr in mutators:
+            parent = parent_nodes.get(id(part))
+            if not isinstance(parent, ast.Call) or parent.func is not part:
+                json_all_changed = True
+            elif part.attr == 'update':
+                for arg in parent.args:
+                    if isinstance(arg, ast.Dict) and all(isinstance(k, ast.Constant) and isinstance(k.value, str) for k in arg.keys):
+                        json_keys_changed.update(k.value for k in arg.keys)
+                    else: json_all_changed = True
+                for keyword in parent.keywords:
+                    if keyword.arg is None: json_all_changed = True
+                    else: json_keys_changed.add(keyword.arg)
+            elif part.attr in ('pop', 'setdefault', '__setitem__', '__delitem__') and parent.args and isinstance(parent.args[0], ast.Constant):
+                json_keys_changed.add(parent.args[0].value)
+            elif isinstance(part.value, ast.Subscript) and isinstance(part.value.slice, ast.Constant):
+                json_keys_changed.add(part.value.slice.value)
+            else: json_all_changed = True
+        if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute) and json_expression(part.func.value):
+            if part.func.attr not in ('get', *mutators): json_all_changed = True
+        if isinstance(part, ast.Call) and isinstance(part.func, ast.Attribute) and canonical_call(part.func) not in readonly_calls:
+            if part.func.attr not in mutators and any(json_expression(arg) for arg in [*part.args, *(k.value for k in part.keywords)]):
+                json_all_changed = True
+    if json_keys_changed.intersection(('load', 'loads', 'read_text', 'read_bytes', 'open')):
+        json_all_changed = True
+
+    def json_value(value):
+        if isinstance(value, str): return {value}
+        if isinstance(value, (dict, list)):
+            token = f'$json:{len(json_objects)}'
+            json_objects[token] = value
+            return {token}
+        return {'$python'}
+
+    def selected_json(node, key_node, env, default=None, depth=0):
+        if json_all_changed: return {'$python'}
+        if isinstance(key_node, ast.Constant) and isinstance(key_node.value, (str, int)):
+            keys = {key_node.value}
+        else: keys = values(key_node, env, depth + 1)
+        result = set()
+        for token in values(node, env, depth + 1):
+            if token not in json_objects:
+                result.add('$python');continue
+            obj = json_objects.get(token)
+            for key in keys:
+                if key in json_keys_changed or isinstance(key, str) and key.startswith('$'):
+                    result.add('$python');continue
+                try: result.update(json_value(obj[key]))
+                except (KeyError, IndexError, TypeError):
+                    result.update(values(default, env, depth + 1) if default is not None else {'$python'})
+        return bounded(result) or {'$python'}
+
+    def open_paths(call, env, depth):
+        called = canonical_call(call.func)
+        if called not in ('open', 'builtins.open', 'io.open') or name(call.func).split('.')[0] in shadowed:
+            return {'$python'}
+        if len(call.args) > 2 or any(k.arg not in ('file', 'mode', 'encoding') for k in call.keywords): return {'$python'}
+        modes = values(call.args[1], env, depth + 1) if len(call.args) > 1 else {'r'}
+        for kw in call.keywords:
+            if kw.arg == 'mode': modes = values(kw.value, env, depth + 1)
+            if kw.arg == 'encoding' and values(kw.value, env, depth + 1) - {'utf-8', 'utf8'}: return {'$python'}
+        if not modes <= {'r', 'rt', 'rb'}: return {'$python'}
+        path_node = call.args[0] if call.args else next((k.value for k in call.keywords if k.arg == 'file'), None)
+        return values(path_node, env, depth + 1) if path_node is not None else {'$python'}
+
+    def file_paths(node, env, depth):
+        if isinstance(node, ast.Call) and canonical_call(node.func) in ('open', 'builtins.open', 'io.open'):
+            return open_paths(node, env, depth)
+        return bounded(path for token in values(node, env, depth + 1) for path in file_objects.get(token, {'$python'}))
+
+    def load_json(call, env, depth):
+        root = name(call.func).split('.')[0]
+        if imports.get(root) not in ('json', 'json.load', 'json.loads') or root in shadowed or any(name(call.func) == p or name(call.func).startswith(p + '.') for p in assigned_attributes):
+            return {'$python'}
+        called = canonical_call(call.func)
+        operand = None
+        if len(call.args) == 1 and not call.keywords:
+            operand = call.args[0]
+        elif not call.args and len(call.keywords) == 1 and call.keywords[0].arg == ('s' if called == 'json.loads' else 'fp'):
+            operand = call.keywords[0].value
+        if operand is None: return {'$python'}  # Decoder hooks can change paths.
+        paths = None
+        if called == 'json.loads' and isinstance(operand, ast.Call) and isinstance(operand.func, ast.Attribute) and operand.func.attr in ('read_text', 'read_bytes'):
+            if operand.args or any(k.arg != 'encoding' or values(k.value, env) - {'utf-8', 'utf8'} for k in operand.keywords): return {'$python'}
+            paths = values(operand.func.value, env, depth + 1)
+        elif called == 'json.loads' and isinstance(operand, ast.Call) and isinstance(operand.func, ast.Attribute) and operand.func.attr == 'read' and not operand.args and not operand.keywords:
+            paths = file_paths(operand.func.value, env, depth)
+        elif called == 'json.load':
+            paths = file_paths(operand, env, depth)
+        if paths is None: return {'$python'}
+        result = set()
+        for path in paths:
+            if not path.startswith('/') or re.search(r'[$`*?\[]', path):
+                result.add('$python');continue
+            if unknown_json_write or any(inside(canonical(path), modified) or inside(modified, canonical(path)) for modified in written_json_paths):
+                result.add('$python');continue
+            if path not in json_cache:
+                try: json_cache[path] = read_json_state(path)
+                except (OSError, ValueError, RecursionError): json_cache[path] = None
+            result.update(json_value(json_cache[path]))
+        return bounded(result) or {'$python'}
+
+    def argv_sequence(node, env):
+        if isinstance(node, (ast.List, ast.Tuple)):
+            sequence = []
+            for item in node.elts:
+                if isinstance(item, ast.Starred):
+                    expanded = argv_sequence(item.value, env)
+                    if expanded is None: return None
+                    sequence.extend(expanded)
+                else: sequence.append(values(item, env))
+            return sequence
+        tokens = values(node, env)
+        variants = [argv_objects[t] for t in tokens if t in argv_objects]
+        if len(variants) != len(tokens) or not variants or len({len(v) for v in variants}) != 1: return None
+        return [set().union(*(v[i] for v in variants)) for i in range(len(variants[0]))]
+
+    def values(node, env, depth=0):
+        if depth > 12:
+            return {'$python'}
+        if isinstance(node, ast.Constant):
+            return {node.value} if isinstance(node.value, str) else {''} if node.value is None else {'$python'}
+        if isinstance(node, ast.Name):
+            result = env.get(node.id, {'$' + node.id})
+            return result | {'$' + node.id} if node.id in mutable_globals or node.id in tainted_files or container_tainted and node.id in container_names else result
+        if isinstance(node, ast.Attribute) and node.attr in ('parent', 'name', 'stem', 'suffix'):
+            paths = values(node.value, env, depth + 1)
+            if node.attr == 'parent': return {os.path.dirname(x) or '$python' for x in paths}
+            if node.attr == 'name': return {os.path.basename(x) for x in paths}
+            return {os.path.splitext(os.path.basename(x))[0 if node.attr == 'stem' else 1] for x in paths}
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+            return set().union(*(values(x, env, depth + 1) for x in node.elts))
+        if isinstance(node, ast.JoinedStr):
+            result = {''}
+            for part in node.values:
+                result = bounded(a + b for a in result for b in values(part.value if isinstance(part, ast.FormattedValue) else part, env, depth + 1))
+            return result
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Div, ast.Add)):
+            left, right = values(node.left, env, depth + 1), values(node.right, env, depth + 1)
+            return joined(left, right) if isinstance(node.op, ast.Div) else bounded(a + b for a in left for b in right)
+        if isinstance(node, ast.BoolOp):
+            return set().union(*(values(x, env, depth + 1) for x in node.values)) - {''}
+        if isinstance(node, ast.IfExp):
+            return values(node.body, env, depth + 1) | values(node.orelse, env, depth + 1)
+        if isinstance(node, ast.Subscript) and name(node.value) == 'os.environ':
+            keys = values(node.slice, env, depth + 1)
+            return bounded(value for key in keys for value in pools.get(key, {'$' + key}))
+        if isinstance(node, ast.Subscript):
+            return selected_json(node.value, node.slice, env, depth=depth)
+        if isinstance(node, ast.Call):
+            called = name(node.func)
+            if canonical_call(node.func) in ('json.load', 'json.loads'):
+                return load_json(node, env, depth)
+            if canonical_call(node.func) in ('open', 'builtins.open', 'io.open'):
+                token = f'$file:{len(file_objects)}'
+                file_objects[token] = open_paths(node, env, depth)
+                return {token}
+            if isinstance(node.func, ast.Attribute) and node.func.attr == 'get' and node.args and any(t in json_objects for t in values(node.func.value, env, depth + 1)):
+                return selected_json(node.func.value, node.args[0], env, node.args[1] if len(node.args) > 1 else None, depth)
+            root_name = called.split('.')[0]
+            wrappers = {'sorted', 'list', 'tuple', 'set', 'iter'}
+            modules = {'os':'os', 'shutil':'shutil', 'datetime':'datetime', 'concurrent':'concurrent',
+                       'ThreadPoolExecutor':'concurrent.futures.ThreadPoolExecutor', 'ProcessPoolExecutor':'concurrent.futures.ProcessPoolExecutor'}
+            special = any(called == item or called.startswith(item + '.') for item in constructors) or root_name in modules or called in wrappers
+            foreign = root_name in modules and not (imports.get(root_name) == modules[root_name] or imports.get(root_name, '').startswith(modules[root_name] + '.'))
+            if (special and root_name in shadowed) or foreign or (called in wrappers and called in imports) or any(called == key or called.startswith(key + '.') for key in assigned_attributes):
+                return {'$python'}
+            if called in ('datetime.datetime.now', 'datetime.datetime.utcnow', 'datetime.datetime.fromtimestamp',
+                          'datetime.datetime.fromisoformat', 'datetime.now', 'datetime.utcnow', 'datetime.fromtimestamp', 'datetime.fromisoformat'):
+                return {'$datetime'}
+            if called in ('concurrent.futures.ThreadPoolExecutor', 'concurrent.futures.ProcessPoolExecutor', 'ThreadPoolExecutor', 'ProcessPoolExecutor'):
+                return {'$executor'}
+            if called in ('os.getenv', 'os.environ.get') and node.args:
+                result = set()
+                for key in values(node.args[0], env, depth + 1):
+                    result.update(pools.get(key, values(node.args[1], env, depth + 1) if len(node.args) > 1 else {''}))
+                return bounded(result)
+            if called == 'shutil.which' and node.args:
+                return bounded(found for item in values(node.args[0], env, depth + 1)
+                               for path in pools.get('PATH', {os.defpath})
+                               if (found := shutil.which(item, path=path))) or {'$python'}
+            if called in constructors or called == 'os.path.join':
+                result = values(node.args[0], env, depth + 1) if node.args else pools.get('PWD', {'$PWD'})
+                for arg in node.args[1:]:
+                    result = joined(result, values(arg, env, depth + 1))
+                return result
+            if called in {p + '.home' for p in constructors}:
+                return pools['HOME']
+            if called == 'os.getcwd' or called in {p + '.cwd' for p in constructors}:
+                return pools.get('PWD', {'$PWD'})
+            if called in ('sorted', 'list', 'tuple', 'set', 'iter') and node.args:
+                return values(node.args[0], env, depth + 1)
+            if called == 'str' and called not in shadowed and called not in imports and len(node.args) == 1 and not node.keywords:
+                return values(node.args[0], env, depth + 1)
+            if isinstance(node.func, ast.Attribute):
+                root = values(node.func.value, env, depth + 1)
+                if node.func.attr == 'strftime' and root == {'$datetime'} and node.args:
+                    formats = values(node.args[0], env, depth + 1)
+                    if all(re.fullmatch(r'(?:[^%/]|%[YymdHMSfjz%])*', x) for x in formats):
+                        return {x if '%' not in x else '*' for x in formats}
+                if node.func.attr in ('glob', 'rglob', 'iterdir'):
+                    pattern = values(node.args[0], env, depth + 1) if node.args else {'*'}
+                    return joined(root, pattern if node.func.attr != 'rglob' else {'**/' + x for x in pattern})
+                if node.func.attr == 'expanduser':
+                    return bounded(directory + x[1:] if x == '~' or x.startswith('~/') else '$python' if x.startswith('~') else x
+                                   for x in root for directory in pools['HOME'])
+                if node.func.attr in ('resolve', 'absolute'):
+                    return root
+                if node.func.attr == 'with_name' and node.args:
+                    return bounded(os.path.join(os.path.dirname(x), y) for x in root for y in values(node.args[0], env, depth + 1))
+                if node.func.attr == 'with_suffix' and node.args:
+                    return bounded(os.path.splitext(x)[0] + y for x in root for y in values(node.args[0], env, depth + 1))
+        return {'$python'}
+
+    def reserve(node, operands, cwd=None):
+        expression = ast.get_source_segment(text, node) or ast.unparse(node)
+        for path in operands:
+            if path and not path.startswith(('/', '$')) and (cwd is not None or pools.get('PWD')):
+                unknown.extend(reserve_relative(node, path, cwd))
+                continue
+            anchor(anchors, path, reason)
+            if not path.startswith('/') or re.search(r'[$`*?\[]', path):
+                unknown.append(unresolved(reason, expression, [path]))
+
+    def reserve_relative(node, path, cwd=None):
+        records = []
+        for directory in (cwd if cwd is not None else pools['PWD']):
+            value = os.path.join(directory, path)
+            anchor(anchors, value, reason)
+            if re.search(r'[$`*?\[]', value):
+                records.append(unresolved(reason, ast.get_source_segment(text, node) or ast.unparse(node), [value]))
+        return records
+
+    def invoke(entry, arguments, keywords, caller_env):
+        nonlocal call_depth
+        function, defining_env, defining_functions = entry
+        if call_depth >= 8:
+            unknown.append(unresolved(reason, 'Python function expansion limit: ' + function.name))
+            return
+        nested = dict(defining_env)
+        parameters = [*function.args.posonlyargs, *function.args.args]
+        for arg in (*parameters, *function.args.kwonlyargs): nested[arg.arg] = {'$' + arg.arg}
+        for parameter, argument in zip(parameters, arguments or []): nested[parameter.arg] = argument
+        if function.args.vararg:
+            if arguments is None:
+                nested[function.args.vararg.arg] = {'$python'}
+            else:
+                token = f'$argv:{len(argv_objects)}'
+                argv_objects[token] = arguments[len(parameters):]
+                nested[function.args.vararg.arg] = {token}
+        for key, value in keywords.items(): nested[key] = value
+        visited_functions.add(id(function))
+        call_depth += 1
+        try:
+            statements(function.body, nested, {key: list(entries) for key, entries in defining_functions.items()})
+        finally:
+            call_depth -= 1
+
+    def expressions(node, env, functions):
+        nonlocal container_tainted, unknown_json_write
+        container_tainted |= mutation(node)
+        # Comprehension/lambda names shadow outer bindings. An unsupported
+        # local binding may broaden to project scope, never borrow an unrelated
+        # outer path and silently narrow the actual operand.
+        env = dict(env)
+        for child in ast.walk(node):
+            if isinstance(child, ast.comprehension):
+                for target in ast.walk(child.target):
+                    if isinstance(target, ast.Name): env[target.id] = {'$' + target.id}
+            if isinstance(child, ast.Lambda):
+                for arg in (*child.args.posonlyargs, *child.args.args, *child.args.kwonlyargs): env[arg.arg] = {'$' + arg.arg}
+        def python_code(value):
+            for source in values(value, env):
+                if source.startswith('$'):
+                    unknown.append(unresolved(reason, ast.get_source_segment(text, value) or ast.unparse(value)))
+                else:
+                    for directory in pools['HOME']:
+                        unknown.extend(python_anchors(anchors, source, directory, reason, pools, pools, _depth + 1))
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            called = name(call.func)
+            if is_file_write(call):
+                operands = list(call.args[:2]) if canonical_call(call.func) in file_writers else []
+                if isinstance(call.func, ast.Attribute) and call.func.attr in writer_methods:
+                    operands.append(call.func.value)
+                    if call.func.attr in ('rename', 'replace', 'symlink_to', 'hardlink_to'):
+                        operands.extend(call.args[:1])
+                        operands.extend(k.value for k in call.keywords if k.arg == 'target')
+                if canonical_call(call.func) in ('open', 'builtins.open', 'io.open', 'os.open'):
+                    operands.extend(call.args[:1])
+                    operands.extend(k.value for k in call.keywords if k.arg == 'file')
+                if not operands: unknown_json_write = True
+                for operand in operands:
+                    for value in values(operand, env):
+                        if not value.startswith('/') or re.search(r'[$`*?\[]', value): unknown_json_write = True
+                        else: written_json_paths.add(canonical(value))
+            root = called.split('.')[0]
+            filesystem_call = imports.get(root, root) + called[len(root):]
+            if filesystem_call not in file_calls and called in file_calls: filesystem_call = called
+            for entry in functions.get(called, []):
+                invoke(entry, argv_sequence(ast.Tuple(elts=call.args), env),
+                       {arg.arg: values(arg.value, env) for arg in call.keywords if arg.arg}, env)
+            mapped = called == 'map' and 'map' not in shadowed and 'map' not in imports or (
+                isinstance(call.func, ast.Attribute) and call.func.attr == 'map' and values(call.func.value, env) == {'$executor'})
+            if mapped and len(call.args) > 1 and isinstance(call.args[0], ast.Name):
+                entries = functions.get(call.args[0].id, [])
+                if entries:
+                    bounded_callbacks.add(id(call.args[0]))
+                    for entry in entries: invoke(entry, [values(arg, env) for arg in call.args[1:]], {}, env)
+            if (called in ('exec', 'eval') or filesystem_call in ('builtins.exec', 'builtins.eval')) and call.args:
+                python_code(call.args[0])
+            if called in constructors:
+                reserve(call, values(call, env))
+            elif filesystem_call in file_calls:
+                if call.args: reserve(call.args[0], values(call.args[0], env))
+                if filesystem_call in destinations and len(call.args) > 1: reserve(call.args[1], values(call.args[1], env))
+                roles = {'src', 'dst'} if filesystem_call in destinations else file_keywords.get(filesystem_call, {'path'})
+                for keyword in call.keywords:
+                    if keyword.arg in roles: reserve(keyword.value, values(keyword.value, env))
+                    elif keyword.arg is None:
+                        if isinstance(keyword.value, ast.Dict) and all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in keyword.value.keys):
+                            for key, value in zip(keyword.value.keys, keyword.value.values):
+                                if key.value in roles: reserve(value, values(value, env))
+                                elif key.value in ('dir_fd', 'src_dir_fd', 'dst_dir_fd') and not (isinstance(value, ast.Constant) and value.value is None):
+                                    unknown.append(unresolved(reason, ast.get_source_segment(text, call) or ast.unparse(call)))
+                        else:
+                            unknown.append(unresolved(reason, ast.get_source_segment(text, keyword.value) or ast.unparse(keyword.value)))
+                    elif keyword.arg in ('dir_fd', 'src_dir_fd', 'dst_dir_fd') and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None):
+                        unknown.append(unresolved(reason, ast.get_source_segment(text, call) or ast.unparse(call)))
+                if filesystem_call == 'os.chdir':
+                    operands = [call.args[0]] if call.args else [k.value for k in call.keywords if k.arg == 'path']
+                    for operand in operands:
+                        paths = values(operand, env)
+                        pools['PWD'] = bounded(path if path.startswith(('/', '$')) else os.path.join(base, path)
+                                               for path in paths for base in pools.get('PWD', {'$PWD'})) | pools.get('PWD', set())
+            elif isinstance(call.func, ast.Attribute) and call.func.attr in path_methods:
+                target_keywords = [k.value for k in call.keywords if k.arg == 'target']
+                expanded_keywords = [k.value for k in call.keywords if k.arg is None]
+                if call.func.attr == 'replace' and not call.args and not target_keywords and not expanded_keywords:
+                    continue  # datetime.replace(tzinfo=...) is not Path.replace(target).
+                if call.func.attr == 'replace' and (isinstance(call.func.value, ast.JoinedStr) or isinstance(call.func.value, ast.Constant) and isinstance(call.func.value.value, str)):
+                    continue  # Literal strings cannot be Path instances.
+                operands = values(call if call.func.attr in ('glob', 'rglob', 'iterdir') else call.func.value, env)
+                reserve(call, operands)
+                if call.func.attr in ('rename', 'replace', 'symlink_to', 'hardlink_to'):
+                    if call.args: reserve(call.args[0], values(call.args[0], env))
+                    for target in target_keywords: reserve(target, values(target, env))
+                    for keyword in expanded_keywords:
+                        if isinstance(keyword, ast.Dict) and all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in keyword.keys):
+                            for key, value in zip(keyword.keys, keyword.values):
+                                if key.value == 'target': reserve(value, values(value, env))
+                        else:
+                            unknown.append(unresolved(reason, ast.get_source_segment(text, keyword) or ast.unparse(keyword)))
+            if called in ('os.environ.update', 'os.putenv'):
+                unknown.append(unresolved(reason, ast.get_source_segment(text, call) or ast.unparse(call)))
+            if filesystem_call in ('subprocess.run', 'subprocess.call', 'subprocess.check_call', 'subprocess.check_output', 'subprocess.Popen'):
+                process_keywords = []
+                for keyword in call.keywords:
+                    if keyword.arg is not None:
+                        process_keywords.append(keyword)
+                    elif isinstance(keyword.value, ast.Dict) and all(isinstance(key, ast.Constant) and isinstance(key.value, str) for key in keyword.value.keys):
+                        process_keywords.extend(ast.keyword(arg=key.value, value=value) for key, value in zip(keyword.value.keys, keyword.value.values))
+                    else:
+                        unknown.append(unresolved(reason, ast.get_source_segment(text, keyword.value) or ast.unparse(keyword.value)))
+                cwd = None
+                for keyword in process_keywords:
+                    if keyword.arg == 'cwd' and not (isinstance(keyword.value, ast.Constant) and keyword.value.value is None):
+                        cwd = bounded(path if path.startswith(('/', '$')) else os.path.join(base, path)
+                                      for path in values(keyword.value, env) for base in pools.get('PWD', {'$PWD'}))
+                        reserve(keyword.value, cwd)
+                    if keyword.arg == 'env':
+                        unknown.append(unresolved(reason, 'subprocess environment mapping not evaluated'))
+                        if isinstance(keyword.value, ast.Dict):
+                            for key, value in zip(keyword.value.keys, keyword.value.values):
+                                if not isinstance(key, ast.Constant) or not isinstance(key.value, str) or not (
+                                    key.value in ('HOME', 'PATH', 'PYTHONPATH', 'ROOT', 'DIR', 'WORKTREE', 'CHECKOUT', 'CWD') or
+                                    ENV_NAME.fullmatch(key.value) or key.value.endswith('_PATH')): continue
+                                for path in values(value, env):
+                                    for entry in (path.split(':') if isinstance(key, ast.Constant) and key.value == 'PATH' else [path]):
+                                        if entry.startswith('/'):
+                                            unknown.append(unresolved(reason, 'subprocess environment path', [entry.rstrip('/') + '/$python']))
+                arg = call.args[0] if call.args else next((k.value for k in process_keywords if k.arg == 'args'), None)
+                if arg is not None:
+                    sequence = argv_sequence(arg, env)
+                    executable = arg.elts[0] if isinstance(arg, (ast.List, ast.Tuple)) and arg.elts else arg
+                    for value in (sequence[0] if sequence else values(executable, env)):
+                        if value.startswith(('/', '$', '~')): reserve(executable, {value})
+                    if not isinstance(arg, (ast.List, ast.Tuple)):
+                        possible = values(arg, env)
+                        if possible & path_flags:
+                            reserve(arg, possible - path_flags, cwd)
+                    for value in (set().union(*sequence) if sequence is not None else values(arg, env)):
+                        if '/' in value and not re.search(r'\s|://', value): reserve(arg, {value}, cwd)
+                    if sequence is not None:
+                        if isinstance(arg, (ast.List, ast.Tuple)) and any(isinstance(item, ast.Starred) for item in arg.elts) and any(value.startswith('$') for items in sequence for value in items):
+                            unknown.append(unresolved(reason, ast.get_source_segment(text, call) or ast.unparse(call)))
+                        pending_path = False
+                        for items in sequence:
+                            if pending_path: reserve(arg, items, cwd)
+                            pending_path = bool(items & path_flags)
+                            for value in items:
+                                flag, sep, path = value.partition('=')
+                                if sep and flag in path_flags: reserve(arg, {path}, cwd)
+                    elif isinstance(arg, (ast.List, ast.Tuple)) and any(isinstance(item, ast.Starred) for item in arg.elts):
+                        unknown.append(unresolved(reason, ast.get_source_segment(text, call) or ast.unparse(call)))
+                    if isinstance(arg, (ast.List, ast.Tuple)) and any(re.fullmatch(r'python(?:[23](?:\.\d+)*)?', os.path.basename(x)) for x in values(executable, env)):
+                        for index, part in enumerate(arg.elts[1:], 1):
+                            if values(part, env) == {'-c'} and index + 1 < len(arg.elts):
+                                python_code(arg.elts[index + 1])
+                            if values(part, env) == {'-'}:
+                                for keyword in process_keywords:
+                                    if keyword.arg == 'input': python_code(keyword.value)
+                    for keyword in process_keywords:
+                        if keyword.arg == 'shell' and isinstance(keyword.value, ast.Constant) and keyword.value.value is True:
+                            for source in values(arg, env):
+                                for directory in pools['HOME']:
+                                    unknown.extend(environment_references(anchors, source, directory, reason, pools, pools))
+
+    def assign(target, value, env):
+        nonlocal container_tainted
+        if isinstance(target, ast.Name):
+            env[target.id] = value
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for part in target.elts: assign(part, value, env)
+        elif isinstance(target, ast.Subscript) and name(target.value) == 'os.environ':
+            for key in values(target.slice, env):
+                pools.setdefault(key, set()).update(value)
+        elif isinstance(target, ast.Subscript):
+            container_tainted = True
+
+    def merge(env, variants):
+        for key in set().union(*(set(v) for v in variants)):
+            env[key] = set().union(*(v.get(key, {'$' + key}) for v in variants))
+
+    def loop_bindings(nodes, env, target=None):
+        nonlocal container_tainted
+        container_tainted |= any(mutation(node) for node in nodes)
+        nested = dict(env)
+        reset = {n.id for n in ast.walk(target) if isinstance(n, ast.Name)} if target is not None else set()
+        for statement in nodes:
+            for part in ast.walk(statement):
+                if isinstance(part, ast.Name) and isinstance(part.ctx, ast.Store) and part.id not in reset:
+                    nested[part.id] = nested.get(part.id, set()) | {'$' + part.id}
+        return nested
+
+    def statements(nodes, env, functions, bindings=None):
+        bindings = dict(env) if bindings is None else bindings
+        for node in nodes:
+            checkpoint()
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if node.value is None: continue
+                expressions(node.value, env, functions)
+                for target in targets:
+                    if isinstance(target, (ast.Tuple, ast.List)) and isinstance(node.value, (ast.Tuple, ast.List)) and len(target.elts) == len(node.value.elts):
+                        for part, value in zip(target.elts, node.value.elts): assign(part, values(value, env), env)
+                    else: assign(target, values(node.value, env), env)
+            elif isinstance(node, ast.AugAssign):
+                expressions(node.value, env, functions)
+                assign(node.target, {'$python'}, env)
+            elif isinstance(node, (ast.For, ast.AsyncFor)):
+                expressions(node.iter, env, functions)
+                nested = loop_bindings(node.body, env, node.target); assign(node.target, values(node.iter, env), nested)
+                statements(node.body + node.orelse, nested, functions, bindings)
+                merge(env, [env.copy(), nested])
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for value in [*node.decorator_list, *node.args.defaults, *(x for x in node.args.kw_defaults if x is not None)]:
+                    expressions(value, env, functions)
+                entry = (node, bindings, functions)
+                functions.setdefault(node.name, []).append(entry)
+                definitions.append(entry)
+            elif isinstance(node, ast.If):
+                expressions(node.test, env, functions)
+                left, right = dict(env), dict(env)
+                statements(node.body, left, functions, bindings); statements(node.orelse, right, functions, bindings); merge(env, [left, right])
+            elif isinstance(node, (ast.With, ast.AsyncWith)):
+                for item in node.items:
+                    expressions(item.context_expr, env, functions)
+                    if item.optional_vars: assign(item.optional_vars, values(item.context_expr, env), env)
+                statements(node.body, env, functions, bindings)
+            elif isinstance(node, ast.Try):
+                variants = []
+                for body in [node.body + node.orelse, *(h.body for h in node.handlers)]:
+                    nested = dict(env); statements(body, nested, functions, bindings); variants.append(nested)
+                merge(env, variants); statements(node.finalbody, env, functions, bindings)
+            elif isinstance(node, ast.While):
+                nested = loop_bindings(node.body, env)
+                expressions(node.test, nested, functions)
+                statements(node.body + node.orelse, nested, functions, bindings); merge(env, [env.copy(), nested])
+            else:
+                expressions(node, env, functions)
+            for key, value in env.items(): bindings[key] = bindings.get(key, set()) | value
+    statements(module.body, {}, {})
+    parents = {id(child): parent for parent in ast.walk(module) for child in ast.iter_child_nodes(parent)}
+    escaped = {node.id for node in ast.walk(module) if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load)
+               and id(node) not in bounded_callbacks and not (
+                   isinstance(parents.get(id(node)), ast.Call) and parents[id(node)].func is node)}
+    # Unknown callback/alias invocations must not hide a function's file uses.
+    for entry in list(definitions):
+        if id(entry[0]) not in visited_functions or entry[0].name in escaped:
+            invoke(entry, [], {}, {})
+    return unique_unknown(unknown)
+
+
 def name_config_sources():
     """Small configuration text, including directory symlinks and dotfiles."""
     homes = {p.pw_dir for p in pwd.getpwall() if p.pw_dir.startswith('/') and os.path.isdir(p.pw_dir)}
@@ -890,8 +1640,38 @@ def name_config_sources():
             continue
 
 
-def configuration_name_anchors(anchors, inventory, sources=None):
+def configuration_name_anchors(anchors, inventory, sources=None, refs=None):
     names = {}
+    identities = inventory.get('remote_urls', {})
+    by_identity = {}
+    for tree in inventory['trees']:
+        for identity in identities.get(tree, []):
+            by_identity.setdefault(identity, set()).add(tree)
+    # Name protection never supplies its own evidence, including a different
+    # name resolved earlier in this same scan.
+    base = {p: why for p, why in anchors.items() if not why.startswith('configuration name ')}
+    refs = refs or {}
+    keepers = {}
+
+    def other_protection(tree):
+        if tree in keepers:
+            return keepers[tree]
+        try:
+            before = os.lstat(tree)
+            if not stat.S_ISDIR(before.st_mode) or tree != canonical(tree):
+                return None
+            reason = ws.anchored(base, tree) or ws.anchored(refs, tree)
+            if not reason:
+                row = plan(tree, inventory['trees'][tree], dict(inventory, bare=inventory.get('bare', [])), base, refs)
+                reason = row.get('reason') if row['action'] == 'keep' else None
+            after = os.lstat(tree)
+            if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                reason = None
+            keepers[tree] = reason
+            return reason
+        except OSError:
+            return None  # A vanished directory cannot satisfy a name.
+
     for tree in inventory['trees']:
         name = os.path.basename(tree).casefold()
         if (len(name) >= 4 and name.lstrip('.') not in GENERIC_NAMES and
@@ -926,10 +1706,24 @@ def configuration_name_anchors(anchors, inventory, sources=None):
             found.update(name for name in complex_names if re.search(r'(?<![\w.-])' + re.escape(name) + r'(?![\w.-])', text))
             for name in sorted(found):
                 for tree in sorted(names[name]):
+                    keys = set(identities.get(tree, []))
+                    if '/' in name:
+                        keys = {key for key in keys if not key.startswith(('file:', 'opaque:')) and
+                                '/'.join(key.split('/')[-2:]).casefold() == name}
+                    copies = {tree} | set().union(*(by_identity.get(key, set()) for key in keys))
+                    ordered = sorted(copies, key=lambda p: (not bool(ws.anchored(base, p) or ws.anchored(refs, p)), p))
+                    holder = next((p for p in ordered if other_protection(p)), None) if len(copies) > 1 else None
                     collision = len(names[name]) > 1
                     label = 'collision' if collision else 'reference'
-                    anchor(anchors, tree, f'configuration name {label}: {name} in {path}')
-                    evidence.append({'path': tree, 'name': name, 'config': path, 'collision': collision})
+                    if holder:
+                        # Bind the selected copy for this guard generation, even
+                        # if its other reason expires before the following plan.
+                        anchor(anchors, holder, f'configuration name assigned: {name} in {path}')
+                    else:
+                        anchor(anchors, tree, f'configuration name {label}: {name} in {path}')
+                    evidence.append({'path': tree, 'name': name, 'config': path, 'collision': collision,
+                                     'satisfied_by': holder, 'other_reason': keepers.get(holder),
+                                     'protected_by_name': not holder or holder == tree})
         except FileNotFoundError:
             continue
     inventory['configuration_name_references'] = evidence
@@ -1053,18 +1847,25 @@ def bb_anchors(anchors, environments_values=None):
                 metadata['PWD'] = [canonical(cwd)]
             elif directory.get('type') == 'project' and project_paths:
                 metadata['PWD'] = project_paths
+            elif directory.get('type') in (None, 'automation-storage') and path and Path(path).parent.name == task['id']:
+                # BB's declared policy uses the common scripts directory, not
+                # the per-task stored-script directory (runtime contract).
+                metadata['PWD'] = [canonical(str(Path(path).parent.parent))]
             selected = directory.get('environmentId') or execution.get('environmentId')
             selected_paths = [canonical(e['path']) for e in environments if e.get('id') == selected and e.get('path')]
             if selected_paths:
                 metadata['PWD'] = selected_paths
-            records = environment_references(anchors, text, (execution.get('env') or {}).get('HOME', '/root'),
-                                              reason, environments_values, metadata)
+            reader = python_anchors if execution.get('interpreter') == 'python3' else environment_references
+            records = reader(anchors, text, (execution.get('env') or {}).get('HOME', '/root'),
+                             reason, environments_values, metadata)
             if records and project_identities is None:
                 project_identities = project_url_identities(project['gitRemoteUrl'], project_paths) if project.get('gitRemoteUrl') else []
             for record in records:
                 record.update(project_id=project['id'], automation_id=task['id'],
                               automation_enabled=task.get('enabled'), project_paths=sorted(set(project_paths + env_paths)),
-                              project_remote_ids=project_identities)
+                              project_source_paths=project_paths, project_environment_paths=env_paths,
+                              project_remote_ids=project_identities, automation_name=task.get('name'),
+                              automation_last_run_at=task.get('lastRunAt'), automation_last_run_status=task.get('lastRunStatus'))
             unknown.extend(records)
     # Thread checks add the original active/recent-thread rule to environment protection.
     thread_anchors = {}
@@ -1084,7 +1885,7 @@ def symlink_anchors(anchors, inventory):
             path = os.path.dirname(path)
 
 
-def usage(inventory):
+def usage(inventory, refs=None):
     anchors = {}
     environments = process_anchors(anchors)
     if environments is None:
@@ -1099,7 +1900,7 @@ def usage(inventory):
     ws.docker_anchors(containers)
     for path, reason in containers.items():
         anchor(anchors, path, reason)
-    unknown = bb_anchors(anchors, environments) + config_anchors(anchors, environments=environments, inventory=inventory)
+    unknown = bb_anchors(anchors, environments) + config_anchors(anchors, environments=environments)
     symlink_anchors(anchors, inventory)
     with open('/proc/self/mountinfo') as handle:
         for line in handle:
@@ -1108,7 +1909,9 @@ def usage(inventory):
                 raise ws.ScanIncomplete('mount inventory incomplete')
             mount = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4])
             anchor(anchors, mount, 'mounted descendant')
-    return anchors, scope_unknown(anchors, unknown, inventory)
+    unknown = scope_unknown(anchors, unknown, inventory)
+    configuration_name_anchors(anchors, inventory, refs=refs)
+    return anchors, unknown
 
 
 def metadata(path, kind):
@@ -1253,16 +2056,41 @@ def references(inventory):
     return anchors
 
 
+def same_origin_nested(path, kind, parent, parent_kind):
+    """Rebind origin evidence at every guard; foreign/unknown snapshots stay."""
+    if kind == 'unknown' or parent_kind == 'unknown':
+        return False
+    try:
+        if kind == 'linked':
+            common = source_git(path, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
+            parent_common = source_git(parent, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip()
+            if common and parent_common and canonical(common) == canonical(parent_common):
+                return True  # Registration/locks/main checkout are checked below.
+        # Reuse effective fetch/push URL resolution, including Git rewrites and
+        # physical local identities. Do not rely on the earlier inventory here:
+        # a parent remote may have changed without touching the child.
+        current = {'trees': {path: kind, parent: parent_kind}, 'bare': []}
+        references(current)
+        return bool(set(current['remote_urls'][path]) & set(current['remote_urls'][parent]))
+    except Exception:
+        return False  # An unreadable relationship cannot exempt a nested tree.
+
+
 def local_state(path, kind, inventory, anchors, refs):
     checkpoint()
     if path != canonical(path) or not stat.S_ISDIR(os.lstat(path).st_mode):
         raise ws.Keep('symlink or nonphysical directory')
     if os.path.ismount(path):
         raise ws.Keep('filesystem root or mount point')
+    nested_child, nested_kind = path, kind
     parent = os.path.dirname(path)
     while parent != path:
         if parent in inventory['trees']:
-            raise ws.Keep(f'嵌套于 {parent}，由该项目自行保留')
+            if not same_origin_nested(nested_child, nested_kind, parent, inventory['trees'][parent]):
+                raise ws.Keep(f'嵌套于 {parent}，由该项目自行保留')
+            # Check each ownership boundary. A descendant with remotes A+B
+            # must not bridge a foreign B snapshot inside an A project.
+            nested_child, nested_kind = parent, inventory['trees'][parent]
         if parent == '/': break
         parent = os.path.dirname(parent)
     for index in (anchors, refs):
@@ -1276,8 +2104,6 @@ def local_state(path, kind, inventory, anchors, refs):
         for name in (*ws.IN_PROGRESS, 'index.lock', 'HEAD.lock', 'packed-refs.lock', 'config.lock'):
             if os.path.lexists(os.path.join(directory, name)):
                 raise ws.Keep(f'git operation in progress: {name}')
-        if os.path.exists(os.path.join(directory, 'objects/info/alternates')):
-            raise ws.Keep('repository uses alternates')
     latest = os.lstat(path).st_mtime
     def failed(exc):
         raise exc
@@ -1291,6 +2117,12 @@ def local_state(path, kind, inventory, anchors, refs):
         for name in dirs + files:
             latest = max(latest, os.lstat(os.path.join(parent, name)).st_mtime)
     for directory in dict.fromkeys([common, gitdir]):
+        # Borrowers may be removed. The lender is protected by references();
+        # changing the borrowing configuration is still recent Git activity.
+        for name in ('objects/info/alternates', 'objects/info/http-alternates'):
+            target = os.path.join(directory, name)
+            if os.path.lexists(target):
+                latest = max(latest, os.lstat(target).st_mtime, os.stat(target).st_mtime)
         # Ref/reflog/FETCH_HEAD changes are use too, even if checkout files and
         # HEAD/index did not change. Object payload and sibling metadata are
         # not traversed; their shared refs and this worktree's metadata are.
@@ -1413,7 +2245,7 @@ def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
         try:
             if row.get('bytes') is None:
                 raise ws.Keep('size measurement incomplete')
-            current_anchors, unknown = usage(inventory)
+            current_anchors, unknown = usage(inventory, refs)
             if global_unknown(unknown):
                 raise ws.Keep('unresolved global config references: ' + '; '.join(global_unknown(unknown)))
             LIVE.clear()  # New remote-proof generation for this execution preparation.
@@ -1440,26 +2272,17 @@ def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
     # All remote IO has finished. Rewalk the disks and refresh EVERY consumer.
     if not prepared:
         return
-    fresh_inventory = discover(roots, excluded)
-    error = '; '.join(fresh_inventory['errors'])
-    try:
-        if error:
-            raise ws.ScanIncomplete(error)
-        final_refs = references(fresh_inventory)
-        final_anchors, unknown = usage(fresh_inventory)
-        if global_unknown(unknown):
-            raise ws.ScanIncomplete('unresolved global config references: ' + '; '.join(global_unknown(unknown)))
-    except Exception as exc:
-        error = ws.failure_text(exc)
     for row in prepared:
         try:
-            if error:
-                raise ws.Keep('final inventory incomplete: ' + error)
-            # Recheck process/BB/config at each sink; no network Git calls here.
-            current_anchors, unknown = usage(fresh_inventory)
+            # Each sink gets its own complete generation. Another consumer or
+            # linked worktree may appear after the preceding sink.
+            fresh_inventory = discover(roots, excluded)
+            if fresh_inventory['errors']:
+                raise ws.Keep('final inventory incomplete: ' + '; '.join(fresh_inventory['errors']))
+            final_refs = references(fresh_inventory)
+            current_anchors, unknown = usage(fresh_inventory, final_refs)
             if global_unknown(unknown):
                 raise ws.Keep('unresolved global config references: ' + '; '.join(global_unknown(unknown)))
-            current_anchors.update(final_anchors)
             persist(log, dict(row, event='remove_intent'))
             remove(row, fresh_inventory, current_anchors, final_refs)
         except Exception as exc:
@@ -1492,13 +2315,389 @@ def reviewed_comparison(rows, preview_path):
     return {'preview': str(preview_path), 'allowed': len(allowed), 'added': added}
 
 
+def linked_context(proc='/proc'):
+    """Only BB environments and live process cwd belong to the linked policy."""
+    projects = json.loads(command(['bb', 'project', 'list', '--json']).stdout)
+    environments = json.loads(command(['bb', 'environment', 'list', '--json']).stdout)
+    if not isinstance(projects, list) or not isinstance(environments, list):
+        raise ws.ScanIncomplete('BB linked inventory incomplete')
+    sources, reserved, cwds, cwd_identities = set(), {}, {}, {}
+    for project in projects:
+        if not isinstance(project.get('sources'), list):
+            raise ws.ScanIncomplete('BB project sources unknown')
+        sources.update(s['path'] for s in project['sources'] if s.get('path'))
+    for env in environments:
+        path = env.get('path') or ((env.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path')
+        if path:
+            sources.add(path)
+        if env.get('status') == 'destroyed' or (env.get('lifecycle') or {}).get('phase') == 'destroyed':
+            continue
+        if not path and env.get('status') == 'error' and not env.get('environmentProviderInstanceKey'):
+            continue
+        if not path:
+            raise ws.ScanIncomplete('BB environment path unknown')
+        reserved[canonical(path)] = 'BB environment: ' + env['id']
+    for pid in os.listdir(proc):
+        if not pid.isdigit():
+            continue
+        base = Path(proc, pid)
+        try:
+            before = (base / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+            try:
+                path = os.readlink(base / 'cwd').removesuffix(' (deleted)')
+            except FileNotFoundError:
+                path = None  # Kernel/zombie process or an exited process.
+            ancestors = {}
+            if path:
+                pointer = str(base / 'cwd')
+                seen = set()
+                for _ in range(256):
+                    checkpoint()
+                    info = os.stat(pointer)
+                    identity = f'{info.st_dev}:{info.st_ino}'
+                    if identity in seen: break
+                    seen.add(identity)
+                    ancestors[identity] = f'process {pid} cwd (inode ancestry: {path})'
+                    pointer += '/..'
+                else: raise ws.ScanIncomplete('process cwd ancestry unknown')
+            after = (base / 'stat').read_text().rsplit(')', 1)[1].split()[19]
+            if before != after:
+                raise ws.ScanIncomplete('process identity changed')
+            if path:
+                if not path.startswith('/'):
+                    raise ws.ScanIncomplete('process cwd unknown')
+                cwds[canonical(path)] = f'process {pid} cwd'
+                cwd_identities.update(ancestors)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except (OSError, ValueError, IndexError) as exc:
+            raise ws.ScanIncomplete(f'linked cwd scan incomplete: {pid}') from exc
+    return {'sources': sorted(sources), 'environments': reserved, 'cwds': cwds, 'cwd_identities': cwd_identities}
+
+
+def linked_known_sources(state_dir, context):
+    """The last complete disk discovery supplements live BB repository paths.
+
+    A new main will be indexed by the unchanged full-disk clone pass. Reading
+    the existing inventory avoids waiting for another disk walk before linked
+    worktrees can be processed.
+    """
+    sources = set(context['sources'])
+    indexed = None
+    for path in sorted(Path(state_dir).glob('git-tree-sweep-*.json'), reverse=True):
+        checkpoint()
+        try:
+            report = json.loads(path.read_text())
+            if not isinstance(report, dict):
+                continue
+            if report.get('roots') != ['/', '/data'] or report.get('discovery', {}).get('errors'):
+                continue
+            if not isinstance(report.get('items'), list):
+                continue
+            if not all(isinstance(x, dict) and isinstance(x.get('path'), str) and x['path'].startswith('/') for x in report['items']):
+                continue
+            sources.update(x['path'] for x in report['items'])
+            sources.update(report['discovery'].get('bare', []))
+            sources.update(report['discovery'].get('linked_markers', []))
+            indexed = str(path)
+            break
+        except (OSError, ValueError, KeyError):
+            continue
+    return sorted(sources), indexed
+
+
+def linked_registrations(main):
+    out = source_git(main, 'worktree', 'list', '--porcelain', '-z').stdout
+    entries = [dict(field.partition(' ')[::2] for field in block.split('\0') if field)
+               for block in out.split('\0\0') if block.strip('\0')]
+    if not entries or not entries[0].get('worktree'):
+        raise ws.Keep('Git worktree registration unknown')
+    primary = canonical(entries[0]['worktree'])
+    rows = []
+    for entry in entries[1:]:
+        if not entry.get('worktree'):
+            raise ws.Keep('Git worktree path unknown')
+        rows.append(dict(entry, path=canonical(entry['worktree']), registered_path=entry['worktree'],
+                         main=primary, type='linked'))
+    return primary, rows
+
+
+def linked_inventory(sources):
+    mains, failures = {}, []
+    def inspect(path):
+        try:
+            try:
+                info = os.stat(path)
+            except (FileNotFoundError, NotADirectoryError):
+                return None
+            if not stat.S_ISDIR(info.st_mode):
+                return None
+            return linked_registrations(path)
+        except Exception as exc:
+            # A container that is not a Git repo is not a failed main. Broken
+            # Git markers remain visible; no deletion can originate from them.
+            if isinstance(exc, OSError) or os.path.lexists(os.path.join(path, '.git')) or os.path.isfile(os.path.join(path, 'HEAD')):
+                return {'path': path, 'reason': ws.failure_text(exc)}
+            return None
+    with cf.ThreadPoolExecutor(8) as pool:
+        for result in pool.map(inspect, sources):
+            if isinstance(result, dict):
+                failures.append(result)
+            elif result:
+                main, entries = result
+                mains[main] = entries
+    # A copied gitdir may claim the same primary path with stale registrations.
+    # Enumerate each actual primary again instead of letting the last copy win.
+    primaries = sorted(mains)
+    refreshed = {}
+    with cf.ThreadPoolExecutor(8) as pool:
+        for primary, result in zip(primaries, pool.map(inspect, primaries)):
+            if isinstance(result, tuple) and result[0] == primary:
+                refreshed[primary] = result[1]
+            else:
+                failures.append({'path': primary, 'reason': 'primary Git registration unavailable or changed'})
+    mains = refreshed
+    registered = {row['path'] for entries in mains.values() for row in entries}
+    failed_paths = {canonical(row['path']) for row in failures}
+    for path in sources:
+        if os.path.isfile(os.path.join(path, '.git')) and canonical(path) not in registered and canonical(path) not in failed_paths:
+            failures.append({'path': canonical(path), 'reason': 'gitfile is not a registered linked worktree (submodule/separate gitdir)'})
+    return mains, failures
+
+
+def linked_state(registration, context):
+    path, main = registration['path'], registration['main']
+    _, current = linked_registrations(main)
+    live = next((r for r in current if r['path'] == path), None)
+    if not live:
+        raise ws.Keep('linked registration disappeared')
+    if 'locked' in live:
+        raise ws.Keep('locked worktree: ' + live['locked'])
+    for name in ('environments', 'cwds'):
+        for point, reason in context[name].items():
+            if inside(point, path):
+                raise ws.Keep(reason)
+    if 'prunable' in live or not os.path.isdir(path):
+        raise ws.Keep('missing/prunable worktree; Git prune decides registration cleanup')
+    before = os.lstat(path)
+    identity_reason = context.get('cwd_identities', {}).get(f'{before.st_dev}:{before.st_ino}')
+    if identity_reason:
+        raise ws.Keep(identity_reason)
+    if not stat.S_ISDIR(before.st_mode) or path != canonical(path):
+        raise ws.Keep('worktree directory identity unknown')
+    common, gitdir, primary = metadata(path, 'linked')
+    if primary != main:
+        raise ws.Keep('worktree main changed')
+    head = source_git(path, 'rev-parse', 'HEAD').stdout.strip()
+    if head != live.get('HEAD'):
+        raise ws.Keep('registered HEAD changed')
+    latest = before.st_mtime
+    def failed(exc):
+        raise exc
+    # Shared common-dir fetches/other worktrees do not refresh this worktree.
+    for root in (path, gitdir):
+        for parent, dirs, files in os.walk(root, followlinks=False, onerror=failed):
+            checkpoint()
+            if parent == path:
+                dirs[:] = [d for d in dirs if d != '.git']
+            # Git's read probes and transient lockfiles can refresh an admin
+            # directory without changing HEAD/index/reflog or source files.
+            names = ([*files, *(name for name in dirs if os.path.islink(os.path.join(parent, name)))]
+                     if root == gitdir else [None, *dirs, *files])
+            for name in names:
+                checkpoint()
+                info = os.lstat(os.path.join(parent, name) if name else parent)
+                if root == path and stat.S_ISDIR(info.st_mode):
+                    reason = context.get('cwd_identities', {}).get(f'{info.st_dev}:{info.st_ino}')
+                    if reason:
+                        raise ws.Keep(reason)
+                latest = max(latest, info.st_mtime)
+                if time.time() - latest < 86400:
+                    raise ws.Keep('active within 24h')
+    branch = live.get('branch')
+    if branch:
+        for name in (branch, 'logs/' + branch):
+            target = os.path.join(common, name)
+            if os.path.lexists(target):
+                latest = max(latest, os.lstat(target).st_mtime)
+    if time.time() - latest < 86400:
+        raise ws.Keep('active within 24h')
+    # Preview the same clean state Git requires. Git remove is still the final
+    # judge, including submodules and ignored entries; never pass --force.
+    if source_git(path, 'status', '--porcelain', '--untracked-files=all').stdout:
+        raise ws.Keep('Git working tree is dirty (including untracked)')
+    after = os.lstat(path)
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise ws.Keep('worktree directory changed')
+    objects = {branch or 'HEAD': head}
+    return dict(live, identity=[after.st_dev, after.st_ino], gitdir=gitdir, head=head, objects=objects,
+                idle_hours=(time.time() - latest) / 3600)
+
+
+def linked_plan(registration, context):
+    row = dict(registration, action='keep', archives=[])
+    try:
+        row.update(linked_state(registration, context))
+        repo = LiveRepo(row['main'], set(ws.DEFAULT_LOGINS))
+        rejected = {}
+        for name, (url, _) in list(repo.remotes.items()):
+            target = tc.local_path(url, row['main'])
+            if target:
+                try:
+                    target = canonical(target)
+                    target_common = canonical(source_git(target, 'rev-parse', '--path-format=absolute', '--git-common-dir').stdout.strip())
+                    independent = not inside(target, row['path']) and target_common != canonical(repo.common)
+                except Exception:
+                    independent = False
+                if not independent:
+                    rejected[name] = 'local remote is self/shared storage or independence is unknown'
+                    repo.remotes.pop(name)
+        repo.dest = repo._archive_destination(set(ws.DEFAULT_LOGINS))
+        row['urls'] = [pair[0] for pair in repo.remotes.values()]
+        row['rejected_local_remotes'] = rejected
+        row['remote_errors'] = {}
+        proof = None
+        # One live branch proof suffices. Do not wait for unrelated servers
+        # after origin has already proved the checked-out commit.
+        for name in sorted(repo.remotes, key=lambda value: (value != 'origin', value)):
+            try:
+                out = live_query(row['main'], ws.transport_url(repo.remotes[name][0]))
+                refs = {ref: sha for sha, ref in (line.split('\t') for line in out.splitlines() if '\t' in line)
+                        if ref.startswith('refs/heads/')}
+                repo.live[name] = refs
+                repo.by_sha.update({sha: f'{name}:{ref}' for ref, sha in refs.items()})
+                proof = repo.proof(row['head'])
+                if proof: break
+            except Exception as exc:
+                repo.live.pop(name, None)
+                row['remote_errors'][name] = ws.failure_text(exc)
+        row['remote_proofs'] = {key: proof for key in row['objects']}
+        row['archive_objects'] = {} if proof else dict(row['objects'])
+        if not proof:
+            if not repo.dest:
+                raise ws.Keep('unpushed branch and no personal or internal remote')
+            url = ws.transport_url(repo.remotes[repo.dest][1])
+            if any('mono2' in value.lower() for value in (row['path'], *[v[0] for v in repo.remotes.values()])) and ws.parse_remote(url)[0] == 'github.com':
+                raise ws.Keep('mono2 must never be archived to GitHub')
+            row['archive_url'] = url
+        row['action'] = 'remove' if proof else 'archive+remove'
+    except Exception as exc:
+        row['reason'] = str(exc) if isinstance(exc, ws.Keep) else 'check unknown: ' + ws.failure_text(exc)
+    return row
+
+
+def linked_execute(rows, log, stamp):
+    for row in rows:
+        if row['action'] == 'keep':
+            continue
+        try:
+            LIVE.clear()
+            context = linked_context()
+            fresh = linked_plan(row, context)
+            if fresh['action'] == 'keep':
+                raise ws.Keep(fresh['reason'])
+            for key in ('identity', 'head', 'gitdir', 'main', 'objects'):
+                if fresh[key] != row[key]:
+                    raise ws.Keep(key + ' changed after preview')
+            for key in ('remote_proofs', 'archive_objects', 'urls', 'rejected_local_remotes', 'remote_errors'):
+                row[key] = fresh[key]
+            for source, sha in fresh['archive_objects'].items():
+                ref = f'refs/heads/archive/git-tree/{ws.archive_slug(row["path"])}-{stamp}/' + re.sub(r'[^A-Za-z0-9-]', '-', source)
+                url = fresh['archive_url']
+                source_git(row['main'], 'push', url, f'{sha}:{ref}')
+                proof = source_git(row['main'], 'ls-remote', url, ref).stdout.split()
+                if not proof or proof[0] != sha:
+                    raise ws.Keep('archive SHA verification failed')
+                archive = {'source': source, 'sha': sha, 'url': url, 'ref': ref}
+                row['archives'].append(archive)
+                persist(log, dict(row, event='archive_verified'))
+            # BB/cwd/registration/age/cleanliness are live after network IO.
+            current = linked_state(row, linked_context())
+            for key in ('identity', 'head', 'gitdir', 'main', 'objects'):
+                if current[key] != row[key]:
+                    raise ws.Keep(key + ' changed before Git remove')
+            persist(log, dict(row, event='remove_intent'))
+            with physical_parent(row['path']) as (fd, basename):
+                actual = os.stat(basename, dir_fd=fd, follow_symlinks=False)
+                if [actual.st_dev, actual.st_ino] != row['identity']:
+                    raise ws.Keep('directory identity changed')
+                source_git(row['main'], 'worktree', 'remove', '--', current['registered_path'])
+            row['result'] = 'removed'
+        except Exception as exc:
+            row.update(result='kept', reason=ws.failure_text(exc))
+        persist(log, row)
+
+
+def linked_main(argv=None):
+    global DEADLINE
+    parser = argparse.ArgumentParser(description='Registered linked worktrees: Git remove, 24h idle; independent clones use git_tree_sweep.py.')
+    parser.add_argument('--execute', action='store_true')
+    parser.add_argument('--reviewed-preview')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--budget-minutes', type=float, default=15)
+    parser.add_argument('--state-dir', default=os.path.expanduser('~/.local/state/devcloud-storage-upkeep'))
+    args = parser.parse_args(argv)
+    started = time.monotonic(); DEADLINE = started + args.budget_minutes * 60; LIVE.clear()
+    # The linked entry is a separate process; retain host config but discard
+    # inherited repository/config injection, just like source_git.
+    ws.ENV = source_environment()
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
+    output = Path(args.state_dir, f'linked-worktree-sweep-{stamp}.json'); log = output.with_suffix('.jsonl')
+    with open(Path(args.state_dir, 'git-tree-sweep.lock'), 'a') as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('Git sweep busy; skipped'); return 0
+        persist(log, {'event':'start','timestamp':stamp,'mode':'execute' if args.execute else 'dry-run','policy':'linked'})
+        rows, mains, failures, error, indexed, comparison, prunes = [], {}, [], None, None, None, []
+        try:
+            context = linked_context(); sources, indexed = linked_known_sources(args.state_dir, context)
+            mains, failures = linked_inventory(sources)
+            registrations = [row for entries in mains.values() for row in entries]
+            with cf.ThreadPoolExecutor(8) as pool:
+                rows = list(pool.map(lambda row: linked_plan(row, context), registrations))
+            registered_paths = {row['path'] for row in rows}
+            rows.extend(dict(failure, type='linked', action='keep', archives=[], reason='Git registration unavailable: ' + failure['reason'])
+                        for failure in failures if failure['path'] not in registered_paths and os.path.isfile(os.path.join(failure['path'], '.git')))
+            def measure(row):
+                try:
+                    out = command(['du','-sx','-B1','--',row['path']],timeout=60,check=False)
+                    row['bytes'] = int(out.stdout.split()[0]) if out.returncode == 0 else None
+                except Exception: row['bytes'] = None
+            with cf.ThreadPoolExecutor(8) as pool: list(pool.map(measure, rows))
+            persist(log, {'event':'planned','seconds':time.monotonic()-started,'summary':summarize(rows)})
+            if args.reviewed_preview:
+                prior = json.loads(Path(args.reviewed_preview).read_text())
+                if prior.get('policy') != 'linked': raise ws.Keep('reviewed preview is not a linked preview')
+                comparison = reviewed_comparison(rows,args.reviewed_preview)
+                if comparison['added']: raise ws.Keep('new linked candidates outside reviewed preview; no actions performed')
+            if args.execute: linked_execute(rows,log,stamp)
+            for main in mains:
+                try:
+                    flags = [] if args.execute else ['--dry-run']
+                    out = source_git(main,'worktree','prune','--verbose',*flags)
+                    entry = {'main':main,'mode':'execute' if args.execute else 'dry-run','result':'ok','output':out.stdout+out.stderr}
+                except Exception as exc: entry = {'main':main,'result':'kept','reason':ws.failure_text(exc)}
+                prunes.append(entry); persist(log,dict(entry,event='prune'))
+        except Exception as exc: error = ws.failure_text(exc)
+        if time.monotonic() >= DEADLINE: error = error or 'time budget reached'
+        report = {'schema_version':3,'policy':'linked','mode':'execute' if args.execute else 'dry-run','timestamp':stamp,
+                  'complete':not bool(error),'error':error,'indexed_discovery':indexed,'mains':sorted(mains),
+                  'unresolved_mains':failures,'items':rows,'prunes':prunes,'reviewed_comparison':comparison,
+                  'timings':{'total_seconds':round(time.monotonic()-started,3)},'summary':summarize(rows),'output':str(output)}
+        with open(output,'w',opener=lambda p,flags:os.open(p,flags,0o600)) as handle: json.dump(report,handle,ensure_ascii=True,indent=2)
+        for row in rows: persist(log,row)
+        print(json.dumps(report if args.json else {key:report[key] for key in ('policy','mode','complete','error','timings','summary','output')}))
+        return 1 if error else 0
+
+
 def main(argv=None):
     global DEADLINE
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--reviewed-preview', help='First execution batch: stop before archive/removal if new candidates appear.')
     parser.add_argument('--json', action='store_true')
-    parser.add_argument('--budget-minutes', type=float, default=30)
+    parser.add_argument('--budget-minutes', type=float, default=45)
     parser.add_argument('--state-dir', default=os.path.expanduser('~/.local/state/devcloud-storage-upkeep'))
     args = parser.parse_args(argv)
     started = time.monotonic()
@@ -1522,6 +2721,8 @@ def main(argv=None):
         except Exception as exc:
             error = 'managed storage unknown: ' + ws.failure_text(exc)
         inventory = discover(roots, excluded)
+        inventory['linked_markers'] = [path for path, kind in inventory['trees'].items() if kind == 'linked']
+        inventory['marker_counts'] = {kind: sum(value == kind for value in inventory['trees'].values()) for kind in set(inventory['trees'].values())}
         timings = {'discovery_seconds': round(time.monotonic() - started, 3)}
         persist(log, {'event': 'discovered', 'seconds': timings['discovery_seconds'],
                       'trees': len(inventory['trees']), 'directories': inventory['directories'], 'errors': inventory['errors']})
@@ -1530,7 +2731,7 @@ def main(argv=None):
             if inventory['errors']:
                 raise ws.ScanIncomplete('; '.join(inventory['errors'][:10]))
             refs = references(inventory)
-            anchors, unknown = usage(inventory)
+            anchors, unknown = usage(inventory, refs)
         except Exception as exc:
             error = 'usage/reference inventory incomplete: ' + ws.failure_text(exc)
         if global_unknown(unknown):
@@ -1538,7 +2739,7 @@ def main(argv=None):
         timings['inventory_seconds'] = round(time.monotonic() - started, 3)
         persist(log, {'event': 'references_checked', 'seconds': timings['inventory_seconds'], 'error': error})
         with cf.ThreadPoolExecutor(8) as pool:
-            rows = list(pool.map(lambda p: plan(p, inventory['trees'][p], inventory, anchors, refs, error), sorted(inventory['trees'])))
+            rows = list(pool.map(lambda p: plan(p, inventory['trees'][p], inventory, anchors, refs, error), sorted(path for path, kind in inventory['trees'].items() if kind != 'linked')))
         timings['plan_seconds'] = round(time.monotonic() - started, 3)
         persist(log, {'event': 'planned', 'seconds': timings['plan_seconds'], 'summary': summarize(rows)})
         # Measurement is bounded too; failures remain null, never zero.
@@ -1563,7 +2764,7 @@ def main(argv=None):
             execute(rows, inventory, anchors, refs, roots, excluded, stamp, log)
         if time.monotonic() >= DEADLINE:
             error = error or 'time budget reached; partial plan retained'
-        report = {'schema_version': 2, 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run',
+        report = {'schema_version': 2, 'policy': 'clones', 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run',
                   'roots': roots, 'complete': not bool(error or inventory['errors']), 'error': error,
                   'unresolved': unknown, 'global_unresolved': global_unknown(unknown),
                   'reviewed_comparison': comparison,

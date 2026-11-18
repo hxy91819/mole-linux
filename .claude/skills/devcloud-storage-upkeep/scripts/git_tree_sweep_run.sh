@@ -2,21 +2,18 @@
 # Start the bounded host worker; BB script runs have a hard 900-second limit.
 set -euo pipefail
 if [[ "${1:-}" == "--help" ]]; then
-    echo 'Start host-wide Git sweep: preview 30m/33m, --execute 150m/153m; optional --reviewed-preview FILE for the first execution.'
+    echo 'Start registered linked sweep (15m) then full clone sweep (45m preview / 150m execute); hard limit 63m / 168m. Manual reviewed previews use each Python entry separately.'
     exit 0
 fi
 git_sweep_mode=dry-run
-git_sweep_budget=30
-git_sweep_hard_seconds=1980
+git_sweep_hard_seconds=3780
 if [[ $# -ne 0 ]]; then
-    if [[ "${1:-}" != --execute ]] || [[ $# -ne 1 && $# -ne 3 ]] ||
-        { [[ $# -eq 3 ]] && { [[ "$2" != --reviewed-preview ]] || [[ ! -f "$3" ]]; }; }; then
-        echo 'Usage: git_tree_sweep_run.sh [--execute [--reviewed-preview FILE]]' >&2
+    if [[ "${1:-}" != --execute ]] || [[ $# -ne 1 ]]; then
+        echo 'Usage: git_tree_sweep_run.sh [--execute]' >&2
         exit 2
     fi
     git_sweep_mode=execute
-    git_sweep_budget=150
-    git_sweep_hard_seconds=9180
+        git_sweep_hard_seconds=10080
 fi
 git_sweep_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 git_sweep_unit=devcloud-git-tree-sweep.service
@@ -43,5 +40,5 @@ fi
 systemd-run --unit="$git_sweep_unit" --collect --service-type=exec \
     --property=User=root --property=WorkingDirectory=/ --property="RuntimeMaxSec=$git_sweep_hard_seconds" \
     --setenv="PATH=${PATH}" \
-    /root/.pyenv/versions/3.12.12/bin/python3 -I "$git_sweep_dir/git_tree_sweep.py" --budget-minutes "$git_sweep_budget" "$@"
+    /bin/bash "$git_sweep_dir/git_tree_sweep_worker.sh" /root/.pyenv/versions/3.12.12/bin/python3 "$@"
 echo "Git tree $git_sweep_mode launched; reports: /root/.local/state/devcloud-storage-upkeep/git-tree-sweep-*.json"
