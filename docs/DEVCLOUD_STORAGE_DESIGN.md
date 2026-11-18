@@ -269,7 +269,7 @@ ignored 无凭据，每个 branch/HEAD/tag 都能恢复。旧 linked 的 WIP 快
 全批远端 IO 完成后刷新发现与引用，随后重核本地状态再进入 sink。linked 只调主仓库的无 force
 `git worktree remove`；clone 绑定 ancestor fd 后只删除自身，不跟随软链。
 
-旧版先删目录再删除 BB 环境，曾为 dangling 环境补扫；当前政策改为任何未销毁环境都保护路径，
+旧版先删目录再删除 BB 环境，曾为 dangling 环境补扫；当前政策改为非遗弃或正在回收的未销毁环境保护路径（遗弃标准见文末），
 因此不再自动调用 `bb environment delete`。旧两个脚本仍提供 helper 和旧行为回归 API；worktree CLI转linked_main，tmp clone CLI转clone主函数；旧06:45任务停用且改为空操作，防止水位旧快照手动派发旧执行器。
 全盘发现约150万目录，旧12分钟轮次预算不足；完整实测一轮863秒，距BB单次900秒硬上限仅37秒余量，无法覆盖负载波动。因此06:30任务只启动systemd transient service，结束后collect；当前先linked15分钟，再clone预演45分钟/执行150分钟，整体硬限63/168分钟。维持全盘发现范围，不用深度或路径白名单换速度。
 最初仅部署预演，owner完成逐轮审核后已授权06:30执行；每次规则变化仍先验证预演和对应授权。
@@ -560,3 +560,10 @@ linked审查收尾：thr_d2prih37sv发现self local/file remote会把共享本�
 linked年龄补充：计算工作树文件/目录和自身gitdir的实际文件（index、HEAD、FETCH_HEAD、reflog等）mtime，不以Git管理目录自身mtime作为活动。实测3棵mono2树仅管理目录被临时锁/探针刷新，实际文件均旧于24h；目录mtime不应使它们永久刷活。此修正只用于linked，clone保持原7天全部元数据规则。
 
 linked首次实测：完整预演128.080秒、执行278.043秒，27候选中10删除/17保留，mono2删除6棵。Git对13棵回指不一致的登记拒绝remove，符合“Git拒绝就保留”，未修登记来绕过拒绝；其余4项因远端不存在/无凭据保留。9个原SHA归档ref独立核验通过，7棵虽归档但Git拒绝仍保留。15分钟预算有实测裕量；失败登记不需要恢复通用clone启发式。总删除窗口可用净增9.131GiB（mono2 5.744GiB），与原du9.064GiB（mono2 5.720GiB）分列，差异含并发活动。06:30已部署6d0208714b86c771，两条路径仍分开报告；完整逐linked证据在linked-fastpath-20261118/REPORT.md。本轮不再等待独立clone数小时批次，独立clone由原每日策略继续处理。
+
+2026-11-18遗弃环境：未销毁的BB环境不能无条件永久保护worktree。owner明确以“没有未归档线程且BB闲置满24小时”判断遗弃；存在未归档线程即保留，无论线程idle多久。时间用环境及线程created/updated/archived/attention/read最新值，未知保留。对managed=true的provider-owned路径先交BB cleanup，BB负责hook、目录及登记；路径型和BB拒绝则不再作为环境证据，回到现有Git判定。共同分类同时用于linked和clone/项目unknown兜底，避免只修预演或漏掉第二条保护。
+只读核验发现release-three-images的env_w7kw3b8puw是managed=false的路径型环境，2个线程均归档。cleanup拒绝这种环境；delete在provider=null时只改生命周期，不能把成功响应误报为目录已删。本流程保留其环境登记，等待Git确认是否能删工作树。providerId=project-checkout也可能managed=false，因此不能只看provider名字选回收命令。BB cleanup异步成功后仍需show确认destroyed；接受但未完成的回收继续保护，失败/拒绝走Git兜底，不用recover绕过BB。BB provider内部有force/remove与停止cwd进程，调用前校线程、环境、实时cwd和工作文件24h闲置，避免把“无未归档线程”误当“没有业务使用”。
+
+不能拿交互线程中的BB status当定时任务上下文：systemd仅传PATH，thread=null。回归现包含无线程身份查询及主机歧义拒绝。正常保留/明确拒绝与基础设施错误也必须分开：逐环境查询或响应协议失败要保留对象、继续后续对象和阶段，并最终非零；否则每日检查会把坏查询报成清理成功。
+
+本轮环境分类计量要分清“记录”和“目录”：执行识别52条遗弃记录，其中50有路径，另2条error从未物化、没有path/instance，在旧规则中也不代表目录。只把50条算作解除路径证据；provider实际回收0，不把路径型记录标成已销毁。Git最终删除2个linked和3个clone，原du合计3.310GiB；17项拒绝均保留。linked阶段/data净增2.141GiB、clone删除窗口净增1.208GiB，全程仅净增0.314GiB，体现同期写入；linked监测启动较晚的0窗口读数不能当0释放。3个clone保持每sink全盘复核，耗2678.488秒，性能成本仍由原clone规则承担；BB环境阶段只耗1.446秒，不能把两者混称“BB回收慢”。

@@ -1790,6 +1790,8 @@ def bb_anchors(anchors, environments_values=None):
     environments = json.loads(command(['bb', 'environment', 'list', '--json']).stdout)
     if not isinstance(projects, list) or not isinstance(environments, list):
         raise ws.ScanIncomplete('BB inventory incomplete')
+    environment_rows = bb_environment_inventory(environments)
+    protected_ids = {row['id'] for row in environment_rows if row['protects']}
     for project in projects:
         if not isinstance(project.get('sources'), list):
             raise ws.ScanIncomplete('BB project sources unknown')
@@ -1797,7 +1799,7 @@ def bb_anchors(anchors, environments_values=None):
             if source.get('path'):
                 anchor(anchors, source['path'], f'BB project source: {project["id"]}')
     for env in environments:
-        if env.get('status') != 'destroyed' and (env.get('lifecycle') or {}).get('phase') != 'destroyed':
+        if env['id'] in protected_ids:
             path = env.get('path') or ((env.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path')
             if not path and env.get('status') == 'error' and not env.get('environmentProviderInstanceKey'):
                 continue  # Provisioning failed before any checkout was materialized.
@@ -1821,7 +1823,7 @@ def bb_anchors(anchors, environments_values=None):
         project_paths = [canonical(s['path']) for s in project.get('sources', []) if s.get('path')]
         env_paths = [canonical(e.get('path') or ((e.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path'))
                      for e in environments if e.get('projectId') == project['id'] and
-                     e.get('status') != 'destroyed' and (e.get('lifecycle') or {}).get('phase') != 'destroyed' and
+                     e['id'] in protected_ids and
                      (e.get('path') or ((e.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path'))]
         for task in tasks:
             if task.get('problem'):
@@ -2315,12 +2317,187 @@ def reviewed_comparison(rows, preview_path):
     return {'preview': str(preview_path), 'allowed': len(allowed), 'added': added}
 
 
+def bb_environment_classify(env, threads, now=None):
+    """Archived is a lifecycle fact, never inferred from an idle runtime."""
+    now = time.time() if now is None else now
+    path = env.get('path') or ((env.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path')
+    row = dict(id=env['id'], path=path, host_id=env.get('hostId'),
+               provider=env.get('environmentProviderId'), managed=env.get('managed') is True,
+               abandoned=False, protects=True, thread_ids=[t['id'] for t in threads])
+    if env.get('status') == 'destroyed' or (env.get('lifecycle') or {}).get('phase') == 'destroyed':
+        return dict(row, protects=False, reason='environment destroyed')
+    unarchived = [t['id'] for t in threads if t.get('archivedAt') is None]
+    if unarchived:
+        return dict(row, reason='unarchived threads', unarchived_thread_ids=unarchived)
+    values = []
+    for record in [env, *threads]:
+        for key in ('createdAt', 'updatedAt'):
+            value = record.get(key)
+            if type(value) not in (int, float) or not 0 < value <= now * 1000:
+                return dict(row, reason='environment/thread activity timestamp unknown')
+            values.append(value)
+        for key in ('archivedAt', 'latestAttentionAt', 'lastReadAt'):
+            value = record.get(key)
+            if value is not None:
+                if type(value) not in (int, float) or not 0 < value <= now * 1000:
+                    return dict(row, reason='environment/thread activity timestamp unknown')
+                values.append(value)
+        activity = record.get('activity') or {}
+        if (record.get('status') in ws.BB_BUSY or
+                record.get('queuedWork', 'none') != 'none' or record.get('hasPendingInteraction') or
+                any(value for value in activity.values() if isinstance(value, int))):
+            return dict(row, reason='environment/thread runtime still active')
+    latest = max(values) / 1000
+    row.update(last_activity=latest, idle_hours=(now - latest) / 3600)
+    if now - latest < 86400:
+        return dict(row, reason='BB activity within 24h')
+    teardown = (env.get('lifecycle') or {}).get('teardown') or {}
+    # A successful asynchronous request is not a refusal: let its owner finish.
+    running = teardown.get('status') == 'running' or (env.get('lifecycle') or {}).get('phase') in ('removing', 'destroying')
+    return dict(row, abandoned=True, protects=running,
+                reason='BB provider cleanup running' if running else 'all threads archived or absent; BB idle >=24h')
+
+
+def bb_environment_inventory(environments=None, threads=None):
+    if environments is None:
+        environments = json.loads(command(['bb', 'environment', 'list', '--json']).stdout)
+    if not isinstance(environments, list) or any(not isinstance(e, dict) or not e.get('id') for e in environments):
+        raise ws.ScanIncomplete('BB environment inventory incomplete')
+    # Older/incomplete records already remain protected, without inventing age.
+    if threads is None:
+        threads = (json.loads(command(['bb', 'thread', 'list', '--include-archived', '--include-hidden', '--json']).stdout)
+                   if any(e.get('createdAt') and e.get('updatedAt') for e in environments) else [])
+    if not isinstance(threads, list) or any(not isinstance(t, dict) or not t.get('id') or 'environmentId' not in t for t in threads):
+        raise ws.ScanIncomplete('BB thread inventory incomplete')
+    grouped = {}
+    for thread in threads:
+        grouped.setdefault(thread['environmentId'], []).append(thread)
+    return [bb_environment_classify(env, grouped.get(env['id'], [])) for env in environments]
+
+
+def bb_provider_workspace_idle(row, context):
+    """BB removal may force/remove and stop cwd users: establish idle first."""
+    path = canonical(row['path'])
+    for points in ('cwds', 'environments'):
+        for point, reason in context[points].items():
+            if inside(point, path):
+                raise ws.Keep(reason)
+    if not os.path.lexists(path):
+        return  # BB also owns cleanup of an already-missing managed workspace.
+    roots = [path]
+    if os.path.isfile(os.path.join(path, '.git')):
+        roots.append(metadata(path, 'linked')[1])
+    def failed(exc): raise exc
+    for root in roots:
+        for parent, dirs, files in os.walk(root, followlinks=False, onerror=failed):
+            checkpoint()
+            if root == path and parent == path and len(roots) > 1:
+                dirs[:] = [d for d in dirs if d != '.git']
+            names = [None, *dirs, *files] if root == path else files
+            for name in names:
+                info = os.lstat(os.path.join(parent, name) if name else parent)
+                if context.get('cwd_identities', {}).get(f'{info.st_dev}:{info.st_ino}'):
+                    raise ws.Keep('live process cwd in provider workspace')
+                if time.time() - info.st_mtime < 86400:
+                    raise ws.Keep('provider workspace active within 24h')
+
+
+def bb_local_host():
+    # BB's server host has no machine provider; enrolled/remote machines do.
+    # Unlike `bb status.thread`, this inventory also exists under systemd.
+    machines = json.loads(command(['bb','machine','list','--all','--json']).stdout)
+    if not isinstance(machines, list):
+        raise ws.ScanIncomplete('BB machine inventory unknown')
+    local = [m for m in machines if isinstance(m, dict) and
+             'machineProviderId' in m and m['machineProviderId'] is None and
+             m.get('type') == 'persistent' and m.get('status') == 'connected' and m.get('id')]
+    if len(local) != 1:
+        raise ws.ScanIncomplete('local BB host identity ambiguous/unavailable')
+    return local[0]['id']
+
+
+def bb_environment_main(argv=None):
+    global DEADLINE
+    parser = argparse.ArgumentParser(description='Retire BB environments: all threads archived/absent and idle >=24h.')
+    parser.add_argument('--execute', action='store_true')
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--budget-minutes', type=float, default=5)
+    parser.add_argument('--state-dir', default=os.path.expanduser('~/.local/state/devcloud-storage-upkeep'))
+    args = parser.parse_args(argv)
+    started = time.monotonic(); DEADLINE = started + args.budget_minutes * 60
+    stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
+    os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
+    output = Path(args.state_dir, f'bb-environment-sweep-{stamp}.json'); log = output.with_suffix('.jsonl')
+    rows, error, failures = [], None, []
+    with open(Path(args.state_dir, 'git-tree-sweep.lock'), 'a') as lock:
+        try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('Git sweep busy; skipped'); return 0
+        persist(log, {'event':'start','timestamp':stamp,'mode':'execute' if args.execute else 'dry-run'})
+        try:
+            host = bb_local_host()
+            environments = json.loads(command(['bb','environment','list','--json']).stdout)
+            rows = [dict(row, action='keep') for row in bb_environment_inventory(environments)]
+            for row in rows:
+                checkpoint()
+                row['action'] = 'keep'
+                if not row['abandoned'] or row['protects']: continue
+                if row['host_id'] != host:
+                    row['reason'] = 'different/unknown host; no local cleanup'; continue
+                if not row['managed'] or not row['provider']:
+                    row['action'] = 'release-protection'; continue
+                row['action'] = 'provider-cleanup'
+                try:
+                    if not row['path'] or not row['path'].startswith('/'):
+                        raise ws.Keep('provider path unknown')
+                    bb_provider_workspace_idle(row, linked_context())
+                    if not args.execute: continue
+                    env = json.loads(command(['bb','environment','show',row['id'],'--json']).stdout)
+                    threads = json.loads(command(['bb','thread','list','--environment',row['id'],'--include-archived','--include-hidden','--json']).stdout)
+                    fresh = bb_environment_inventory([env], threads)[0]
+                    if not fresh['abandoned'] or fresh['protects'] or any(fresh[key] != row[key] for key in ('path','host_id','provider','managed')):
+                        raise ws.Keep('BB environment evidence changed')
+                    bb_provider_workspace_idle(fresh, linked_context())
+                    persist(log, dict(row,event='cleanup_intent'))
+                    out = command(['bb','environment','cleanup',row['id'],'--json'],check=False)
+                    reply = json.loads(out.stdout)
+                    if out.returncode:
+                        problem = reply.get('error') or {}
+                        if problem.get('code') not in ('invalid_request', 'conflict', 'environment_in_use') or not problem.get('message'):
+                            raise ws.ScanIncomplete('BB cleanup failed: ' + ws.failure_text(out.stderr or out.stdout))
+                        row.update(result='refused; Git fallback',cleanup_error=problem['message'])
+                    else:
+                        if reply.get('ok') is not True:
+                            raise ws.ScanIncomplete('BB cleanup response unknown')
+                        observed = json.loads(command(['bb','environment','show',row['id'],'--json']).stdout)
+                        if observed.get('id') != row['id'] or observed.get('status') not in ('provisioning','ready','error','destroyed'):
+                            raise ws.ScanIncomplete('BB cleanup observation unknown')
+                        row.update(result='destroyed' if observed.get('status')=='destroyed' or (observed.get('lifecycle') or {}).get('phase')=='destroyed' else 'cleanup requested; pending', observed=observed)
+                except ws.Keep as exc:
+                    row.update(result='kept', cleanup_error=ws.failure_text(exc))
+                except Exception as exc:
+                    row.update(result='failed', cleanup_error=ws.failure_text(exc))
+                    failures.append(row['id'] + ': ' + row['cleanup_error'])
+                persist(log,row)
+        except Exception as exc: error = ws.failure_text(exc)
+        error = error or ('; '.join(failures) if failures else None)
+        if time.monotonic() >= DEADLINE: error = error or 'time budget reached'
+        report = dict(schema_version=1, policy='bb-environments', mode='execute' if args.execute else 'dry-run',
+                      timestamp=stamp,complete=not bool(error),error=error,failures=failures,items=rows,
+                      timings={'total_seconds':round(time.monotonic()-started,3)},output=str(output))
+        with open(output,'w',opener=lambda p,flags:os.open(p,flags,0o600)) as handle: json.dump(report,handle,ensure_ascii=True,indent=2)
+        for row in rows: persist(log,row)
+        print(json.dumps(report if args.json else {key:report[key] for key in ('policy','mode','complete','error','timings','output')}))
+        return 1 if error else 0
+
+
 def linked_context(proc='/proc'):
     """Only BB environments and live process cwd belong to the linked policy."""
     projects = json.loads(command(['bb', 'project', 'list', '--json']).stdout)
     environments = json.loads(command(['bb', 'environment', 'list', '--json']).stdout)
     if not isinstance(projects, list) or not isinstance(environments, list):
         raise ws.ScanIncomplete('BB linked inventory incomplete')
+    protected_ids = {row['id'] for row in bb_environment_inventory(environments) if row['protects']}
     sources, reserved, cwds, cwd_identities = set(), {}, {}, {}
     for project in projects:
         if not isinstance(project.get('sources'), list):
@@ -2330,7 +2507,7 @@ def linked_context(proc='/proc'):
         path = env.get('path') or ((env.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path')
         if path:
             sources.add(path)
-        if env.get('status') == 'destroyed' or (env.get('lifecycle') or {}).get('phase') == 'destroyed':
+        if env['id'] not in protected_ids:
             continue
         if not path and env.get('status') == 'error' and not env.get('environmentProviderInstanceKey'):
             continue
