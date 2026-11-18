@@ -70,9 +70,12 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
 - **匿名测试 DB 卷满 1 小时即清**：无任何容器引用、名称为 64 位十六进制且只带
   `com.docker.volume.anonymous` 标签、内容是 MySQL/PostgreSQL 数据目录或为空，创建满 1 小时即
   `docker volume rm <id>`。容器已删的匿名卷没有任何程序还能挂回去；命名卷、compose 卷与 retained 登记照旧。
-- **2026-11-18最新方向：linked 与独立clone分开判定**：每天06:30（Asia/Shanghai）的同一launcher先运行 `worktree_sweep.py` 的Git登记路径（15分钟），再运行 `git_tree_sweep.py` 的全盘独立clone路径（预演45分钟/执行150分钟）；systemd整体硬限为预演63分钟/执行168分钟。`tmp_clone_sweep.py` CLI转发独立clone路径，旧两个文件的helper仅供兼容。新规则预演后按owner授权直接执行一次，改动留工作区，不提交。
+- **2026-11-18最新方向：linked 与独立clone分开判定**：每天06:30（Asia/Shanghai）的同一launcher先回收遗弃BB环境（5分钟），再运行 `worktree_sweep.py` 的Git登记路径（15分钟），再运行 `git_tree_sweep.py` 的全盘独立clone路径（预演45分钟/执行150分钟）；systemd整体硬限为预演68分钟/执行173分钟。`tmp_clone_sweep.py` CLI转发独立clone路径，旧两个文件的helper仅供兼容。新规则预演后按owner授权直接执行一次，改动留工作区，不提交。
+  - **2026-11-18遗弃BB环境（linked/clone共用）**：完整读取含hidden和archived的线程库存。有任一未归档线程的环境始终保护；不能用idle线程状态代替archivedAt。全部归档或没有线程，且环境/线程最后活动满24h，才解除环境保护。年龄取createdAt、updatedAt、archivedAt、latestAttentionAt、lastReadAt的最大值；缺失必需时间、未来/无效时间、运行/排队活动、未知库存均保留。BB已接受异步回收且仍在running/removing时继续保护，让provider完成；拒绝/failed则按Git兜底。此解除同时适用于clone的环境anchor和项目unknown兜底中的环境路径，其他引用与判定不变。
+    每天先运行`bb_environment_sweep.py`（5分钟）再linked15分钟和clone45/150分钟，整体硬限68/173分钟。provider实际拥有路径（managed=true且有provider ID）时，用`bb environment cleanup <id> --json`请求BB回收，不加recover；BB自行执行teardown和目录/登记清理。该owner命令可能强制移除并停止cwd进程，因此调用前重读线程/环境，检查本地cwd、共享环境和工作文件至少24h未活动，避免影响活业务。路径型/managed=false（即使providerId=project-checkout）不调用cleanup，不直接改BB数据；BB拒绝回收的遗弃环境也不再提供保留证据，工作树仍过原linked/clone规则。
+    cleanup返回成功只表示请求已接受；show观察destroyed才报已回收，否则报pending并在后续检查读回。BB原生delete对无provider的路径环境可仅记destroyed而不删目录，故不用它冒充磁盘清理。遗弃判定每次删除前重新读取，不把预演结果做永久豁免清单。
   - **linked worktree专用规则**：已知主仓库取BB项目source、BB环境所属仓库及最近一次完整两盘发现的Git路径（报告中的完整发现库存）；每轮重新向Git执行 `git worktree list --porcelain -z`，不在全盘通用判定里处理linked。完整clone扫描继续登记新发现的主仓库/linked marker，供下一次快速路径使用。
-    仅当未locked、不是任何未销毁BB环境（含环境路径落在该树内）、没有活进程cwd落在该树内、当前分支/ detached HEAD已有实时远端分支证明或已按原SHA归档核验、闲置满24小时，才从主仓库执行 `git worktree remove -- <登记路径>`，不加 `--force`。预演用Git status报告dirty/untracked，最终以Git remove是否接受为准；Git拒绝即保留并记录原因，无原始目录删除fallback。
+    仅当未locked、不是仍受保护的BB环境（非遗弃或正在回收，含环境路径落在该树内）、没有活进程cwd落在该树内、当前分支/ detached HEAD已有实时远端分支证明或已按原SHA归档核验、闲置满24小时，才从主仓库执行 `git worktree remove -- <登记路径>`，不加 `--force`。预演用Git status报告dirty/untracked，最终以Git remove是否接受为准；Git拒绝即保留并记录原因，无原始目录删除fallback。
     24小时活动证据只含工作树文件、它自己的gitdir及所在分支的ref/reflog；主仓库fetch或其他worktree的共同元数据活动不重置本树年龄。只证明当前分支/HEAD，不要求其他共享分支、tag或stash满足clone规则。归档仍使用允许的同主机个人/内部origin、`archive/git-tree/*`原SHA并远端核验，拒绝不改写历史；mono2不归档到GitHub。
     BB环境/cwd/登记/HEAD/24h活动在每项网络IO后、Git remove前复核，未知保留。名称引用、项目兜底、嵌套、alternates、HOME/XDG、配置/容器等全盘clone保护不用于linked；Git对ignored条目和子模块按自身remove语义处理。理由：linked的所有权和状态由主仓库登记及上述实时证据决定，不让clone的通用范围保护阻止Git管理自己的副本。
     每个主仓库随后执行 `git worktree prune --verbose`（预演加 `--dry-run`），仅由Git清理失效的登记；不直接删除残缺gitfile目录。无法解析的Git路径列为unresolved_mains/保留，主仓库自身仍走下面原clone保护。首次人工执行绑定专用完整预演 `--reviewed-preview`，报告schema_version=3、policy=linked。
@@ -86,7 +89,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     依赖容器 `node_modules/vendor/.venv/venv/__pypackages__` 仅在 package.json、Go/Composer/Bundler/Cargo 元数据、pyvenv.cfg 或 PEP 582 布局等 owner 证据存在时裁剪，pnpm 按版本/files 布局确认；仅同名目录仍遍历。
     理由：其中的 Git 结构是安装器/缓存的实现状态，生命周期归 owner 命令；整库删除会破坏依赖和工具复用。
     `.pyenv`、`.nvm` 等工具安装本身不按名称排除，依赖实际使用引用保护。排除路径及理由写入报告。
-  - **占用保护**：BB 项目全部 source 路径、任何未 destroyed 环境路径、原有忙碌/近期 BB 线程、
+  - **占用保护**：BB 项目全部 source 路径、非遗弃或正在回收的未 destroyed 环境路径、原有忙碌/近期 BB 线程、
     进程 cwd/exe/fd/maps 与 PATH、`*_HOME/*_ROOT/*_DIR`，容器（含 stopped）挂载、挂载点、外部软链，
     shell 初始化文件、systemd 系统/用户单元、crontab、BB 自动化保存的命令引用，均保护包含该引用的工作树。
     引用父容器本身不等于引用其中每个子 clone；不借引用保护恢复路径白名单。未成功物化、无 path/instance 的

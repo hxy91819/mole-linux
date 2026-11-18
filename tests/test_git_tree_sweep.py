@@ -747,7 +747,7 @@ def test_launcher_starts_only_one_bounded_dry_run(case, state, success, launched
     assert capture.exists() == launched
     if launched:
         args = json.loads(capture.read_text())
-        assert ('--property=RuntimeMaxSec=10080' if execute else '--property=RuntimeMaxSec=3780') in args
+        assert ('--property=RuntimeMaxSec=10380' if execute else '--property=RuntimeMaxSec=4080') in args
         assert '--property=WorkingDirectory=/' in args
         assert str(SCRIPT.with_name('git_tree_sweep_worker.sh')) in args
         assert ('--execute' in args) is execute
@@ -2553,10 +2553,9 @@ def test_worker_runs_linked_before_clones_and_preserves_each_budget(case,mode):
     probe.chmod(0o755)
     result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe),*mode],capture_output=True,text=True)
     calls=[json.loads(x) for x in log.read_text().splitlines()]
-    assert result.returncode==0 and len(calls)==2
-    assert calls[0][1].endswith('/worktree_sweep.py') and calls[1][1].endswith('/git_tree_sweep.py')
-    assert calls[0][calls[0].index('--budget-minutes')+1]=='15'
-    assert calls[1][calls[1].index('--budget-minutes')+1]==('150' if mode else '45')
+    assert result.returncode==0 and len(calls)==3
+    assert [Path(call[1]).name for call in calls]==['bb_environment_sweep.py','worktree_sweep.py','git_tree_sweep.py']
+    assert [call[call.index('--budget-minutes')+1] for call in calls]==['5','15','150' if mode else '45']
     assert all(('--execute' in call)==bool(mode) for call in calls)
 
 
@@ -2584,13 +2583,13 @@ def test_clone_main_does_not_feed_linked_trees_to_generic_plan(case,monkeypatch,
     assert all(row['type']!='linked' for row in report['items'])
 
 
-@pytest.mark.parametrize('failed_phase',[0,1])
+@pytest.mark.parametrize('failed_phase',[0,1,2])
 def test_worker_attempts_both_phases_and_reports_failures(case,failed_phase):
     c=case;probe=c.root/'python';log=c.root/'calls'
     probe.write_text('#!'+os.sys.executable+'\nimport sys,pathlib\np=pathlib.Path('+repr(str(log))+')\nn=len(p.read_text().splitlines()) if p.exists() else 0\nwith p.open("a") as f:f.write("called\\n")\nsys.exit(7 if n=='+str(failed_phase)+' else 0)\n')
     probe.chmod(0o755)
     result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe)],capture_output=True,text=True)
-    assert result.returncode==7 and len(log.read_text().splitlines())==2
+    assert result.returncode==7 and len(log.read_text().splitlines())==3
 
 
 @pytest.mark.parametrize('status,phase,protected', [('active',None,True),('paused',None,True),('destroyed',None,False),('active','destroyed',False)])
@@ -2803,3 +2802,188 @@ def test_linked_bind_mount_of_child_directory_is_detected_without_host_parent_an
     ctx['cwd_identities']={f'{info.st_dev}:{info.st_ino}':'process 456 cwd (bound child)'}
     row=c.m.linked_plan(linked_row(c,target),ctx)
     assert row['action']=='keep' and 'cwd' in row['reason'],row
+
+
+def bb_old_environment(c, managed=False):
+    return dict(id='env-old',path=str(c.repo),hostId='host-local',status='ready',
+                managed=managed,environmentProviderId='git-worktree' if managed else None,
+                createdAt=OLD*1000,updatedAt=OLD*1000,lifecycle={'phase':'active'})
+
+
+def bb_archived_thread(env='env-old'):
+    return dict(id='thread-old',environmentId=env,archivedAt=OLD*1000,createdAt=OLD*1000,
+                updatedAt=OLD*1000,status='idle',activity={},queuedWork='none')
+
+
+@pytest.mark.parametrize('threads,age_hours,abandoned',[
+    ([],25,True),([True],25,True),([False],500,False),([True,False],500,False),
+    ([True],23.99,False),([],24,True),([True],24,True)])
+def test_bb_environment_requires_archival_and_24h(case,threads,age_hours,abandoned):
+    c=case;now=time.time();env=bb_old_environment(c)
+    env['updatedAt']=env['createdAt']=(now-age_hours*3600)*1000
+    ts=[]
+    for index,archived in enumerate(threads):
+        t=bb_archived_thread();t.update(id=f't-{index}',updatedAt=env['updatedAt'],createdAt=env['createdAt'],archivedAt=env['updatedAt'] if archived else None);ts.append(t)
+    row=c.m.bb_environment_classify(env,ts,now)
+    assert row['abandoned'] is abandoned and row['protects'] is not abandoned,row
+
+
+@pytest.mark.parametrize('change',['env_timestamp_missing','thread_timestamp_missing','future_timestamp','recent_archive','recent_read','busy_archived','queued_archived'])
+def test_bb_environment_unknown_or_recent_activity_keeps(case,change):
+    c=case;env=bb_old_environment(c);t=bb_archived_thread()
+    if change=='env_timestamp_missing':env.pop('updatedAt')
+    if change=='thread_timestamp_missing':t.pop('createdAt')
+    if change=='future_timestamp':t['updatedAt']=(time.time()+3600)*1000
+    if change=='recent_archive':t['archivedAt']=time.time()*1000
+    if change=='recent_read':t['lastReadAt']=time.time()*1000
+    if change=='busy_archived':t['activity']={'activeBackgroundCommandCount':1}
+    if change=='queued_archived':t['queuedWork']='queued'
+    row=c.m.bb_environment_classify(env,[t])
+    assert row['protects'] and not row['abandoned'],row
+
+
+@pytest.mark.parametrize('status,phase,teardown,protected',[
+    ('destroyed','destroyed',None,False),('ready','removing',None,True),
+    ('ready','active',{'status':'running'},True),('error','active',{'status':'failed'},False)])
+def test_bb_environment_destroyed_running_and_refused_lifecycle(case,status,phase,teardown,protected):
+    env=bb_old_environment(case,True);env.update(status=status,lifecycle={'phase':phase,'teardown':teardown})
+    assert case.m.bb_environment_classify(env,[])['protects'] is protected
+
+
+@pytest.mark.parametrize('data',[{},[{}],[{'id':'thread','archivedAt':None}]])
+def test_bb_environment_malformed_thread_inventory_is_unknown(case,data):
+    with pytest.raises(case.m.ws.ScanIncomplete):case.m.bb_environment_inventory([bb_old_environment(case)],data)
+
+
+@pytest.mark.parametrize('archived',[True,False])
+def test_abandoned_environment_releases_both_linked_and_clone_protection(case,monkeypatch,archived):
+    c=case;target=linked(c);env=bb_old_environment(c);env['path']=str(target);t=bb_archived_thread();t['archivedAt']=OLD*1000 if archived else None
+    raw=c.m.command
+    def respond(args,**kw):
+        if args[0]!='bb':return raw(args,**kw)
+        value={'project':[{'id':'p','sources':[]}],'environment':[env],'thread':[t],'automation':[]}[args[1]]
+        return SimpleNamespace(stdout=json.dumps(value),returncode=0)
+    monkeypatch.setattr(c.m,'command',respond);monkeypatch.setattr(c.m.ws,'bb_anchors',lambda *a:None)
+    proc=c.root/'empty-proc';proc.mkdir();context=c.m.linked_context(str(proc))
+    assert (c.m.linked_plan(linked_row(c,target),context)['action']!='keep') is archived
+    anchors={};c.m.bb_anchors(anchors)
+    assert bool(c.m.ws.anchored(anchors,str(target))) is not archived
+    assert plan(c,target,'linked',anchors=anchors)['action']==('remove' if archived else 'keep')
+
+
+def bb_environment_fake_cli(c,monkeypatch,env,threads=None,fresh_threads=None,response=None,observed=None):
+    threads=[] if threads is None else threads;calls=[];raw=c.m.command
+    def run(args,**kw):
+        if args[0]!='bb':return raw(args,**kw)
+        calls.append(args)
+        if args[1]=='status':value={'thread':None}
+        elif args[1]=='machine':value=[{'id':'host-local','machineProviderId':None,'status':'connected','type':'persistent'}]
+        elif args[1:3]==['environment','list']:value=[env]
+        elif args[1:3]==['thread','list']:value=fresh_threads if '--environment' in args and fresh_threads is not None else threads
+        elif args[1:3]==['environment','show']:value=observed if observed is not None and any(x[1:3]==['environment','cleanup'] for x in calls) else env
+        elif args[1:3]==['environment','cleanup']:return response or SimpleNamespace(stdout='{"ok":true}',stderr='',returncode=0)
+        else:raise AssertionError(args)
+        return SimpleNamespace(stdout=json.dumps(value),stderr='',returncode=0)
+    monkeypatch.setattr(c.m,'command',run)
+    monkeypatch.setattr(c.m,'linked_context',lambda:dict(linked_empty_context(c),sources=[]))
+    return calls
+
+
+@pytest.mark.parametrize('managed,execute',[(False,False),(False,True),(True,False),(True,True)])
+def test_environment_sweep_previews_and_uses_bb_owner_command_only(case,monkeypatch,capsys,managed,execute):
+    c=case;env=bb_old_environment(c,managed);observed=dict(env,status='destroyed',lifecycle={'phase':'destroyed'})
+    calls=bb_environment_fake_cli(c,monkeypatch,env,observed=observed)
+    assert c.m.bb_environment_main(['--state-dir',str(c.root/'state'),'--json',*(['--execute'] if execute else [])])==0
+    report=json.loads(capsys.readouterr().out);row=report['items'][0]
+    assert row['action']==('provider-cleanup' if managed else 'release-protection')
+    assert bool([x for x in calls if x[1:3]==['environment','cleanup']]) is (managed and execute)
+    assert not any(x[1:3]==['environment','delete'] or '--recover' in x for x in calls)
+    assert c.repo.exists()  # BB is mocked; sweeper has no direct directory sink.
+    if managed and execute:assert row['result']=='destroyed'
+
+
+@pytest.mark.parametrize('fault',['unarchived','recent','process_cwd','another_environment','new_file','cleanup_refused','async_pending','bad_response'])
+def test_environment_cleanup_rebinds_and_reports_owner_refusal(case,monkeypatch,capsys,fault):
+    c=case;env=bb_old_environment(c,True);fresh=[];ctx=linked_empty_context(c)
+    if fault=='unarchived':fresh=[dict(bb_archived_thread(),archivedAt=None)]
+    if fault=='recent':env['updatedAt']=time.time()*1000
+    if fault=='process_cwd':ctx['cwds'][str(c.repo/'child')]='live cwd'
+    if fault=='another_environment':ctx['environments'][str(c.repo)]='BB environment: live'
+    if fault=='new_file':(c.repo/'just-created').touch()
+    response=SimpleNamespace(stdout='{"ok":false,"error":{"code":"invalid_request","message":"BB refuses cleanup"}}',stderr='',returncode=1) if fault=='cleanup_refused' else SimpleNamespace(stdout='{}',stderr='',returncode=0) if fault=='bad_response' else None
+    calls=bb_environment_fake_cli(c,monkeypatch,env,fresh_threads=fresh,response=response)
+    monkeypatch.setattr(c.m,'linked_context',lambda:ctx)
+    assert c.m.bb_environment_main(['--execute','--json','--state-dir',str(c.root/'state')])==(1 if fault=='bad_response' else 0)
+    row=json.loads(capsys.readouterr().out)['items'][0];mutations=[x for x in calls if x[1:3]==['environment','cleanup']]
+    if fault in ('cleanup_refused','async_pending','bad_response'):
+        assert len(mutations)==1
+        if fault=='cleanup_refused':assert row['result']=='refused; Git fallback' and not c.m.bb_environment_classify(env,[])['protects']
+        if fault=='async_pending':assert row['result']=='cleanup requested; pending'
+        if fault=='bad_response':assert row['result']=='failed' and 'response unknown' in row['cleanup_error']
+    else:assert not mutations
+    assert c.repo.exists()
+
+
+def test_environment_sweep_incomplete_inventory_does_not_mutate(case,monkeypatch,capsys):
+    c=case;calls=bb_environment_fake_cli(c,monkeypatch,bb_old_environment(c,True),threads={})
+    assert c.m.bb_environment_main(['--execute','--json','--state-dir',str(c.root/'state')])==1
+    report=json.loads(capsys.readouterr().out);assert not report['complete']
+    assert not any(x[1:3]==['environment','cleanup'] for x in calls)
+
+
+def test_environment_sweep_does_not_require_thread_context(case,monkeypatch,capsys):
+    c=case;env=bb_old_environment(c);calls=bb_environment_fake_cli(c,monkeypatch,env);raw=c.m.command
+    def run(args,**kw):
+        if args[:2]==['bb','status']:return SimpleNamespace(stdout='{"thread":null}',returncode=0)
+        if args[:2]==['bb','machine']:return SimpleNamespace(stdout=json.dumps([{'id':'host-local','machineProviderId':None,'status':'connected','type':'persistent'}]),returncode=0)
+        return raw(args,**kw)
+    monkeypatch.setattr(c.m,'command',run)
+    assert c.m.bb_environment_main(['--execute','--json','--state-dir',str(c.root/'state')])==0
+    report=json.loads(capsys.readouterr().out)
+    assert report['items'][0]['action']=='release-protection' and report['complete']
+    assert not any(x[1]=='status' for x in calls)
+
+
+@pytest.mark.parametrize('fault',['show_query','cleanup_bad_json','cleanup_bad_ack','cleanup_transport','show_after_cleanup'])
+def test_environment_query_and_protocol_errors_make_stage_fail(case,monkeypatch,capsys,fault):
+    c=case;env=bb_old_environment(c,True);calls=bb_environment_fake_cli(c,monkeypatch,env);raw=c.m.command
+    def run(args,**kw):
+        if args[1:3]==['environment','show'] and (fault=='show_query' or fault=='show_after_cleanup' and any(x[1:3]==['environment','cleanup'] for x in calls)):
+            raise RuntimeError('BB query unreachable')
+        if args[1:3]==['environment','cleanup'] and fault.startswith('cleanup_'):
+            if fault=='cleanup_bad_json':return SimpleNamespace(stdout='not JSON',stderr='',returncode=0)
+            if fault=='cleanup_bad_ack':return SimpleNamespace(stdout='{}',stderr='',returncode=0)
+            return SimpleNamespace(stdout='{"ok":false,"error":{"code":"network_error","message":"connection failed"}}',stderr='',returncode=1)
+        return raw(args,**kw)
+    monkeypatch.setattr(c.m,'command',run)
+    assert c.m.bb_environment_main(['--execute','--json','--state-dir',str(c.root/'state')])==1
+    report=json.loads(capsys.readouterr().out)
+    assert not report['complete'] and report['error'] and report['items'][0]['result']=='failed'
+    assert c.repo.exists()
+
+
+@pytest.mark.parametrize('machines',[[],[{'id':'host-local','status':'connected','type':'persistent'}],
+    [{'id':'a','machineProviderId':None,'status':'connected','type':'persistent'},{'id':'b','machineProviderId':None,'status':'connected','type':'persistent'}],
+    [{'id':'remote','machineProviderId':'manual','status':'connected','type':'persistent'}]])
+def test_environment_host_identity_unknown_prevents_cleanup(case,monkeypatch,capsys,machines):
+    c=case;calls=bb_environment_fake_cli(c,monkeypatch,bb_old_environment(c,True));raw=c.m.command
+    def run(args,**kw):
+        if args[1]=='machine':return SimpleNamespace(stdout=json.dumps(machines),returncode=0)
+        return raw(args,**kw)
+    monkeypatch.setattr(c.m,'command',run)
+    assert c.m.bb_environment_main(['--execute','--json','--state-dir',str(c.root/'state')])==1
+    assert not json.loads(capsys.readouterr().out)['complete']
+    assert not any(x[1:3]==['environment','cleanup'] for x in calls)
+
+
+def test_environment_stage_continues_other_environments_after_query_failure(case,monkeypatch,capsys):
+    c=case;env=bb_old_environment(c,True);other=dict(bb_old_environment(c),id='other-env');calls=bb_environment_fake_cli(c,monkeypatch,env);raw=c.m.command
+    def run(args,**kw):
+        if args[1:3]==['environment','list']:return SimpleNamespace(stdout=json.dumps([env,other]),returncode=0)
+        if args[1:3]==['environment','show']:raise RuntimeError('query failure')
+        return raw(args,**kw)
+    monkeypatch.setattr(c.m,'command',run)
+    assert c.m.bb_environment_main(['--execute','--json','--state-dir',str(c.root/'state')])==1
+    report=json.loads(capsys.readouterr().out)
+    assert report['items'][0]['result']=='failed' and report['items'][1]['action']=='release-protection'
+    assert len(report['failures'])==1
