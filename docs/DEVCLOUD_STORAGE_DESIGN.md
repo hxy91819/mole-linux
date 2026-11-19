@@ -567,3 +567,11 @@ linked首次实测：完整预演128.080秒、执行278.043秒，27候选中10�
 不能拿交互线程中的BB status当定时任务上下文：systemd仅传PATH，thread=null。回归现包含无线程身份查询及主机歧义拒绝。正常保留/明确拒绝与基础设施错误也必须分开：逐环境查询或响应协议失败要保留对象、继续后续对象和阶段，并最终非零；否则每日检查会把坏查询报成清理成功。
 
 本轮环境分类计量要分清“记录”和“目录”：执行识别52条遗弃记录，其中50有路径，另2条error从未物化、没有path/instance，在旧规则中也不代表目录。只把50条算作解除路径证据；provider实际回收0，不把路径型记录标成已销毁。Git最终删除2个linked和3个clone，原du合计3.310GiB；17项拒绝均保留。linked阶段/data净增2.141GiB、clone删除窗口净增1.208GiB，全程仅净增0.314GiB，体现同期写入；linked监测启动较晚的0窗口读数不能当0释放。3个clone保持每sink全盘复核，耗2678.488秒，性能成本仍由原clone规则承担；BB环境阶段只耗1.446秒，不能把两者混称“BB回收慢”。
+
+2026-11-19 CLI注入丢失：BB script会注入BB_CLI，真实只读探针得到/root/.bb/bin/bb、0.49.0且支持include-archived；但launcher只把清理过的PATH传给systemd。worker的PATH命中/root/.local/bin/bb，shim再转到旧0.46.1，三个阶段都因不支持include-archived而fail-closed。交互线程带BB_CLI，先前人工验证绕开了这个生产环境差异。现保留注入路径，缺省由服务端MainPID的bin/node推导安装包CLI；实测能力后以--setenv传递，每个Python BB调用显式绝对路径，不依赖shim是否自行尊重BB_CLI。回归把旧bb置于PATH头部；修复前db685c34的红灯仅保留于审查证据，常规测试直接验证当前worker三阶段仍访问服务端假CLI，不依赖Git历史。CLI不可得/能力不符时不再用模糊PATH尝试，错误给出具体探测命令和下一步。
+
+首次CLI审查补充：只绑定JS入口路径仍不够；host-daemon/dist/bb的#!/usr/bin/env node在干净PATH找不到Node。探针与阶段命令现共用command_for，显式以同包bin/node运行JS入口；BB注入的绝对shell wrapper本身已绑定Node，仍直接调用。新增最小PATH的JS/shebang三阶段与MainPID回退测试，缺包内Node拒绝、能力探针非零保留stderr，避免把解释器错误误报成选项缺失。部署文档引用七文件manifest新哈希，六文件9217仅列历史。
+
+第二轮审查核验：仅让假Python调用command三次不足以覆盖共享helper的runner绑定；实际clone usage还会经过ws.bb_anchors。回归改跑三条真实main，外部响应与磁盘发现隔离，定向去掉ws.run=command必须红灯。手动shell中export包住命令替换会抹掉退出码，示例改为独立赋值检查成功后才export并启动扫描。
+
+实测确认：绑定运行中CLI后，三阶段均完整成功；32个存量clone全量执行没有路径裁剪，耗136m38s，落在原150m日常预算内。人工临时预算只提供上限并在launcher完成后立即恢复正式任务。root/data删除窗口与全程净变化分列，证据见bb-cli-binding-20261119/REPORT.md；容量受并发写入影响，不能只用全程净增评判清理是否发生。

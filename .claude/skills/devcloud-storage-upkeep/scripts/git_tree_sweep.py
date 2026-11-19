@@ -40,6 +40,7 @@ def sibling(name):
 ws = sibling('worktree_sweep')
 tc = sibling('tmp_clone_sweep')
 _run = ws.run
+_bb_cli_helper = None
 IDLE = 7 * 86400
 CONFIG_TEXT_LIMIT = 1024 * 1024
 GENERIC_NAMES = set('app apps assets backup backend bin build cache client code config configuration contents data debug default dependency dependencies directory dist doc docs documentation example examples frontend git home include install lib local log logs main master module modules node_modules package packages plugin plugins private project projects public release repo repository root runtime sample scripts server service services share site software source src static storage target temp templates test tests tmp tool tools upstream vendor version versions website work worktree worktrees'.split())
@@ -102,7 +103,16 @@ def checkpoint():
 
 
 def command(args, cwd=None, timeout=120, check=True, env=None):
+    global _bb_cli_helper
     checkpoint()
+    if args and args[0] == 'bb':
+        cli = os.environ.get('BB_CLI', '')
+        if not os.path.isabs(cli) or not os.path.isfile(cli) or not os.access(cli, os.X_OK):
+            raise ws.ScanIncomplete('BB_CLI missing or not executable; run git_tree_sweep_run.sh to bind the running server CLI; PATH bb is never used')
+        if _bb_cli_helper is None:
+            _bb_cli_helper = sibling('git_tree_sweep_bb_cli')
+        args = [*_bb_cli_helper.command_for(cli), *args[1:]]
+        env = dict(ws.ENV if env is None else env, BB_CLI=cli)
     return _run(args, cwd=cwd, timeout=max(.01, min(timeout, DEADLINE - time.monotonic())), check=check, env=env)
 
 
@@ -2433,7 +2443,7 @@ def bb_environment_main(argv=None):
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print('Git sweep busy; skipped'); return 0
-        persist(log, {'event':'start','timestamp':stamp,'mode':'execute' if args.execute else 'dry-run'})
+        persist(log, {'event':'start','timestamp':stamp,'mode':'execute' if args.execute else 'dry-run','bb_cli':os.environ.get('BB_CLI')})
         try:
             host = bb_local_host()
             environments = json.loads(command(['bb','environment','list','--json']).stdout)
@@ -2482,7 +2492,7 @@ def bb_environment_main(argv=None):
         except Exception as exc: error = ws.failure_text(exc)
         error = error or ('; '.join(failures) if failures else None)
         if time.monotonic() >= DEADLINE: error = error or 'time budget reached'
-        report = dict(schema_version=1, policy='bb-environments', mode='execute' if args.execute else 'dry-run',
+        report = dict(schema_version=1, policy='bb-environments', bb_cli=os.environ.get('BB_CLI'), mode='execute' if args.execute else 'dry-run',
                       timestamp=stamp,complete=not bool(error),error=error,failures=failures,items=rows,
                       timings={'total_seconds':round(time.monotonic()-started,3)},output=str(output))
         with open(output,'w',opener=lambda p,flags:os.open(p,flags,0o600)) as handle: json.dump(report,handle,ensure_ascii=True,indent=2)
@@ -2825,7 +2835,7 @@ def linked_main(argv=None):
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             print('Git sweep busy; skipped'); return 0
-        persist(log, {'event':'start','timestamp':stamp,'mode':'execute' if args.execute else 'dry-run','policy':'linked'})
+        persist(log, {'event':'start','timestamp':stamp,'mode':'execute' if args.execute else 'dry-run','policy':'linked','bb_cli':os.environ.get('BB_CLI')})
         rows, mains, failures, error, indexed, comparison, prunes = [], {}, [], None, None, None, []
         try:
             context = linked_context(); sources, indexed = linked_known_sources(args.state_dir, context)
@@ -2858,7 +2868,7 @@ def linked_main(argv=None):
                 prunes.append(entry); persist(log,dict(entry,event='prune'))
         except Exception as exc: error = ws.failure_text(exc)
         if time.monotonic() >= DEADLINE: error = error or 'time budget reached'
-        report = {'schema_version':3,'policy':'linked','mode':'execute' if args.execute else 'dry-run','timestamp':stamp,
+        report = {'schema_version':3,'policy':'linked','mode':'execute' if args.execute else 'dry-run','timestamp':stamp,'bb_cli':os.environ.get('BB_CLI'),
                   'complete':not bool(error),'error':error,'indexed_discovery':indexed,'mains':sorted(mains),
                   'unresolved_mains':failures,'items':rows,'prunes':prunes,'reviewed_comparison':comparison,
                   'timings':{'total_seconds':round(time.monotonic()-started,3)},'summary':summarize(rows),'output':str(output)}
@@ -2892,7 +2902,7 @@ def main(argv=None):
             return 0
         roots = ['/', '/data']
         excluded, error = set(), None
-        persist(log, {'event': 'start', 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run'})
+        persist(log, {'event': 'start', 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run', 'bb_cli': os.environ.get('BB_CLI')})
         try:
             excluded = managed_roots()
         except Exception as exc:
@@ -2941,7 +2951,7 @@ def main(argv=None):
             execute(rows, inventory, anchors, refs, roots, excluded, stamp, log)
         if time.monotonic() >= DEADLINE:
             error = error or 'time budget reached; partial plan retained'
-        report = {'schema_version': 2, 'policy': 'clones', 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run',
+        report = {'schema_version': 2, 'policy': 'clones', 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run', 'bb_cli': os.environ.get('BB_CLI'),
                   'roots': roots, 'complete': not bool(error or inventory['errors']), 'error': error,
                   'unresolved': unknown, 'global_unresolved': global_unknown(unknown),
                   'reviewed_comparison': comparison,

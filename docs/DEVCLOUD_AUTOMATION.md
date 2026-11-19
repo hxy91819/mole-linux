@@ -121,13 +121,14 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 ## 2. 不可变快照与发布
 
 仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`，仅含
-当前快照为 `/data/tools/devcloud-storage-upkeep/releases/9217bf8ab4fc6204/`，包含
-`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、`git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 六个脚本和 `manifest.json`。
+当前七脚本快照为 `/data/tools/devcloud-storage-upkeep/releases/b70f81e79242476d/`，包含
+`git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、`git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 七个脚本和 `manifest.json`。
+旧 `9217bf8ab4fc6204` 是六脚本历史快照，缺少 CLI binder，不用于当前部署。
 launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境，再运行linked登记路径和独立clone全盘路径；cwd=/，BB只负责120秒内启动。其他维护任务继续使用各自已有快照。
 
-1. 6脚本各记sha256，manifest稳定JSON+换行，目录名取manifest哈希前16位，文件0444/目录0555。两个Python入口与launcher的help均验证成功且无pycache。
-2. 先运行 `python3 -I <snap>/bb_environment_sweep.py --json` 核对遗弃环境，再运行linked： `python3 -I <snap>/worktree_sweep.py --json`；完整后用其专用预演文件执行 `--execute --reviewed-preview <linked-preview.json>`。只读Git登记定位不重扫磁盘；主仓来自实时BB source/环境和最近一次完整两盘发现库存。无缓存的初次安装先用clone全盘预演建立库存。
-3. clone入口 `python3 -I <snap>/git_tree_sweep.py --json` 保持7天、全部原引用/凭据/恢复证明规则；只送独立clone进通用计划，linked仅作为引用来源/下次主仓索引。其人工执行只绑定自己的clone预演，不混用linked预演。
+1. 7脚本各记sha256，manifest稳定JSON+换行，目录名取manifest哈希前16位，文件0444/目录0555。两个Python入口与launcher的help均验证成功且无pycache。
+2. 手动每次调用先检查绑定成功：`BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/bb_environment_sweep.py --json` 核对遗弃环境，再运行linked： `BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/worktree_sweep.py --json`；完整后用其专用预演文件执行 `--execute --reviewed-preview <linked-preview.json>`。只读Git登记定位不重扫磁盘；主仓来自实时BB source/环境和最近一次完整两盘发现库存。无缓存的初次安装先用clone全盘预演建立库存。
+3. clone入口 `BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/git_tree_sweep.py --json` 保持7天、全部原引用/凭据/恢复证明规则；只送独立clone进通用计划，linked仅作为引用来源/下次主仓索引。其人工执行只绑定自己的clone预演，不混用linked预演。
 4. 部署保存脚本 `bash <snap>/git_tree_sweep_run.sh --execute`，读回enabled、cron=30 6 * * *、Asia/Shanghai、timeout=120000及命令快照。launcher只接受无参数或--execute；手动绑定预演使用上面各自Python入口。
 5. 旧tmp任务auto_3jiqtmzreq8保持disabled+noop，不恢复或手动触发；每日检查prompt同步读回。其余维护任务不跟随更换快照。
 6. linked只按最新Git登记五条件、24h和Git remove/no-force判断，网络后立即复核BB/cwd/登记/HEAD/age/clean；实际Git状态文件计活动，不让管理目录的临时锁mtime刷活。Git prune按显式命令清失效登记，锁定登记仍保留。单主仓无法读登记只保留并报告该主仓，不扩大成全局阻断；BB/cwd整体读取未知则该阶段不执行。
@@ -137,7 +138,11 @@ launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境�
 只读复现（命令不带路径筛选参数）：
 
 ```bash
-python3 -I <git-snap>/git_tree_sweep.py --budget-minutes 45 --json
+(
+  BB_CLI="$(/usr/bin/python3 -I <git-snap>/git_tree_sweep_bb_cli.py)" || exit 1
+  export BB_CLI
+  python3 -I <git-snap>/git_tree_sweep.py --budget-minutes 45 --json
+)
 # 定时等价：bash <git-snap>/git_tree_sweep_run.sh；linked→clone，环境→linked→clone，预演整体硬限68分钟
 python3 -m pytest tests/test_git_tree_sweep.py tests/test_devcloud_storage_upkeep.py -q
 bb automation show auto_hukidoavox0 --project proj_8d3wrcajxn --json
@@ -346,7 +351,7 @@ readlink -f /root/.cache/go-build /root/.cache/golangci-lint
 - `git_tree_sweep.py` 默认CLI只计划/执行独立clone，保持全部原7天保护；仍发现linked以建立clone引用索引和下次快速路径的已知主仓。`tmp_clone_sweep.py` CLI转发它。
 - launcher调用5脚本快照内的worker，先linked15m，再clone45/150m；整体硬限63/168m，cwd=/，BB启动超时120秒。一条失败仍尝试另一条，最终非零；各阶段有独立锁及完整报告。
 - linked报告=`linked-worktree-sweep-<UTC>.json(l)`，schema_version=3、policy=linked；clone报告仍`git-tree-sweep-<UTC>.json(l)`、schema_version=2、policy=clones。检查两份结果，不用clone耗时掩盖linked是否已完成。
-- 手动只验证本次变更：`python3 -I <snap>/worktree_sweep.py --json`，确认完整后 `python3 -I <snap>/worktree_sweep.py --execute --reviewed-preview <linked预演JSON> --json`。每项最终复核仅重读BB/进程cwd/Git登记/状态及当前分支，不重复全盘扫描。独立clone人工命令仍使用它自己的预演文件；launcher仅接受无参数或--execute，不混用两类预演。
+- 手动只验证本次变更：`BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/worktree_sweep.py --json`，确认完整后 `BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/worktree_sweep.py --execute --reviewed-preview <linked预演JSON> --json`。每项最终复核仅重读BB/进程cwd/Git登记/状态及当前分支，不重复全盘扫描。独立clone人工命令仍使用它自己的预演文件；launcher仅接受无参数或--execute，不混用两类预演。
 - 旧1dfa人工执行已于2026-11-18 12:56停止，尚在发现阶段，归档/删除均0。本轮人工执行针对linked；34个clone候选继续由原每日clone策略处理。尚未发生新版schedule时明示等待首次定时运行。
 
 linked年龄补充：计算工作树文件/目录和自身gitdir的实际文件（index、HEAD、FETCH_HEAD、reflog等）mtime，不以Git管理目录自身mtime作为活动。实测3棵mono2树仅管理目录被临时锁/探针刷新，实际文件均旧于24h；目录mtime不应使它们永久刷活。此修正只用于linked，clone保持原7天全部元数据规则。
@@ -366,3 +371,13 @@ linked年龄补充：计算工作树文件/目录和自身gitdir的实际文件�
 
 遗弃环境本轮最终结果：三阶段complete=true/error=null，manual unit Result=success并collect。环境1.446秒；linked216.013秒；3个新增clone2678.488秒（44分38秒）。实际共删除5棵（2linked+3clone），17候选保留，0新增归档；5个删除路径独立确认不存在。50个有路径的遗弃环境解除其环境证据；2条无path/instance的error记录未物化，原本不占目录，不能算作目录回收；0provider-owned环境实际命中，BB登记未直接改动。
 删除目录原du3553800192B/3.310GiB；linked阶段/data净增2298630144B/2.141GiB（监测启动晚于2次删除，短窗口缺测），clone三次删除窗口净增1297305600B/1.208GiB（全程提前挂监测）。两者为不同非重叠窗口观察，均含同期活动；全轮/data净增337158144B/0.314GiB，/净变-12926976B，不能将并发写入混为清理失败或把du当因果释放量。完整逐环境/逐树/失败清单及结束容量见/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/abandoned-environments-20261118/REPORT.md与final-summary.json。原32个既有clone候选继续在每日全量阶段处理，未建立排除清单。代码与测试留工作区由owner提交，尚待首次新版schedule。
+
+2026-11-19 CLI绑定修复：BB script真实探针auto_pam50rztcys/arun_sabavlvdfgg确认注入/root/.bb/bin/bb，version=0.49.0、include-archived受支持；探针已删除。launcher运行git_tree_sweep_bb_cli.py：先用BB_CLI，未注入时用systemctl show bb-dev-server.service --property=MainPID --value，再读取/proc/PID/exe（本机为包内bin/node），推导包内host-daemon/dist/bb。绝对可执行/选项探测成功后通过systemd --setenv=BB_CLI传入；worker再次验证，core.command所有bb调用改为该绝对路径且固定子进程BB_CLI。不修改全局/root/.local/bin/bb，不回落旧PATH。报告bb_cli必须是绑定路径，三阶段complete/error另行核对。证据在/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/bb-cli-binding-20261119/。
+BB外直接运行Python入口，使用上方已检查退出状态的绑定步骤；先独立赋值、成功后export，再运行Python，不能用export包住命令替换（它会吞掉绑定器退出码）。正常自动化由launcher处理。CLI不存在、服务不在运行、能力探测失败时按stderr点名的原因和命令修复再重试。7脚本快照包含新绑定helper。
+
+MainPID回退的host-daemon入口是env-node脚本；binder的command_for为探针和所有阶段命令绑定同包bin/node，最小PATH=/usr/bin:/bin无需另装Node。非零能力探针保留退出码与首条stderr，和缺少选项分开诊断。普通回归直接验证当前worker，不依赖历史commit可用；修复前红灯只作审查证据。
+本次完整人工执行使用 `/data/tools/devcloud-storage-upkeep/releases/13f015132208a4ba/`，只将clone预算从150m增至540m、整体硬限从173m增至563m；发现/判定/执行代码与日常快照相同。依据上轮3个clone耗2678.488秒且有32项存量，给完整复核有界时间；日常06:30仍用b70f81e79242476d和原预算，不保留人工路径清单。
+
+第二轮审查补充：旧PATH回归现经过三条真实stage main及clone的ws.bb_anchors共享runner，只替换宿主磁盘发现和外部BB响应；三份隔离报告均完整。手动示例在扫描之前检查binder退出码，失败不启动Python。
+
+2026-11-19 CLI修复最终实测：正式快照b70f81e79242476d（7脚本）已部署06:30/AsiaShanghai/--execute/timeout120s，旧tmp disabled+noop、每日prompt回读一致。真实BB script人工run arun_3efzqydrbty通过临时预算快照13f015132208a4ba启动，随即恢复正式任务。三阶段complete=true/error=null，CLI均/root/.bb/bin/bb且0.49.0；耗时环境2.274s、linked237.994s、clone8197.665s（136m38s，仍在日常150m内），worker成功退出，BB服务未重启。53个有路径遗弃环境解除证据，provider实际回收0；另2未物化无路径记录不计目录回收。删除33树（1linked+32clone），18归档ref/14原SHA独立核验，17linked按Git/远端拒绝保留，1115主仓prune成功。删除前du9.714GiB；clone按目标盘删除窗口净增/data9.494GiB、/0.132GiB，全程净变化/data2.085GiB、/0.391GiB，含同期活动不当因果释放量。891全量回归通过，补强29项再过，2轮readonly review共5项P1闭合，工作区留owner提交。完整清单/快照/证据=/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/bb-cli-binding-20261119/REPORT.md。下一次schedule仍待11月20日06:30验证。
