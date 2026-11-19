@@ -2230,6 +2230,17 @@ def test_clean_tmp_busy_lock_skips_without_launch(runner_case, capsys):
     assert not r.LOG.exists() and r.subprocess.Popen.call_count == r.subprocess.run.call_count == 0
 
 
+def test_clean_tmp_dry_run_previews_both_roots_without_writing_ledger(runner_case, monkeypatch):
+    r = runner_case
+    run = mock.Mock(side_effect=[mock.Mock(returncode=2), mock.Mock(returncode=0)])
+    monkeypatch.setattr(r.subprocess, 'run', run)
+    assert r.main(['--dry-run']) == 2
+    commands = [call.args[0] for call in run.call_args_list]
+    assert [cmd[cmd.index('--path') + 1] for cmd in commands] == ['/var/tmp', '/data/system-tmp']
+    assert all(r.EXECUTOR in cmd and '--json' in cmd and '--execute' not in cmd for cmd in commands)
+    assert not any(path.exists() for path in (r.LOCK, r.LOG, r.STDERR))
+
+
 def test_clean_tmp_detached_child_keeps_inherited_lock(runner_case, monkeypatch, capsys):
     import fcntl
     r = runner_case

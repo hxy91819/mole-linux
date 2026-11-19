@@ -2,11 +2,10 @@
 本文件是 BB agent 任务 auto_5gacevqssoe（project proj_8d3wrcajxn）的 prompt 原文，
 取自 `bb automation show auto_5gacevqssoe --project proj_8d3wrcajxn --json`（2026-11-14）。
 改检查项、阈值或协调线程时，必须同时更新这里和 BB 任务，并回读核对。
-提取正文（从一级标题开始）：
-  sed -n '/^# 每日存储检查（只读）$/,$p' docs/DEVCLOUD_DAILY_CHECK_PROMPT.md
-更新 BB 任务：
+更新 BB 任务（保留整份文件和末尾换行）：
+  prompt=$(cat docs/DEVCLOUD_DAILY_CHECK_PROMPT.md && printf .)
   bb automation update auto_5gacevqssoe --project proj_8d3wrcajxn \
-    --prompt "$(sed -n '/^# 每日存储检查（只读）$/,$p' docs/DEVCLOUD_DAILY_CHECK_PROMPT.md)"
+    --prompt "${prompt%.}"
 -->
 # 每日存储检查（只读）
 
@@ -24,7 +23,7 @@
    - auto_u4kos3to-di（增长计量，每天 07:00）：25 小时。
    有不正常的运行时，用同样的 `--output <runId>` 取那次运行的输出作为证据。
 2. 两个共享 Go 缓存确实在被修剪。分别解析真实目录：`readlink -f "$(go env GOCACHE)"` 与 `readlink -f /root/.cache/golangci-lint`。对每个真实根，`du -sx -B1 "<真实根>"` 都不超过 107374182400（100 GiB）；`find "<真实根>" -mindepth 2 -maxdepth 2 -type f -name '*-[ad]' -mmin +1520 -print -quit` 没有输出。每小时修剪24小时没用过的条目，两根均不该留下超过1520分钟的哈希条目；分别列出大小与最老条目检查结果。
-3. /tmp 与 /var/tmp 清理（cron 每天 03:30）。`/data/metrics/devcloud-clean-tmp.log` 每行一个 JSON。分别按 `path` 为 `/data/system-tmp` 和 `/var/tmp`，找 `ts` 晚于最近一次 03:30 的第一条 `"event": "summary"`；两根各自都必须存在，`status` 为 `ok`，`failed` 为 0，`scan` 为 `complete`。缺任一根的 summary 都算不符合。`deferred` 大于 0 是预算递延，属于正常。再看 `/data/metrics/devcloud-clean-tmp.stderr.log` 的修改时间：晚于最近一次 03:30 就算不符合，并贴出它的末尾 20 行。
+3. /tmp 与 /var/tmp 清理（cron 每天 03:30）。`/data/metrics/devcloud-clean-tmp.log` 每行一个 JSON。分别按 `path` 为 `/data/system-tmp` 和 `/var/tmp`，找 `ts` 晚于最近一次 03:30 的第一条 `"event": "summary"`；两根各自都必须存在，`status` 为 `ok`，`failed` 为 0，`scan` 为 `complete`。缺任一根的 summary 都算不符合。列出两根的 `skipped` 和 `skipped_reasons`。复核发现活引用或候选变化而保留的项计入 `skipped`，属于正常。`deferred_reason` 为 `execution budget` 的递延属于正常。若 `failed` 大于 0，摘录对应 `event=failed` 的路径和错误。再看 `/data/metrics/devcloud-clean-tmp.stderr.log` 的修改时间：晚于最近一次 03:30 就算不符合，并贴出它的末尾 20 行。
 4. systemd-tmpfiles 不再按年龄清 /tmp。`/etc/tmpfiles.d/tmp.conf` 里 `/tmp` 那一行的第 6 列（年龄）是 `-`；`systemctl show systemd-tmpfiles-clean.service -p Result --value` 输出 `success`。
 5. 两块盘的容量。`df -B1 --output=avail /data` 和 `df -B1 --output=avail /`（系统盘）的可用字节都不少于 161061273600（150 GiB）。
 6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`schema_version` 为3，`ts` 距 NOW 不超过25小时；07:00计量任务必须已经结束，单根预算780秒、全轮840秒、任务超时900秒，应在07:30前完成。
