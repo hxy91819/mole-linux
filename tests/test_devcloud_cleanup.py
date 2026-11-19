@@ -141,7 +141,7 @@ class CleanupTests(unittest.TestCase):
         code, output = self.var_tmp_cli()
         self.assertEqual(code, 0, output)
         self.assertEqual(output['path'], str(self.root))
-        self.assertEqual(output['skipped']['protected name'], 1)
+        self.assertEqual(output['scan_skipped']['protected name'], 1)
         self.assertTrue(path.exists())
 
     def test_var_tmp_git_tree_is_retained(self):
@@ -149,7 +149,7 @@ class CleanupTests(unittest.TestCase):
         code, output = self.var_tmp_cli()
         self.assertEqual(code, 0, output)
         self.assertEqual(output['path'], str(self.root))
-        self.assertEqual(output['skipped']['repository or persistent state'], 1)
+        self.assertEqual(output['scan_skipped']['repository or persistent state'], 1)
         self.assertTrue(path.exists())
 
     def test_var_tmp_recent_tree_is_retained(self):
@@ -158,7 +158,7 @@ class CleanupTests(unittest.TestCase):
         code, output = self.var_tmp_cli()
         self.assertEqual(code, 0, output)
         self.assertEqual(output['path'], str(self.root))
-        self.assertEqual(output['skipped']['recent descendant'], 1)
+        self.assertEqual(output['scan_skipped']['recent descendant'], 1)
         self.assertTrue(path.exists())
 
     def test_var_tmp_live_reference_is_retained(self):
@@ -167,7 +167,7 @@ class CleanupTests(unittest.TestCase):
         code, output = self.var_tmp_cli()
         self.assertEqual(code, 0, output)
         self.assertEqual(output['path'], str(self.root))
-        self.assertEqual(output['skipped']['live or mount reference'], 1)
+        self.assertEqual(output['scan_skipped']['live or mount reference'], 1)
         self.assertTrue(path.exists())
 
     def test_var_tmp_eligible_item_is_deleted(self):
@@ -534,17 +534,80 @@ class CleanupTests(unittest.TestCase):
         self.assertEqual(output['scan'], 'incomplete')
         self.assertTrue((self.root / 'first.log').exists())
 
-    def test_failed_deletion_returns_nonzero_and_logs_once(self):
-        candidate = self.candidate()
-        code, output = self.run_cli(['--execute'], validate_root=lambda _: self.root,
-                                    trusted=lambda _: None,
-                                    build_plan=lambda *args: ([candidate], {}),
-                                    execute_item=mock.Mock(side_effect=OSError('delete failed')))
+    def test_recheck_races_are_logged_and_later_batches_delete(self):
+        names = ('active.log', 'changed.log', 'staged.log', 'later.log')
+        plan = [self.candidate(name) for name in names]
+        self.old('changed.log', 'updated since preview')
+        staged_inode = (self.root / 'staged.log').stat().st_ino
+
+        def probe(path, deadline, known=None):
+            if path == self.root:
+                return {**self.live, 'reserved': {'active.log'}}
+            reserved = {'.'} if path.name == 'staged.log' else set()
+            return {**self.live, 'reserved': reserved}
+
+        def sink(receipt, item, preview, deadline=None):
+            if not preview:
+                item.unlink()  # Private fixture.
+
+        with mock.patch.object(m, 'BATCH_SIZE', 3), mock.patch.object(m, 'process_snapshot', side_effect=probe):
+            code, output = self.run_cli(['--execute'], validate_root=lambda _: self.root,
+                                        trusted=lambda _: None, build_plan=lambda *args: (plan, {'recent': 4}),
+                                        owner_delete=sink)
+        self.assertEqual(code, 0, output)
+        self.assertEqual({key: output[key] for key in ('status', 'deleted', 'failed', 'skipped', 'deferred')},
+                         {'status': 'ok', 'deleted': 1, 'failed': 0, 'skipped': 3, 'deferred': 0})
+        reasons = ['candidate acquired a live reference', 'candidate changed since preview',
+                   'staged item acquired a process or mount reference']
+        self.assertEqual(output['skipped_reasons'], dict.fromkeys(reasons, 1))
+        self.assertEqual(output['scan_skipped'], {'recent': 4})
+        rows = [json.loads(line) for line in m.LOG.read_text().splitlines()]
+        self.assertEqual({row['path']: row['reason'] for row in rows if row['event'] == 'skipped'},
+                         {str(self.root / name): reason for name, reason in zip(names, reasons)})
+        self.assertEqual([row['path'] for row in rows if row['event'] == 'deleted'],
+                         [str(self.root / 'later.log')])
+        self.assertEqual((self.root / 'active.log').read_text(), 'fixture')
+        self.assertEqual((self.root / 'changed.log').read_text(), 'updated since preview')
+        self.assertEqual((self.root / 'staged.log').read_text(), 'fixture')
+        self.assertEqual((self.root / 'staged.log').stat().st_ino, staged_inode)
+        self.assertFalse((self.root / 'later.log').exists())
+        self.assertFalse(list(self.state.glob('item-*')))
+
+    def test_failed_deletions_log_each_path_and_stop_later_batches(self):
+        names = ('io.log', 'mole.log', 'restore.log', 'later.log')
+        plan = [self.candidate(name) for name in names]
+
+        def probe(path, deadline, known=None):
+            if path.name == 'restore.log':
+                (self.root / path.name).write_text('replacement')
+                return {**self.live, 'reserved': {'.'}}
+            return self.live
+
+        def sink(receipt, item, preview, deadline=None):
+            if item.name == 'io.log':
+                raise OSError('delete failed')
+            raise m.Refused('Mole refused or failed')
+
+        with mock.patch.object(m, 'BATCH_SIZE', 3), mock.patch.object(m, 'process_snapshot', side_effect=probe):
+            code, output = self.run_cli(['--execute'], validate_root=lambda _: self.root,
+                                        trusted=lambda _: None, build_plan=lambda *args: (plan, {}),
+                                        owner_delete=sink)
         self.assertEqual(code, 1)
-        self.assertEqual(output['failed'], 1)
+        self.assertEqual(output['failed'], 3)
+        self.assertEqual(output['deferred'], 1)
+        self.assertEqual(output['deferred_reason'], 'item failure')
+        self.assertEqual(output['skipped'], 0)
         rows = [json.loads(x) for x in m.LOG.read_text().splitlines()]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]['status'], 'failed')
+        self.assertEqual(rows[-1]['status'], 'failed')
+        errors = {Path(row['path']).name: row['error'] for row in rows if row['event'] == 'failed'}
+        self.assertEqual(set(errors), set(names[:3]))
+        self.assertEqual(errors['io.log'], 'delete failed')
+        self.assertEqual(errors['mole.log'], 'Mole refused or failed')
+        self.assertIn('retained item needs review', errors['restore.log'])
+        self.assertEqual((self.root / 'restore.log').read_text(), 'replacement')
+        self.assertEqual([item.read_text() for item in self.state.glob('item-*/restore.log')], ['fixture'])
+        for name in ('io.log', 'mole.log', 'later.log'):
+            self.assertEqual((self.root / name).read_text(), 'fixture')
 
     def test_lock_contention_does_not_scan_or_delete(self):
         candidate = self.candidate()

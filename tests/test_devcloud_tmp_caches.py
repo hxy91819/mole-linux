@@ -161,7 +161,9 @@ class CacheTests(unittest.TestCase):
             with mock.patch.object(m, 'process_snapshot', side_effect=probe):
                 code, result = self.run_cli(['--execute'], validate_root=lambda _: self.root,
                                             trusted=lambda _: None)
-            self.assertEqual(code, 1, result)
+            self.assertEqual(code, int(unknown), result)
+            self.assertEqual(result['failed'], int(unknown))
+            self.assertEqual(result['skipped'], int(not unknown))
             self.assertEqual(result['deleted'], 0)
             self.assertTrue(root.exists())
             self.assertFalse(list(self.state.glob('item-*')))

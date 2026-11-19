@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位与增长两个任务使用独立快照 `56806e44ddcbe176`，不改变其他清理任务的快照（Git 使用下文独立快照）：
+水位刹车使用快照 `8833479afbddfa7c`，增长计量使用快照 `56806e44ddcbe176`：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -110,7 +110,7 @@ export PATH=/root/.nvm/versions/node/v24.22.1/bin:/root/.nvm/versions/node/v24.1
 | 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对六个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源；全部符合只回一句，不符合才发协调线程 |
 
 prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)。改检查项时
-两边同步：改文件 → 用文件里的提取命令更新 `bb automation update ... --prompt` → `show` 回读。
+两边同步：改文件 → 用完整文件（含末尾换行）更新 `bb automation update ... --prompt` → `show` 回读逐字核对。
 协调线程换了也要同步改 prompt 里的 `bb thread tell` 目标。每日检查只看 `trigger=schedule`
 的运行，`manual` 是人工测试，不算周期成功。
 
@@ -181,9 +181,11 @@ linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` �
 再更新两个任务的短名称 bash `--script-file`，回读命令、时区、cron、enabled。已知坏目录
 `8f4acd16bb88facd` 不保留；`916428875da4edee` 保留作回滚；其他旧快照按引用情况维护。
 
-`/tmp` 清理是另一条独立部署：快照 `/data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/`，
-由 crontab 直接引用；上一版 `7ca528d7c5f3f004`、`df3e2b353d8e1c72`、`f1e330c325c73fd0`、
-`1c2d71d3ab21cc79` 保留作回滚。升级它时要同时改 cron 版本路径和每日 DSH 检查覆盖的根。
+`clean-tmp` 执行器快照为 `/data/tools/devcloud-maintenance/releases/64a16a707b7a1da1/`，
+由包装器的 `EXECUTOR` 引用。上一版 `cbb5caf329a61b57` 和旧版 `7ca528d7c5f3f004`、
+`df3e2b353d8e1c72`、`f1e330c325c73fd0`、`1c2d71d3ab21cc79` 保留作回滚。升级执行器时按原 manifest
+清单发布只读版本，复算文件哈希、权限和 manifest 目录名，再发布引用它的包装器快照。用新包装器
+`--dry-run` 验收两根后，更新 cron 与水位入口并回读，按需同步每日 DSH 检查。
 
 ## 3. crontab
 
@@ -191,7 +193,7 @@ linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` �
 
 ```cron
 # devcloud-clean-tmp: ordinary entries 3d; structural caches idle 24h (owner-approved 2026-11-14)
-30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/56806e44ddcbe176/clean_tmp_runner.py # devcloud-clean-tmp
+30 3 * * * PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/timeout --signal=TERM --kill-after=10s 1790 /usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/8833479afbddfa7c/clean_tmp_runner.py # devcloud-clean-tmp
 ```
 
 - 先 `/var/tmp`（内部预算 300 秒，timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒，
@@ -199,10 +201,13 @@ linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` �
 - cron 与水位同用 `clean_tmp_runner.py`；全程持 `/var/lib/devcloud-storage-upkeep/clean-tmp.lock`，
   非阻塞拿锁，后台 timeout/执行器继承 fd；两盘同时越线合并为一个两根顺序 worker，
   执行器还保留自身每根 staging 锁。包装器用 `-I`，旧执行器维持 `-B` 以导入同目录 `devcloud_tmp`。
-- summary/intent/deleted 及包装器 runner_start/runner_finish（含退出码与 stdout）写 `/data/metrics/devcloud-clean-tmp.log`，
+- summary/intent/deleted/skipped/failed 及包装器 runner_start/runner_finish（含退出码与 stdout）写 `/data/metrics/devcloud-clean-tmp.log`，
   stderr 追加到同名 `.stderr.log`。
+- 执行复核发现活引用或候选变化时，保留该项并继续处理，已隔离的项先恢复原名。summary 的
+  `skipped`/`skipped_reasons` 汇总执行阶段跳过，扫描过滤原因记录在 `scan_skipped`。
+  Mole 拒绝、I/O 或恢复失败逐项记录，当前批次收尾后停止发下一批，避免在状态不确定时扩大删除范围。
 - 水位用相同入口加 `--launch --path /var/tmp` 或 `--launch --path /data/system-tmp`；只派发不等待。
-  包装器仅接受这两根；人工查看候选使用底层执行器去掉 `--execute` 的预览命令。
+  包装器仅接受这两根。人工验收用同一包装器加 `--dry-run`，输出两根预览 JSON，不写执行日志。
 - 日志轮转由 `logrotate.timer` 管：每日检查，超过 5 MiB 提前轮转，保留 14 份/最长 30 天，
   压缩旧文件，不截断活跃日志。
 

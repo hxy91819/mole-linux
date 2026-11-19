@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-EXECUTOR = '/data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/bin/devcloud.py'
+EXECUTOR = '/data/tools/devcloud-maintenance/releases/64a16a707b7a1da1/bin/devcloud.py'
 LOCK = Path('/var/lib/devcloud-storage-upkeep/clean-tmp.lock')
 LOG = Path('/data/metrics/devcloud-clean-tmp.log')
 STDERR = Path('/data/metrics/devcloud-clean-tmp.stderr.log')
@@ -17,12 +17,12 @@ ROOT_TIMEOUTS = {'/var/tmp': 325, '/data/system-tmp': 1435}
 TOTAL_SECONDS = 1790
 
 
-def command(root):
+def command(root, preview=False):
     # Executor owns the internal 300/1400s budgets, staging lock and JSONL events.
     # It imports devcloud_tmp from its own directory; preserve its existing -B contract.
     return ['/usr/bin/timeout', '--signal=TERM', '--kill-after=10s',
             str(ROOT_TIMEOUTS[root]), '/usr/bin/python3', '-B', EXECUTOR,
-            'clean-tmp', '--path', root, '--execute', '--age-days', '3', '--json']
+            'clean-tmp', '--path', root, '--age-days', '3', '--json'] + ([] if preview else ['--execute'])
 
 
 def record(**fields):
@@ -57,10 +57,19 @@ def execute(roots, fd):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--path', choices=ROOT_TIMEOUTS, help='omit to run both cron roots')
-    parser.add_argument('--launch', action='store_true', help='detach with lock inherited by worker')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--launch', action='store_true', help='detach with lock inherited by worker')
+    mode.add_argument('--dry-run', action='store_true', help='print preview summaries without writing to the ledger')
     parser.add_argument('--lock-fd', type=int, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     roots = [args.path] if args.path else list(ROOT_TIMEOUTS)
+    if args.dry_run:
+        code = 0
+        for root in roots:
+            result = subprocess.run(command(root, preview=True))
+            if result.returncode:
+                code = result.returncode
+        return code
     if args.lock_fd is None:
         LOCK.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)

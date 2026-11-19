@@ -83,6 +83,10 @@ class Refused(RuntimeError):
     pass
 
 
+class CandidateSkipped(Refused):
+    """Local evidence that an item must be retained."""
+
+
 def checkpoint(deadline):
     if CANCELLED.is_set():
         raise InterruptedError('cleanup cancelled; restore staged items')
@@ -414,24 +418,24 @@ def tree_snapshot(path, cutoff, watches, deadline, cache_type=None):
         s = item.lstat()
         relative = str(item.relative_to(path))
         if s.st_dev != device or item.is_mount():
-            raise Refused('mounted descendant')
+            raise CandidateSkipped('mounted descendant')
         if not (stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode)):
-            raise Refused('symlink, socket or special file')
+            raise CandidateSkipped('symlink, socket or special file')
         if s.st_uid != 0 or s.st_mode & 0o022 or (stat.S_ISREG(s.st_mode) and s.st_nlink != 1):
-            raise Refused('foreign owner, writable tree or shared file')
+            raise CandidateSkipped('foreign owner, writable tree or shared file')
         if cache_type and not cache_member(cache_type, relative, s.st_mode):
-            raise Refused('mixed cache layout')
+            raise CandidateSkipped('mixed cache layout')
         owner_database = (cache_type == 'pnpm-store' and len(Path(relative).parts) == 2
                           and item.name in ('index.db', 'index.db-wal', 'index.db-shm'))
         if (item.name in PERSISTENT_NAMES or item.name.endswith(PERSISTENT_SUFFIXES)) and not owner_database:
-            raise Refused('repository or persistent state')
+            raise CandidateSkipped('repository or persistent state')
         if stat.S_ISREG(s.st_mode):
             latest = max(latest, s.st_mtime)
         if s.st_mtime > cutoff and (not cache_type or stat.S_ISREG(s.st_mode)):
-            raise Refused('recent descendant')
+            raise CandidateSkipped('recent descendant')
         key = (os.major(s.st_dev) << 20 | os.minor(s.st_dev), s.st_ino)
         if key in watches:
-            raise Refused('inotify reference')
+            raise CandidateSkipped('inotify reference')
         digest.update(json.dumps([relative, s.st_dev, s.st_ino, s.st_mode, s.st_uid,
                                   s.st_gid, s.st_nlink, s.st_size, s.st_mtime_ns,
                                   s.st_ctime_ns if relative != '.' else 0]).encode())
@@ -583,13 +587,13 @@ def final_guard(receipt):
     deadline = time.monotonic() + (CACHE_SECONDS if record.get("cache_type") else 20)
     live = process_snapshot(item, deadline, record.get('process_identities'))
     if live['reserved']:
-        raise Refused('staged item acquired a process or mount reference')
+        raise CandidateSkipped('staged item acquired a process or mount reference')
     kind = record.get('cache_type')
     if kind and cache_kind(item) != kind:
-        raise Refused('staged cache layout changed')
+        raise CandidateSkipped('staged cache layout changed')
     snapshot = tree_snapshot(item, record['cutoff'], live['watches'], deadline, kind)
     if snapshot['fingerprint'] != record['fingerprint']:
-        raise Refused('staged contents changed')
+        raise CandidateSkipped('staged contents changed')
 
 
 def owner_delete(receipt, item, preview, deadline=None):
@@ -651,16 +655,16 @@ def execute_item(root, candidate, cutoff, deadline, batch_live=None):
     live = batch_live if batch_live is not None else process_snapshot(root, deadline)
     name = candidate['name']
     if name in live['reserved']:
-        raise Refused('candidate acquired a live reference')
+        raise CandidateSkipped('candidate acquired a live reference')
     kind = candidate.get('cache_type')
     if kind:
         cutoff = time.time() - CACHE_AGE_SECONDS
         if cache_kind(root / name) != kind:
-            raise Refused('cache layout changed since preview')
+            raise CandidateSkipped('cache layout changed since preview')
     current = tree_snapshot(root / name, cutoff, live['watches'],
                             min(deadline, time.monotonic() + (CACHE_SECONDS if kind else ITEM_SECONDS)), kind)
     if any(current[key] != candidate[key] for key in ('fingerprint', 'bytes', 'entries')):
-        raise Refused('candidate changed since preview')
+        raise CandidateSkipped('candidate changed since preview')
     stage = Path(tempfile.mkdtemp(prefix='item-', dir=state_for(root)))
     item, receipt = stage / name, stage / 'receipt.json'
     if name == receipt.name:
@@ -683,8 +687,8 @@ def execute_item(root, candidate, cutoff, deadline, batch_live=None):
         if os.path.lexists(item):
             try:
                 rename_exclusive(item, root / name)
-            except OSError:
-                raise Refused(f'original name is occupied; retained item needs review: {item}')
+            except OSError as error:
+                raise Refused(f'could not restore original name ({error}); retained item needs review: {item}') from error
         raise
     finally:
         if not os.path.lexists(item):
@@ -712,7 +716,7 @@ def _main(argv=None):
     summary = {'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'summary',
                'mode': 'execute' if options.execute else 'preview', 'path': str(options.path),
                'age_days': options.age_days if math.isfinite(options.age_days) else None,
-               'deleted': 0, 'failed': 0}
+               'deleted': 0, 'failed': 0, 'skipped': 0, 'skipped_reasons': {}}
     lock = None
     locked = False
     code = 0
@@ -742,16 +746,20 @@ def _main(argv=None):
             if pending:
                 raise Refused(f'unresolved staging receipt; review before continuing: {pending[0]}')
         cutoff = time.time() - options.age_days * 86400
-        plan, skipped = build_plan(root, cutoff, started + SCAN_SECONDS)
+        plan, scan_skipped = build_plan(root, cutoff, started + SCAN_SECONDS)
         selected = plan
         summary.update(scan='complete', candidates=len(selected), eligible=len(plan),
-                       deferred=len(plan) - len(selected), skipped=skipped,
+                       deferred=len(plan) - len(selected), scan_skipped=scan_skipped,
                        candidate_bytes=sum(row['bytes'] for row in selected),
                        sample=[row['name'] for row in selected[:options.limit]],
                        cache_roots=[{'path': str(root / row['name']),
                                      **{key: row[key] for key in ('cache_type', 'bytes', 'latest_file_mtime')}}
                                     for row in selected if row.get('cache_type')])
         if options.execute:
+            summary['deferred'] = len(selected)
+            skipped_reasons = Counter()
+            summary['skipped_reasons'] = skipped_reasons
+
             def remove(candidate, live):
                 checkpoint(started + run_seconds)
                 if started + run_seconds - time.monotonic() < ITEM_RUN_RESERVE_SECONDS:
@@ -783,24 +791,37 @@ def _main(argv=None):
                     for future, candidate in zip(futures, batch):
                         if future.cancelled():
                             continue
+                        path = str(root / candidate['name'])
+                        ts = time.strftime('%Y-%m-%dT%H:%M:%S%z')
                         try:
-                            if future.result():
-                                summary['deleted'] += 1
-                                summary['deleted_bytes'] = summary.get('deleted_bytes', 0) + candidate['bytes']
+                            deleted = future.result()
+                        except CandidateSkipped as error:
+                            reason = str(error)
+                            summary['skipped'] += 1
+                            skipped_reasons[reason] += 1
+                            summary['deferred'] -= 1
+                            append_log({'ts': ts, 'event': 'skipped', 'path': path, 'reason': reason})
                         except InterruptedError as error:
                             cancellation = error
                         except Exception as error:
                             summary['failed'] += 1
+                            summary['deferred'] -= 1
                             summary['error'] = str(error)
                             code = 1
+                            append_log({'ts': ts, 'event': 'failed', 'path': path, 'error': str(error)})
+                        else:
+                            if deleted:
+                                summary['deleted'] += 1
+                                summary['deferred'] -= 1
+                                summary['deleted_bytes'] = summary.get('deleted_bytes', 0) + candidate['bytes']
                     if cancellation is not None:
-                        summary['deferred'] = len(selected) - summary['deleted'] - summary['failed']
                         raise cancellation
                     if code:
+                        # Finish accounting for the current batch. A sink or restore failure
+                        # can leave uncertain filesystem state, so do not schedule more work.
                         break
-            summary['deferred'] = len(selected) - summary['deleted'] - summary['failed']
-            if summary['deferred'] and not code:
-                summary['deferred_reason'] = 'execution budget'
+            if summary['deferred']:
+                summary['deferred_reason'] = 'item failure' if code else 'execution budget'
     except Exception as error:
         code = 2
         summary.update(error=str(error), scan=summary.get('scan', 'incomplete'))
@@ -823,7 +844,8 @@ def _main(argv=None):
             print(summary.get('error', summary.get('audit_error', 'cleanup failed')), file=sys.stderr)
     else:
         print(f"clean-tmp {summary['mode']}: {summary['status']}; "
-              f"candidates={summary.get('candidates', 'unknown')} deleted={summary['deleted']} failed={summary['failed']}")
+              f"candidates={summary.get('candidates', 'unknown')} deleted={summary['deleted']} "
+              f"skipped={summary['skipped']} failed={summary['failed']}")
         for path, row in summary.get('mounts_after', {}).items():
             print(f"  {path}: {row['physical_used_percent']:.2f}% physical used; "
                   f"{row['unavailable_percent']:.2f}% unavailable; "

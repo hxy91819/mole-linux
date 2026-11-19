@@ -344,24 +344,24 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   顺序执行 `/usr/bin/python3 -B <执行器> clean-tmp --path <固定根> --execute --age-days 3 --json`，
   先 `/var/tmp`（内部预算 300 秒、timeout 325 秒），再 `/data/system-tmp`（内部预算 1400 秒、timeout 1435 秒），
   均 kill-after 10 秒，外层仍为 1790 秒。
-  同一命令去掉 `--execute` 即预览，不接受其他路径。
+  包装器加 `--dry-run` 即预览，不接受其他路径。
   `systemd-private-*`（及已有 `systemd-*`）始终跳过。普通项保留期 3 天。唯一执行器为固定部署版
-  `/data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/bin/devcloud.py`；上一版
-  `7ca528d7c5f3f004` 及 `df3e2b353d8e1c72`（仅 /tmp）、`f1e330c325c73fd0` 与
-  `1c2d71d3ab21cc79` 保留作回滚。后续升级先验收新快照，再同步 cron 版本路径与每日
-  DSH 检查，不执行共享工作区。
+  `/data/tools/devcloud-maintenance/releases/64a16a707b7a1da1/bin/devcloud.py`；上一版
+  `cbb5caf329a61b57` 及旧版 `7ca528d7c5f3f004`、`df3e2b353d8e1c72`（仅 /tmp）、
+  `f1e330c325c73fd0`、`1c2d71d3ab21cc79` 保留作回滚。后续升级先验收新快照，再同步 cron、
+  水位入口与每日 DSH 检查，不执行共享工作区。
 - **systemd-tmpfiles 自 2026-11-04 起不再按年龄清理 `/tmp`**：`/etc/tmpfiles.d/tmp.conf` 为
   `q /tmp 0700 root root -`（age 一栏为 `-`）。原 3d 规则逐个文件删除，曾把闲置 worktree 里的已跟踪
   文件删掉（32 个 /tmp worktree 中 7 个受损）；遇到孤立 FIFO 时还会卡死，10-30 起整个 tmpfiles 清理
   因此停过 4 天 20 小时。活体探针：`systemd-tmpfiles --cat-config | grep -E '^q /tmp '`。
 - 升级必须新建快照：目录名 = `manifest.json` 规范化内容的 sha256 前 16 位，全部文件逐项
-  记录 sha256 与 mode，目录/文件置只读；验收 = 清单复算 + 真实 preview，再改 cron 与
-  每日 DSH 检查覆盖的根（改完回读 cron 和检查任务核对）。
+  记录 sha256 与 mode，目录/文件置只读；验收 = 清单复算 + 两根真实预览，再改 cron 与水位入口，
+  按需同步每日 DSH 检查（改完回读核对）。
   回归：`tests/test_devcloud_cleanup.py::test_policy_shards_cover_every_candidate_exactly_once`
   与 `::test_policy_shard_refusal_discards_the_whole_candidate_set`。
 - 2026-11-04 的分片吞吐验证、容量统计口径修正和旧快照升级过程只用于解读历史报告，
   已移到设计文档「决策记录」和「经验教训」；现行预算、分片和容量规则见本节和
-  `/data/tools/devcloud-maintenance/releases/cbb5caf329a61b57/` 的部署清单。
+  `/data/tools/devcloud-maintenance/releases/64a16a707b7a1da1/` 的部署清单。
 - 容量统计固定用 statvfs：总量 `f_blocks`、物理空闲 `f_bfree`、普通可用 `f_bavail`，
   保留差额为 `f_bfree - f_bavail`；同时输出物理已用与含保留块的占用百分比，不能混用分母。
   零、负或不一致容量拒绝；`used_percent` 兼容字段明确表示物理已用。
@@ -392,9 +392,11 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 - Git 工作树统一由每日 06:30 的 `git_tree_sweep.py`（模式按本轮授权条件），旧 06:45 任务停用；
   不再补删 BB 环境，pnpm 每周日 05:30 逐版本 owner prune。
   `/data/bb-data/thread-storage/.shared-cache/` 是共享缓存，不在本段普通临时项或线程遗留范围。
-- 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted 事件与每根各一条
+- 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted/skipped/failed 事件与每根各一条
   summary 分开，`path` 区分两个根；错误日志为同名 `.stderr.log`。summary 记录两盘前后容量和
-  部分失败，失败非零；summary 增记 cache_roots（路径、类型、allocated bytes、
+  部分失败，失败非零。复核发现活引用或候选变化时保留该项，已隔离项先恢复原名，再继续后续批次。
+  逐项记跳过原因，按 `skipped`/`skipped_reasons` 汇总，扫描阶段的过滤另记 `scan_skipped`。
+  Mole 拒绝、I/O 或恢复失败时逐项写错误，已发批次收尾后停止发下一批。summary 还记录 cache_roots（路径、类型、allocated bytes、
   最新文件 mtime）及 deleted_bytes。logrotate 每日检查，保留 14 份/最长 30 天、
   5 MiB 检查阈值，不截断活跃日志。回归：`tests/test_devcloud_cleanup.py`；本机
   挂载与真实 Mole 路由另以专属测试文件验收，结果入 `storage-audit.log`。
