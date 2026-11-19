@@ -11,6 +11,8 @@ elif [[ $# -ne 0 ]]; then
     echo 'Usage: git_tree_sweep_worker.sh PYTHON [--execute]' >&2
     exit 2
 fi
+BB_CLI="$(/usr/bin/python3 -I "$git_sweep_dir/git_tree_sweep_bb_cli.py")" || exit 1
+export BB_CLI
 git_sweep_environment_rc=0
 "$git_sweep_python" -I "$git_sweep_dir/bb_environment_sweep.py" --budget-minutes 5 "$@" || git_sweep_environment_rc=$?
 git_sweep_linked_rc=0

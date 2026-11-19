@@ -742,13 +742,14 @@ def test_launcher_starts_only_one_bounded_dry_run(case, state, success, launched
     run.chmod(0o755)
     launcher = SCRIPT.with_name('git_tree_sweep_run.sh')
     result = subprocess.run(['bash', str(launcher), *(['--execute'] if execute else [])], env=dict(os.environ, PATH=str(bindir) + ':' + os.environ['PATH'],
-                            PROBE_STATE=state, PROBE_CAPTURE=str(capture)), capture_output=True, text=True)
+                            PROBE_STATE=state, PROBE_CAPTURE=str(capture),BB_CLI=str(bound_test_cli(c))), capture_output=True, text=True)
     assert (result.returncode == 0) == success, result.stderr
     assert capture.exists() == launched
     if launched:
         args = json.loads(capture.read_text())
         assert ('--property=RuntimeMaxSec=10380' if execute else '--property=RuntimeMaxSec=4080') in args
         assert '--property=WorkingDirectory=/' in args
+        assert any(value.startswith('--setenv=BB_CLI=') and value.endswith('/server package/bb') for value in args)
         assert str(SCRIPT.with_name('git_tree_sweep_worker.sh')) in args
         assert ('--execute' in args) is execute
         assert '/root/.pyenv/versions/3.12.12/bin/python3' in args
@@ -2551,7 +2552,7 @@ def test_worker_runs_linked_before_clones_and_preserves_each_budget(case,mode):
     c=case;probe=c.root/'python';log=c.root/'calls.jsonl'
     probe.write_text('#!'+os.sys.executable+'\nimport json,sys,pathlib\nwith pathlib.Path('+repr(str(log))+').open("a") as f:f.write(json.dumps(sys.argv[1:])+"\\n")\n')
     probe.chmod(0o755)
-    result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe),*mode],capture_output=True,text=True)
+    result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe),*mode],env=dict(os.environ,BB_CLI=str(bound_test_cli(c))),capture_output=True,text=True)
     calls=[json.loads(x) for x in log.read_text().splitlines()]
     assert result.returncode==0 and len(calls)==3
     assert [Path(call[1]).name for call in calls]==['bb_environment_sweep.py','worktree_sweep.py','git_tree_sweep.py']
@@ -2588,7 +2589,7 @@ def test_worker_attempts_both_phases_and_reports_failures(case,failed_phase):
     c=case;probe=c.root/'python';log=c.root/'calls'
     probe.write_text('#!'+os.sys.executable+'\nimport sys,pathlib\np=pathlib.Path('+repr(str(log))+')\nn=len(p.read_text().splitlines()) if p.exists() else 0\nwith p.open("a") as f:f.write("called\\n")\nsys.exit(7 if n=='+str(failed_phase)+' else 0)\n')
     probe.chmod(0o755)
-    result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe)],capture_output=True,text=True)
+    result=subprocess.run(['bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe)],env=dict(os.environ,BB_CLI=str(bound_test_cli(c))),capture_output=True,text=True)
     assert result.returncode==7 and len(log.read_text().splitlines())==3
 
 
@@ -2987,3 +2988,106 @@ def test_environment_stage_continues_other_environments_after_query_failure(case
     report=json.loads(capsys.readouterr().out)
     assert report['items'][0]['result']=='failed' and report['items'][1]['action']=='release-protection'
     assert len(report['failures'])==1
+
+
+def bound_test_cli(c,packaged_node=False):
+    package=c.root/'server package'
+    cli=package/('node_modules/bb-app/host-daemon/dist/bb' if packaged_node else 'bb');cli.parent.mkdir(parents=True)
+    implementation='#!'+os.sys.executable+'\nimport json,os,sys\nfrom pathlib import Path\na=sys.argv[1:]\ncli=Path(__file__).resolve()\n'
+    if packaged_node:
+        cli.write_text('#!/usr/bin/env node\n// Executed only by the package runtime.\n')
+        runtime=package/'bin/node';runtime.parent.mkdir(parents=True)
+        implementation+='cli=Path(a.pop(0)).resolve()\n'
+    else:runtime=cli
+    implementation+='if os.environ.get("CLI_TEST_LOG"):\n with open(os.environ["CLI_TEST_LOG"],"a") as f:f.write(json.dumps({"cli":str(cli),"args":a})+"\\n")\nif "--help" in a:print("--include-archived --include-hidden --json --all")\nelif a[:2]==["machine","list"]:print(json.dumps([{"id":"local","machineProviderId":None,"status":"connected","type":"persistent"}]))\nelif a[:2]==["environment","list"]:print(json.dumps([{"id":"old","status":"destroyed","createdAt":1,"updatedAt":1}]))\nelse:print("[]")\n'
+    runtime.write_text(implementation);runtime.chmod(0o755);cli.chmod(0o755);return cli
+
+
+@pytest.mark.parametrize('packaged_node',[False,True])
+def test_worker_uses_bound_server_cli_even_with_old_bb_on_path(case,monkeypatch,packaged_node):
+    c=case;cli=bound_test_cli(c,packaged_node);bindir=c.root/'bin';bindir.mkdir();old_called=c.root/'old-called';old=bindir/'bb'
+    old.write_text('#!'+os.sys.executable+'\nfrom pathlib import Path\nPath('+repr(str(old_called))+').touch()\nraise SystemExit(9)\n');old.chmod(0o755)
+    probe=c.root/'python';probe.write_text('#!'+os.sys.executable+'''\nfrom pathlib import Path
+import os,sys,types
+p=Path(os.environ["CLI_TEST_CORE"])
+m=types.ModuleType("cli_test");m.__file__=str(p)
+exec(compile(p.read_bytes(),str(p),"exec"),m.__dict__)
+# Replace host discovery only; execute the real stage entry and BB query paths,
+# including clone usage -> bb_anchors -> ws.bb_anchors -> ws.run.
+m.managed_roots=lambda:set()
+m.discover=lambda *a:{"trees":{},"bare":[],"links":[],"errors":[],"directories":0,"excluded":{}}
+m.process_anchors=lambda *a:{}
+m.config_anchors=lambda *a,**kw:[]
+m.name_config_sources=lambda:[]
+m.shutil.which=lambda name:None
+listdir=m.os.listdir
+m.os.listdir=lambda path:[] if str(path)=="/proc" else listdir(path)
+entry={"bb_environment_sweep.py":m.bb_environment_main,"worktree_sweep.py":m.linked_main,"git_tree_sweep.py":m.main}[Path(sys.argv[2]).name]
+raise SystemExit(entry([*sys.argv[3:],"--state-dir",os.environ["CLI_TEST_STATE"]]))
+''');probe.chmod(0o755)
+    state=c.root/'state';log=c.root/'cli.jsonl';env=dict(os.environ,PATH=str(bindir)+':/usr/bin:/bin',BB_CLI=str(cli),CLI_TEST_LOG=str(log),CLI_TEST_CORE=str(SCRIPT),CLI_TEST_STATE=str(state))
+    after=subprocess.run(['/bin/bash',str(SCRIPT.with_name('git_tree_sweep_worker.sh')),str(probe)],env=env,capture_output=True,text=True)
+    assert after.returncode==0 and not old_called.exists(),after.stderr
+    queries=[x for x in map(json.loads,log.read_text().splitlines()) if '--help' not in x['args']]
+    assert all(x['cli']==str(cli) for x in queries)
+    threads=[x for x in queries if x['args'][:2]==['thread','list']]
+    assert len(threads)==4 and len([x for x in threads if '--include-archived' in x['args']])==3
+    reports=[json.loads(p.read_text()) for p in state.glob('*.json')]
+    assert len(reports)==3 and all(p['complete'] and p['error'] is None for p in reports)
+
+
+@pytest.mark.parametrize('bad',['missing','relative','not-executable'])
+def test_bb_command_refuses_unbound_cli_without_path_fallback(case,monkeypatch,bad):
+    c=case;p=c.root/'bad-cli';p.write_text('no exec')
+    value={'missing':'','relative':'bb','not-executable':str(p)}[bad];monkeypatch.setenv('BB_CLI',value)
+    monkeypatch.setattr(c.m,'_run',lambda *a,**k:(_ for _ in ()).throw(AssertionError('PATH must not be invoked')))
+    with pytest.raises(c.m.ws.ScanIncomplete,match='run git_tree_sweep_run.sh'):c.m.command(['bb','thread','list'])
+
+
+def test_bb_command_overrides_stale_child_environment(case,monkeypatch):
+    c=case;cli=bound_test_cli(c);monkeypatch.setenv('BB_CLI',str(cli));seen=[]
+    monkeypatch.setattr(c.m,'_run',lambda args,**kw:seen.append((args,kw)) or SimpleNamespace(stdout='[]'))
+    c.m.command(['bb','thread','list'],env={'BB_CLI':'/stale/shim','OTHER':'preserved'})
+    assert seen[0][0][0]==str(cli) and seen[0][1]['env']=={'BB_CLI':str(cli),'OTHER':'preserved'}
+
+
+@pytest.mark.parametrize('packaged_node',[False,True])
+def test_cli_resolver_uses_service_package_when_not_injected(case,monkeypatch,packaged_node):
+    c=case;m=c.m.sibling('git_tree_sweep_bb_cli');cli=bound_test_cli(c,packaged_node)
+    package=c.root/'install';target=package/'node_modules/bb-app/host-daemon/dist/bb';target.parent.mkdir(parents=True);target.symlink_to(cli)
+    monkeypatch.delenv('BB_CLI',raising=False);monkeypatch.setenv('PATH','/usr/bin:/bin');raw=m.subprocess.run;seen=[]
+    def run(args,**kw):
+        seen.append(args)
+        if args[0]=='/usr/bin/systemctl':return SimpleNamespace(stdout='123\n',returncode=0)
+        return raw(args,**kw)
+    raw_link=m.os.readlink
+    monkeypatch.setattr(m.subprocess,'run',run);monkeypatch.setattr(m.os,'readlink',lambda value,**kw:str(package/'bin/node') if value=='/proc/123/exe' else raw_link(value,**kw))
+    assert m.resolve()==str(cli)
+    assert seen[0][1:]==['show','bb-dev-server.service','--property=MainPID','--value']
+
+
+def test_cli_node_entry_refuses_path_runtime_when_package_runtime_missing(case,monkeypatch):
+    c=case;m=c.m.sibling('git_tree_sweep_bb_cli');cli=bound_test_cli(c,True)
+    (c.root/'server package/bin/node').unlink();monkeypatch.setenv('BB_CLI',str(cli))
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:(_ for _ in ()).throw(AssertionError('PATH runtime must not run')))
+    with pytest.raises(RuntimeError,match='Packaged Node unavailable.*inspect bb-dev-server.service'):m.resolve()
+
+
+def test_cli_probe_reports_nonzero_stderr_and_next_step(case,monkeypatch):
+    c=case;m=c.m.sibling('git_tree_sweep_bb_cli');cli=c.root/'broken-cli'
+    cli.write_text('#!/bin/sh\necho interpreter-sentinel >&2\nexit 17\n');cli.chmod(0o755);monkeypatch.setenv('BB_CLI',str(cli))
+    with pytest.raises(RuntimeError,match='probe exited 17.*interpreter-sentinel.*inspect this CLI --version'):m.resolve()
+
+
+@pytest.mark.parametrize('fault',['inactive','missing-package','old-cli'])
+def test_cli_resolver_failure_names_cause_and_next_step(case,monkeypatch,fault):
+    c=case;m=c.m.sibling('git_tree_sweep_bb_cli');monkeypatch.delenv('BB_CLI',raising=False)
+    if fault=='old-cli':
+        cli=c.root/'old';cli.write_text('#!/bin/sh\necho "--json"\n');cli.chmod(0o755);monkeypatch.setenv('BB_CLI',str(cli))
+    else:
+        monkeypatch.setattr(m.subprocess,'run',lambda *a,**kw:SimpleNamespace(stdout='0' if fault=='inactive' else '123',returncode=0))
+        monkeypatch.setattr(m.os,'readlink',lambda _:str(c.root/'absent/bin/node'))
+    with pytest.raises(RuntimeError) as error:m.resolve()
+    message=str(error.value)
+    assert ('start' in message.lower() or 'inspect' in message.lower()) and ('BB_CLI' in message or 'MainPID' in message)
+    if fault=='old-cli':assert 'missing --include-archived' in message and 'PATH bb is never used' in message
