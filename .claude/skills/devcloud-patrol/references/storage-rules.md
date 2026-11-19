@@ -70,10 +70,10 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
 - **匿名测试 DB 卷满 1 小时即清**：无任何容器引用、名称为 64 位十六进制且只带
   `com.docker.volume.anonymous` 标签、内容是 MySQL/PostgreSQL 数据目录或为空，创建满 1 小时即
   `docker volume rm <id>`。容器已删的匿名卷没有任何程序还能挂回去；命名卷、compose 卷与 retained 登记照旧。
-- **2026-11-18最新方向：linked 与独立clone分开判定**：每天06:30（Asia/Shanghai）的同一launcher先回收遗弃BB环境（5分钟），再运行 `worktree_sweep.py` 的Git登记路径（15分钟），再运行 `git_tree_sweep.py` 的全盘独立clone路径（预演45分钟/执行150分钟）；systemd整体硬限为预演68分钟/执行173分钟。`tmp_clone_sweep.py` CLI转发独立clone路径，旧两个文件的helper仅供兼容。新规则预演后按owner授权直接执行一次，改动留工作区，不提交。
+- **2026-11-18最新方向：linked 与独立clone分开判定**：每天06:30（Asia/Shanghai）的同一launcher先回收遗弃BB环境（5分钟），再运行 `worktree_sweep.py` 的Git登记路径（15分钟），再运行 `git_tree_sweep.py` 的全盘独立clone路径（预演/执行各30分钟）；systemd整体硬限为均53分钟。`tmp_clone_sweep.py` CLI转发独立clone路径，旧两个文件的helper仅供兼容。新规则预演后按owner授权直接执行一次，改动留工作区，不提交。
   - **2026-11-19运行时CLI绑定**：launcher只接受BB script注入的BB_CLI，缺省时从bb-dev-server.service当前MainPID的exe安装包定位node_modules/bb-app/host-daemon/dist/bb；不存在或必需选项探测不通过，明确点名原因与下一步，拒绝启动，不使用PATH bb。以systemd --setenv传入worker；各Python阶段的command对bb重写为该绝对CLI，并覆盖陈旧子环境BB_CLI，禁止PATH兜底。JS入口的探针和阶段调用共用command_for，以同包bin/node启动，不依赖PATH的Node；缺解释器或非零探针保留具体错误。三份JSON/JSONL记录bb_cli，避免交互线程验证正确却在每日干净PATH下命中旧shim。
   - **2026-11-18遗弃BB环境（linked/clone共用）**：完整读取含hidden和archived的线程库存。有任一未归档线程的环境始终保护；不能用idle线程状态代替archivedAt。全部归档或没有线程，且环境/线程最后活动满24h，才解除环境保护。年龄取createdAt、updatedAt、archivedAt、latestAttentionAt、lastReadAt的最大值；缺失必需时间、未来/无效时间、运行/排队活动、未知库存均保留。BB已接受异步回收且仍在running/removing时继续保护，让provider完成；拒绝/failed则按Git兜底。此解除同时适用于clone的环境anchor和项目unknown兜底中的环境路径，其他引用与判定不变。
-    每天先运行`bb_environment_sweep.py`（5分钟）再linked15分钟和clone45/150分钟，整体硬限68/173分钟。provider实际拥有路径（managed=true且有provider ID）时，用`bb environment cleanup <id> --json`请求BB回收，不加recover；BB自行执行teardown和目录/登记清理。该owner命令可能强制移除并停止cwd进程，因此调用前重读线程/环境，检查本地cwd、共享环境和工作文件至少24h未活动，避免影响活业务。路径型/managed=false（即使providerId=project-checkout）不调用cleanup，不直接改BB数据；BB拒绝回收的遗弃环境也不再提供保留证据，工作树仍过原linked/clone规则。
+    每天先运行`bb_environment_sweep.py`（5分钟）再linked15分钟和clone30分钟，整体硬限53分钟。provider实际拥有路径（managed=true且有provider ID）时，用`bb environment cleanup <id> --json`请求BB回收，不加recover；BB自行执行teardown和目录/登记清理。该owner命令可能强制移除并停止cwd进程，因此调用前重读线程/环境，检查本地cwd、共享环境和工作文件至少24h未活动，避免影响活业务。路径型/managed=false（即使providerId=project-checkout）不调用cleanup，不直接改BB数据；BB拒绝回收的遗弃环境也不再提供保留证据，工作树仍过原linked/clone规则。
     cleanup返回成功只表示请求已接受；show观察destroyed才报已回收，否则报pending并在后续检查读回。BB原生delete对无provider的路径环境可仅记destroyed而不删目录，故不用它冒充磁盘清理。遗弃判定每次删除前重新读取，不把预演结果做永久豁免清单。
   - **linked worktree专用规则**：已知主仓库取BB项目source、BB环境所属仓库及最近一次完整两盘发现的Git路径（报告中的完整发现库存）；每轮重新向Git执行 `git worktree list --porcelain -z`，不在全盘通用判定里处理linked。完整clone扫描继续登记新发现的主仓库/linked marker，供下一次快速路径使用。
     仅当未locked、不是仍受保护的BB环境（非遗弃或正在回收，含环境路径落在该树内）、没有活进程cwd落在该树内、当前分支/ detached HEAD已有实时远端分支证明或已按原SHA归档核验、闲置满24小时，才从主仓库执行 `git worktree remove -- <登记路径>`，不加 `--force`。预演用Git status报告dirty/untracked，最终以Git remove是否接受为准；Git拒绝即保留并记录原因，无原始目录删除fallback。
@@ -127,7 +127,10 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     branch/HEAD 可验位于实时远端分支历史。远端查询失败保留；指向待删树自身/内部的 local/file remote 不作独立恢复证明；外部本地 remote 的包含仓库由完整 URL 引用索引保护，bare 库只作引用源不进入删除。缺失 ref 只能向同主机个人命名空间或内部 origin 的 `archive/git-tree/*`
     推原始对象，逐 ref `ls-remote` 核 exact SHA；tag 用 tag ref，不能用压缩快照替代原历史，不 force push，
     mono2 不推 GitHub，无目的地/归档失败均保留。预演只查询，不推送。
-  - **删除与复核**：全批远端查询/归档结束后重扫两盘及全部引用，再在每个 sink 前复核本地状态与占用；
+  - **2026-11-19 owner 性能边界**：全盘发现、remote/alternates、配置/名称/容器/自动化引用库存在本轮完整建立一次并复用；报告global_inventory记开始、发现完成和引用完成的UTC时间。轮内新增但未活跃读取的全局消费者下轮发现；不做每树全盘重扫。owner确认候选已闲置7天，新增borrower仍可从已经证明/归档的远端恢复，接受此快照边界。
+    每棵clone删除前实时重查：该树的进程cwd/fd/argv（含git clone --shared/--reference的源操作数；同时保留exe/maps/环境保护）、git status含untracked、stash及锁、该树每个refs/HEAD的实时远端或原SHA归档证明、是否已成为受保护BB环境。每树重新查询远端，不能复用上一树的远端证明。所有网络操作后再次核本地状态，再扫进程，实时mountinfo还须证明候选根及其后代无挂载（包含同设备bind mount），最后核物理身份并再次检查截止时间才fd-based删除。
+    目标每树执行≤10秒；删前复核超时/未知保留，记录原因供下轮重试。递归删除开始后不因时限中途取消，delete耗时单列，不把已删除报为保留。全局进程快照在启动本轮du前取得，避免计量进程污染占用保护；du随后与无依赖的全局引用/配置工作并发，全部结果在执行前汇合；原始SHA同目的地批量push并逐ref核验，不能压缩/force。execution_timings与execution_subprocess_seconds分列阶段/子命令成本，total不重复相加。clone整轮预算30分钟；此修订替代之前每sink重扫全机的规定。
+  - **删除与复核**：按上述本轮快照和逐树实时证据执行；
     unknown 或预算不足即保留。linked 必须从主 checkout 调 `git worktree remove -- <path>`，不加 `--force`；
     文件系统根和挂载点只列出保留；clone 仅 fd-based 删除该目录，逐级打开 ancestor 时 O_NOFOLLOW，不跟随任何软链。预演与执行共用判定。
     不删除 BB 环境。每对象 JSON/JSONL 包含路径、类型、实占（失败为 null）、

@@ -267,7 +267,7 @@ def test_process_probe_reads_cwd_maps_fd_and_environment(case, tmp_path, probe):
     c = case
     proc = tmp_path / 'proc'
     pid = proc / '987654'
-    (pid / 'fd').mkdir(parents=True)
+    (pid / 'fd').mkdir(parents=True);(pid/'cmdline').write_bytes(b'')
     (pid / 'cwd').symlink_to(c.repo if probe == 'cwd' else '/unrelated')
     (pid / 'exe').symlink_to(c.repo / 'a' if probe == 'exe' else '/usr/bin/bash')
     (pid / 'status').write_text('Uid: 0 0 0 0\n')
@@ -442,13 +442,15 @@ def test_remote_or_archive_uncertainty_retains_clone(case, monkeypatch, mode):
 def execute_case(c, monkeypatch):
     row = plan(c)
     row['bytes'] = 4096
-    def usage(inventory, refs=None):
+    def usage(inventory, refs=None, **kw):
         anchors = {}
         c.m.symlink_anchors(anchors, inventory)
         return anchors, []
-    monkeypatch.setattr(c.m, 'usage', usage)
+    inventory=inv(c);anchors,_=usage(inventory)
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{})
+    monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
     log = c.root / 'ledger.jsonl'
-    c.m.execute([row], inv(c), {}, {}, [str(c.root)], set(), 'test', log)
+    c.m.execute([row], inventory, anchors, {}, [str(c.root)], set(), 'test', log)
     return row, log
 
 
@@ -471,7 +473,7 @@ def test_execution_archives_exact_history_before_clone_removal(case, monkeypatch
     assert all('--force' not in cmd and '-f' not in cmd for cmd in c.calls if 'push' in cmd)
 
 
-@pytest.mark.parametrize('failure', ['push_rejected', 'wrong_sha', 'new_secret', 'new_reference', 'new_symlink', 'discovery_unknown', 'config_unknown'])
+@pytest.mark.parametrize('failure', ['push_rejected', 'wrong_sha', 'new_secret'])
 def test_archive_and_last_network_window_failures_keep_clone(case, monkeypatch, failure):
     c = case
     (c.repo / 'a').write_text('unpublished')
@@ -488,30 +490,9 @@ def test_archive_and_last_network_window_failures_keep_clone(case, monkeypatch, 
             if not touched:
                 touched = True
                 if failure == 'new_secret': (c.repo / '.env').write_text('secret')
-                if failure == 'new_symlink': (c.root / 'consumer').symlink_to(c.repo / 'a')
-                if failure == 'new_reference':
-                    other = c.root / 'consumer'
-                    shell('git', 'init', '-q', str(other))
-                    shell('git', 'config', 'remote.local.url', str(c.repo), cwd=other)
         return raw(cmd, **kw)
     monkeypatch.setattr(c.m, '_run', altered)
-    original_discover = c.m.discover
-    if failure == 'discovery_unknown':
-        count = 0
-        def incomplete(*a):
-            nonlocal count
-            result = original_discover(*a)
-            count += 1
-            if count >= 3: result['errors'].append('denied')
-            return result
-        monkeypatch.setattr(c.m, 'discover', incomplete)
-    if failure == 'config_unknown':
-        row = plan(c)
-        row['bytes'] = 4096
-        monkeypatch.setattr(c.m, 'usage', lambda _, refs=None: ({}, ['unknown path variable']))
-        c.m.execute([row], inv(c), {}, {}, [str(c.root)], set(), 'test', c.root / 'ledger')
-    else:
-        row, _ = execute_case(c, monkeypatch)
+    row, _ = execute_case(c, monkeypatch)
     assert row.get('result') == 'kept', row
     assert c.repo.exists()
 
@@ -562,7 +543,7 @@ def test_main_reports_budget_exhaustion_and_never_executes_partial_inventory(cas
     inventory = inv(c)
     monkeypatch.setattr(c.m, 'managed_roots', lambda: set())
     monkeypatch.setattr(c.m, 'discover', lambda *a: inventory)
-    monkeypatch.setattr(c.m, 'usage', lambda _, refs=None: ({}, []))
+    monkeypatch.setattr(c.m, 'usage', lambda _, refs=None, **kw: ({}, []))
     monkeypatch.setattr(c.m, 'references', lambda _: {})
     state = c.root / 'state'
     assert c.m.main(['--budget-minutes', '0', '--state-dir', str(state)]) == 1
@@ -747,7 +728,7 @@ def test_launcher_starts_only_one_bounded_dry_run(case, state, success, launched
     assert capture.exists() == launched
     if launched:
         args = json.loads(capture.read_text())
-        assert ('--property=RuntimeMaxSec=10380' if execute else '--property=RuntimeMaxSec=4080') in args
+        assert '--property=RuntimeMaxSec=3180' in args
         assert '--property=WorkingDirectory=/' in args
         assert any(value.startswith('--setenv=BB_CLI=') and value.endswith('/server package/bb') for value in args)
         assert str(SCRIPT.with_name('git_tree_sweep_worker.sh')) in args
@@ -954,7 +935,7 @@ def test_observed_process_values_are_all_substituted(case, monkeypatch, values):
 
 def test_process_snapshot_returns_real_values_for_later_substitution(case, tmp_path):
     p = tmp_path / '123'
-    (p / 'fd').mkdir(parents=True)
+    (p / 'fd').mkdir(parents=True);(p/'cmdline').write_bytes(b'')
     (p / 'cwd').symlink_to(case.repo)
     (p / 'status').write_text('Uid: 0 0 0 0\n')
     (p / 'stat').write_text('123 (proc) ' + ' '.join(['0'] * 22))
@@ -1023,17 +1004,20 @@ def test_scoped_unknown_allows_unrelated_clone_to_reach_remote_proof(case, expre
 
 
 @pytest.mark.parametrize('protect', [False, True])
-def test_execution_rechecks_scoped_unknown_without_global_veto(case, monkeypatch, protect):
+def test_execution_preserves_scoped_unknown_from_round_snapshot(case, monkeypatch, protect):
     c = case
     row = plan(c)
     row['bytes'] = 4096
-    def usage(inventory, refs=None):
+    def usage(inventory, refs=None, **kw):
         root = c.repo if protect else c.root / 'elsewhere'
         anchors = {}
         records = c.m.text_anchors(anchors, f'source "{root}/$name/init"', '/root', 'new config')
         return anchors, c.m.scope_unknown(anchors, records, inventory)
-    monkeypatch.setattr(c.m, 'usage', usage)
-    c.m.execute([row], inv(c), {}, {}, [str(c.root)], set(), 'scoped', c.root / 'events')
+    inventory=inv(c);anchors,records=usage(inventory)
+    assert records and not c.m.global_unknown(records)
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{})
+    monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
+    c.m.execute([row], inventory, anchors, {}, [str(c.root)], set(), 'scoped', c.root / 'events')
     assert c.repo.exists() is protect
     assert row['result'] == ('kept' if protect else 'removed')
 
@@ -1463,7 +1447,7 @@ def test_process_directory_scope_exceptions_and_isolated_homes(case, monkeypatch
 def test_process_home_from_proc_protects_nested_checkout(case, tmp_path, monkeypatch, key):
     c = case
     proc = tmp_path / 'proc'; p = proc / '987654'
-    (p/'fd').mkdir(parents=True)
+    (p/'fd').mkdir(parents=True);(p/'cmdline').write_bytes(b'')
     instance = c.root / 'server-instance/home'
     (p/'cwd').symlink_to(instance if key == 'cwd' else '/')
     (p/'stat').write_text('987654 (server) ' + ' '.join(['1'] * 25))
@@ -1478,7 +1462,7 @@ def test_process_home_from_proc_protects_nested_checkout(case, tmp_path, monkeyp
 
 
 def test_passwd_home_comes_from_process_uid(case, tmp_path, monkeypatch):
-    c = case;proc = tmp_path / 'proc';p=proc/'987654';(p/'fd').mkdir(parents=True)
+    c = case;proc = tmp_path / 'proc';p=proc/'987654';(p/'fd').mkdir(parents=True);(p/'cmdline').write_bytes(b'')
     home = str(c.root/'service-login')
     (p/'cwd').symlink_to(home)
     (p/'stat').write_text('987654 (server) ' + ' '.join(['1'] * 25))
@@ -1670,7 +1654,7 @@ def test_new_candidate_stops_execution_before_archive_or_remove(case, monkeypatc
     monkeypatch.setattr(c.m,'managed_roots',lambda:set())
     monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
     monkeypatch.setattr(c.m,'references',lambda _: {})
-    monkeypatch.setattr(c.m,'usage',lambda _, refs=None: ({},[]))
+    monkeypatch.setattr(c.m,'usage',lambda _, refs=None, **kw: ({},[]))
     monkeypatch.setattr(c.m,'plan',lambda path,kind,*a: {'path':path,'type':kind,'action':'remove','archives':[]})
     def forbidden(*a,**kw):raise AssertionError('execution must not start')
     monkeypatch.setattr(c.m,'execute',forbidden)
@@ -1724,7 +1708,9 @@ def test_shared_borrower_unpublished_history_still_requires_verified_archive(cas
     row=plan(c,borrower,refs=refs)
     assert row['action']=='archive+remove' and row['archive_objects'],row
     row['bytes']=1024
-    monkeypatch.setattr(c.m,'usage',lambda _, refs=None:({},[]))
+    monkeypatch.setattr(c.m,'usage',lambda _, refs=None, **kw:({},[]))
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{})
+    monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
     c.m.execute([row],inventory,{},refs,[str(c.root)],set(),'borrower-test',c.root/'execute.jsonl')
     assert row['result']=='removed' and c.repo.exists()
     assert row['archives']
@@ -2115,7 +2101,7 @@ def test_python_subprocess_custom_environment_keeps_known_home_prefix(case):
 
 @pytest.mark.parametrize('location,protected', [('inside',True),('root',True),('ancestor',False)])
 def test_cwd_only_protects_worktrees_containing_the_directory(case,tmp_path,monkeypatch,location,protected):
-    c=case;proc=tmp_path/'proc';p=proc/'123456';(p/'fd').mkdir(parents=True)
+    c=case;proc=tmp_path/'proc';p=proc/'123456';(p/'fd').mkdir(parents=True);(p/'cmdline').write_bytes(b'')
     directory={'inside':c.repo/'src','root':c.repo,'ancestor':c.repo.parent}[location]
     directory.mkdir(exist_ok=True)
     (p/'cwd').symlink_to(directory);(p/'stat').write_text('123456 (worker) '+' '.join(['1']*25))
@@ -2324,30 +2310,27 @@ def test_json_open_with_write_mode_is_not_executed(case):
     assert c.m.python_anchors({},text,'/root','python') and state.read_text()==original
 
 
-def test_each_removal_refreshes_git_consumers(case, monkeypatch):
-    c = case
-    second = c.root / 'second'
-    shell('git', 'clone', '-q', str(c.bare), str(second))
-    age(second)
-    inventory = inv(c)
-    refs = c.m.references(inventory)
-    rows = [c.m.plan(str(path), 'clone', inventory, {}, refs) for path in (c.repo, second)]
-    assert all(row['action'] == 'remove' for row in rows), rows
-    for row in rows: row['bytes'] = 4096
-    monkeypatch.setattr(c.m, 'usage', lambda inventory, refs=None: ({}, []))
-    original = c.m.remove
-    def remove(row, *args):
-        original(row, *args)
-        if row['path'] == str(c.repo):
-            consumer = c.root / 'new-consumer'
-            shell('git', 'init', '-q', str(consumer))
-            shell('git', 'config', 'remote.local.url', str(second), cwd=consumer)
-    monkeypatch.setattr(c.m, 'remove', remove)
-    c.m.execute(rows, inventory, {}, refs, [str(c.root)], set(), 'refresh', c.root / 'events')
-    assert rows[0]['result'] == 'removed'
-    assert rows[1]['result'] == 'kept', rows[1]
-    assert 'remote' in rows[1]['reason']
-    assert second.exists()
+@pytest.mark.parametrize('consumer', ['remote','alternates','symlink'])
+def test_new_inactive_consumer_is_detected_next_round(case,monkeypatch,consumer):
+    # Owner 2026-11-19: global references are a complete per-round snapshot;
+    # consumers created later belong to the next round, active readers stay live.
+    c=case;inventory=inv(c);refs=c.m.references(inventory);row=c.m.plan(str(c.repo),'clone',inventory,{},refs);row['bytes']=4096
+    assert row['action']=='remove'
+    target=c.root/'new-consumer'
+    if consumer=='symlink':target.symlink_to(c.repo/'a')
+    else:
+        shell('git','init','-q',str(target))
+        if consumer=='remote':shell('git','config','remote.local.url',str(c.repo),cwd=target)
+        else:(target/'.git/objects/info/alternates').write_text(str(c.repo/'.git/objects'))
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{});monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
+    def no_delete(*a,**kw):pass
+    no_delete.avoids_symlink_attacks=True
+    with monkeypatch.context() as patch:
+        patch.setattr(c.m.shutil,'rmtree',no_delete)
+        c.m.execute([row],inventory,{},refs,[str(c.root)],set(),'snapshot',c.root/'events')
+    assert row.get('result')=='removed' and c.repo.exists(),row  # Only the sink is stubbed.
+    next_inventory=inv(c);next_refs=c.m.references(next_inventory);anchors={};c.m.symlink_anchors(anchors,next_inventory)
+    assert c.m.plan(str(c.repo),'clone',next_inventory,anchors,next_refs)['action']=='keep'
 
 
 @pytest.mark.parametrize('escape',[
@@ -2556,7 +2539,7 @@ def test_worker_runs_linked_before_clones_and_preserves_each_budget(case,mode):
     calls=[json.loads(x) for x in log.read_text().splitlines()]
     assert result.returncode==0 and len(calls)==3
     assert [Path(call[1]).name for call in calls]==['bb_environment_sweep.py','worktree_sweep.py','git_tree_sweep.py']
-    assert [call[call.index('--budget-minutes')+1] for call in calls]==['5','15','150' if mode else '45']
+    assert [call[call.index('--budget-minutes')+1] for call in calls]==['5','15','30']
     assert all(('--execute' in call)==bool(mode) for call in calls)
 
 
@@ -2573,7 +2556,7 @@ def test_clone_main_does_not_feed_linked_trees_to_generic_plan(case,monkeypatch,
     monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
     monkeypatch.setattr(c.m,'managed_roots',lambda:set())
     monkeypatch.setattr(c.m,'references',lambda *a:{})
-    monkeypatch.setattr(c.m,'usage',lambda *a:({},[]))
+    monkeypatch.setattr(c.m,'usage',lambda *a,**kw:({},[]))
     def guard(path,kind,*args):
         assert kind!='linked';seen.append(path)
         return {'path':path,'type':kind,'action':'keep','archives':[],'reason':'fixture'}
@@ -3091,3 +3074,267 @@ def test_cli_resolver_failure_names_cause_and_next_step(case,monkeypatch,fault):
     message=str(error.value)
     assert ('start' in message.lower() or 'inspect' in message.lower()) and ('BB_CLI' in message or 'MainPID' in message)
     if fault=='old-cli':assert 'missing --include-archived' in message and 'PATH bb is never used' in message
+
+
+@pytest.mark.parametrize('operand', ['absolute', 'flag', 'file-url', 'relative', 'bare', 'short-directory', 'shell', 'spaces', 'equals', 'file-url-equals', 'bare-equals', 'shell-semicolon', 'shell-flag-semicolon', 'shell-pipe', 'quoted-punctuation', 'bare-dash', 'shell-login', 'shell-trace', 'shell-option-argument'])
+def test_live_process_argv_protects_source_checkout(case, tmp_path, operand):
+    c=case;proc=tmp_path/'proc';p=proc/'987654';(p/'fd').mkdir(parents=True);(p/'cmdline').write_bytes(b'')
+    target=c.root/'-source' if operand=='bare-dash' else c.root/'tool; clone&' if operand=='quoted-punctuation' else c.root/'local-source' if operand=='bare' else c.root/'tool=clone' if operand in ('equals','file-url-equals','bare-equals') else c.repo if operand!='spaces' else c.root/'tool clone';target.mkdir(exist_ok=True)
+    (p/'cwd').symlink_to(c.root)
+    (p/'stat').write_text('987654 (git) '+' '.join(['1']*25));(p/'status').write_text('Uid: 0 0 0 0\n')
+    (p/'maps').write_text('');(p/'environ').write_bytes(b'')
+    args={'absolute':['git','clone','--shared',str(target)],'flag':['git','clone','--reference='+str(target)],
+          'file-url':['git','clone','file://'+str(target)],'relative':['git','clone',os.path.relpath(target,c.root)],
+          'bare':['git','clone','--shared','local-source'],'short-directory':['git','-C'+str(target),'status'],
+          'shell':['bash','-c','git clone --shared '+str(target)],'spaces':['git','clone','--reference',str(target)],
+          'equals':['git','clone','--shared',str(target)],'file-url-equals':['git','clone','file://'+str(target)],'bare-equals':['git','clone','tool=clone'],
+          'shell-semicolon':['bash','-c',f'git clone --shared "{target}"; echo done'],
+          'shell-flag-semicolon':['bash','-c',f'git clone --reference="{target}"&& echo done'],
+          'shell-pipe':['bash','-c',f'git clone --shared "{target}"|cat'],
+          'quoted-punctuation':['bash','-c',f'git clone --shared "{target}"'],
+          'shell-login':['bash','-lc',f'git clone --shared "{target}"; echo done'],
+          'shell-trace':['bash','-xc',f'git clone --shared "{target}"; echo done'],
+          'shell-option-argument':['bash','--rcfile','other-config','-o','errexit','-lc',f'git clone --shared "{target}"; echo done'],
+          'bare-dash':['git','clone','--shared','--','-source']}[operand]
+    (p/'cmdline').write_bytes(b'\0'.join(os.fsencode(arg) for arg in args)+b'\0')
+    anchors={};c.m.process_anchors(anchors,str(proc))
+    assert 'argv' in (c.m.ws.anchored(anchors,str(target)) or '')
+
+
+def test_execute_reuses_round_inventory_and_does_not_repeat_global_usage(case,monkeypatch):
+    c=case;second=c.root/'second';shell('git','clone','-q',str(c.bare),str(second));age(second)
+    inventory=inv(c);refs=c.m.references(inventory)
+    rows=[c.m.plan(str(path),'clone',inventory,{},refs) for path in (c.repo,second)]
+    assert all(row['action']=='remove' for row in rows)
+    for row in rows:row['bytes']=4096
+    def forbidden(*a,**k):raise AssertionError('global inventory must be reused within the round')
+    monkeypatch.setattr(c.m,'discover',forbidden);monkeypatch.setattr(c.m,'references',forbidden);monkeypatch.setattr(c.m,'usage',forbidden)
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{});monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
+    c.m.execute(rows,inventory,{},refs,[str(c.root)],set(),'reuse',c.root/'events')
+    assert [row.get('result') for row in rows]==['removed','removed'],rows
+
+
+@pytest.mark.parametrize('change',['dirty','stash','lock','refs','credential','bb_environment','bb_unknown','proc_unknown','remote_lost','remote_unreachable','cwd','fd','argv'])
+def test_clone_sink_checks_live_evidence_after_preparation(case,monkeypatch,change):
+    c=case;inventory=inv(c);row=c.m.plan(str(c.repo),'clone',inventory,{},{});row['bytes']=4096
+    assert row['action']=='remove'
+    environments=[];monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:environments)
+    monkeypatch.setattr(c.m,'usage',lambda *a,**k:({},[]))
+    original=c.m.remove;raw=c.m._run;child=None
+    if change not in ('cwd','fd','argv','proc_unknown'):
+        monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{})
+    def remove(item,*args,**kw):
+        nonlocal child
+        if change=='dirty':(c.repo/'a').write_text('changed');age(c.repo)
+        if change=='stash':
+            (c.repo/'a').write_text('stashed');shell('git','stash','push','-qm','keep',cwd=c.repo);age(c.repo)
+        if change=='lock':(c.repo/'.git/index.lock').touch();age(c.repo)
+        if change=='refs':
+            (c.repo/'a').write_text('new commit');shell('git','commit','-qam','new',cwd=c.repo);age(c.repo)
+        if change=='credential':(c.repo/'.env').write_text('private');age(c.repo)
+        if change=='bb_environment':environments.append({'id':'new-env','path':str(c.repo),'protects':True})
+        if change=='bb_unknown':monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:(_ for _ in ()).throw(c.m.ws.ScanIncomplete('BB inventory unknown')))
+        if change=='proc_unknown':monkeypatch.setattr(c.m,'process_anchors',lambda a:(_ for _ in ()).throw(PermissionError('proc denied')))
+        if change=='remote_lost':shell('git','update-ref','-d','refs/heads/main',cwd=c.bare)
+        if change=='remote_unreachable':monkeypatch.setattr(c.m,'_run',lambda argv,**kwargs:(_ for _ in ()).throw(RuntimeError('remote unreachable')) if 'ls-remote' in argv else raw(argv,**kwargs))
+        if change in ('cwd','fd','argv'):
+            code='import os,sys\np=sys.stdin.readline().strip()\n'
+            code+= 'os.chdir(p)\n' if change=='cwd' else 'held=open(p+"/a")\n' if change=='fd' else ''
+            code+='print("ready",flush=True)\nsys.stdin.read()\n'
+            child=subprocess.Popen([os.sys.executable,'-c',code,*([str(c.repo)] if change=='argv' else [])],cwd=c.root,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+            child.stdin.write(str(c.repo)+'\n');child.stdin.flush();assert child.stdout.readline().strip()=='ready'
+        return original(item,*args,**kw)
+    monkeypatch.setattr(c.m,'remove',remove)
+    try:c.m.execute([row],inventory,{},{},[str(c.root)],set(),'live',c.root/'events')
+    finally:
+        if child:
+            child.stdin.close();child.wait(timeout=5);child.stdout.close()
+    assert row.get('result')=='kept',row
+    assert c.repo.exists()
+    if child:assert 'process '+str(child.pid) in row.get('reason',''),row
+    if change=='argv':assert 'argv' in row['reason']
+
+
+def test_archive_refspecs_are_batched_and_verified_exactly(case,monkeypatch):
+    c=case;(c.repo/'a').write_text('unpublished');shell('git','commit','-qam','new',cwd=c.repo)
+    for tag in ('one','two','three'):shell('git','-c','tag.gpgSign=false','tag',tag,cwd=c.repo)
+    age(c.repo);row,_=execute_case(c,monkeypatch)
+    assert row['result']=='removed' and len(row['archives'])>=5
+    pushes=[argv for argv in c.calls if 'push' in argv]
+    assert len(pushes)==1
+    assert all(any(arg==a['sha']+':'+a['ref'] for arg in pushes[0]) for a in row['archives'])
+
+
+def test_unmaterialized_error_environment_does_not_reserve_a_directory(case,monkeypatch):
+    c=case;env={'id':'unmaterialized','status':'error','path':None}
+    row=c.m.bb_environment_classify(env,[])
+    assert row['protects'] and row['unmaterialized']
+    monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[row])
+    assert c.m.clone_environment_anchors()=={}
+
+
+def test_main_overlaps_size_measurement_with_reference_inventory(case,monkeypatch,capsys):
+    import threading
+    c=case;inventory=inv(c);du_started=threading.Event();raw=c.m.command
+    monkeypatch.setattr(c.m,'managed_roots',lambda:set());monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
+    def references(_):
+        assert du_started.wait(3),'size IO must overlap independent reference work'
+        return {}
+    def command(argv,**kw):
+        if argv[0]=='du':du_started.set();return SimpleNamespace(stdout='4096\t'+argv[-1],returncode=0)
+        return raw(argv,**kw)
+    monkeypatch.setattr(c.m,'references',references);monkeypatch.setattr(c.m,'command',command);monkeypatch.setattr(c.m,'usage',lambda *a,**kw:({},[]))
+    assert c.m.main(['--json','--state-dir',str(c.root/'state')])==0
+    report=json.loads(capsys.readouterr().out)
+    assert report['global_inventory']['scope']=='round' and report['global_inventory']['references_checked_at']
+    assert report['complete'] and all(r['bytes']==4096 for r in report['items'])
+
+
+def test_clone_live_commands_are_bounded_without_leaking_budget_to_next_phase(case,monkeypatch):
+    c=case;inventory=inv(c);row=c.m.plan(str(c.repo),'clone',inventory,{},{});row['bytes']=4096
+    assert row['action']=='remove'
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{});monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
+    seen=[];raw=c.m._run
+    def run(argv,**kw):seen.append((list(argv),kw['timeout']));return raw(argv,**kw)
+    monkeypatch.setattr(c.m,'_run',run);c.m.DEADLINE=time.monotonic()+120
+    c.m.execute([row],inventory,{},{},[str(c.root)],set(),'bounded',c.root/'events')
+    assert row['result']=='removed' and seen and all(timeout<=10 for _,timeout in seen)
+    c.m.command(['/bin/true'],timeout=60)
+    assert seen[-1][1]==60
+    assert row['execution_timings']['total']>0 and row['execution_subprocess_seconds']['ls_remote']>0
+
+
+def test_final_recovery_records_the_live_effective_remote_url(case,monkeypatch):
+    c=case;inventory=inv(c);row=c.m.plan(str(c.repo),'clone',inventory,{},{});row['bytes']=4096
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{});monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
+    original=c.m.remove
+    def remove(item,*args,**kw):
+        shell('git','remote','set-url','origin',str(c.bare),cwd=c.repo);age(c.repo)
+        return original(item,*args,**kw)
+    monkeypatch.setattr(c.m,'remove',remove)
+    c.m.execute([row],inventory,{},{},[str(c.root)],set(),'live-url',c.root/'events')
+    assert row['result']=='removed' and row['urls']==[str(c.bare)]
+
+
+def test_partial_batched_push_keeps_clone_and_records_only_verified_refs(case,monkeypatch):
+    c=case;(c.repo/'a').write_text('new');shell('git','commit','-qam','new',cwd=c.repo);age(c.repo)
+    raw=c.m._run
+    def partial(argv,**kw):
+        if 'push' in argv:
+            index=argv.index('push');raw(argv[:index+3],**kw)
+            return SimpleNamespace(returncode=1,stdout='',stderr='one ref rejected')
+        return raw(argv,**kw)
+    monkeypatch.setattr(c.m,'_run',partial)
+    row,_=execute_case(c,monkeypatch)
+    assert row['result']=='kept' and c.repo.exists() and len(row['archives'])==1,row
+    assert 'one ref rejected' in row['reason']
+    assert shell('git','rev-parse',row['archives'][0]['ref'],cwd=c.bare)==row['archives'][0]['sha']
+
+
+@pytest.mark.parametrize('fault',['discovery','references','usage'])
+def test_incomplete_round_snapshot_never_enters_execution(case,monkeypatch,capsys,fault):
+    c=case;inventory=inv(c)
+    if fault=='discovery':inventory['errors'].append('inventory denied')
+    monkeypatch.setattr(c.m,'managed_roots',lambda:set());monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
+    if fault=='references':monkeypatch.setattr(c.m,'references',lambda *a:(_ for _ in ()).throw(RuntimeError('reference denied')))
+    monkeypatch.setattr(c.m,'usage',lambda *a,**kw:({},['unresolved global path'] if fault=='usage' else []))
+    monkeypatch.setattr(c.m,'execute',lambda *a:(_ for _ in ()).throw(AssertionError('incomplete snapshot must not execute')))
+    assert c.m.main(['--execute','--json','--state-dir',str(c.root/'state')])==1
+    report=json.loads(capsys.readouterr().out)
+    assert not report['complete'] and report['error'] and c.repo.exists()
+
+
+@pytest.mark.parametrize('placement',['root','same-device-child','file','quoted-space'])
+def test_live_mount_added_after_inventory_never_reaches_delete(case,monkeypatch,placement):
+    c=case;payload=c.repo/'node_modules/payload';payload.mkdir(parents=True)
+    mounted={'root':c.repo,'same-device-child':payload,'file':payload/'mounted-file','quoted-space':payload/'mounted folder'}[placement]
+    if placement=='file':mounted.touch()
+    elif placement=='quoted-space':mounted.mkdir()
+    age(c.repo);inventory=inv(c);row=c.m.plan(str(c.repo),'clone',inventory,{},{});row['bytes']=4096
+    assert row['action']=='remove'
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{});monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
+    actual_read=Path.read_text;original=c.m.remove;calls=[]
+    device=c.repo.stat().st_dev
+    text=f'999 1 {os.major(device)}:{os.minor(device)} / '+str(mounted).replace(' ','\\040')+' rw - ext4 /dev/same-device rw\n'
+    def remove(item,*a,**kw):
+        monkeypatch.setattr(Path,'read_text',lambda p,*args,**kwargs:text if str(p)=='/proc/self/mountinfo' else actual_read(p,*args,**kwargs))
+        return original(item,*a,**kw)
+    def never_delete(*a,**kw):calls.append(a);raise AssertionError('mounted data must stay')
+    never_delete.avoids_symlink_attacks=True;monkeypatch.setattr(c.m,'remove',remove)
+    with monkeypatch.context() as patch:
+        patch.setattr(c.m.shutil,'rmtree',never_delete)
+        c.m.execute([row],inventory,{},{},[str(c.root)],set(),'new-mount',c.root/'events')
+    assert not calls and row.get('result')=='kept' and 'mount' in row.get('reason','').lower(),row
+    assert c.repo.exists()
+
+
+def test_du_in_progress_does_not_enter_round_process_protection(case,monkeypatch,capsys):
+    import threading
+    c=case;inventory=inv(c);du_started=threading.Event();usage_finished=threading.Event();raw_command=c.m.command;original_usage=c.m.usage
+    monkeypatch.setattr(c.m,'managed_roots',lambda:set());monkeypatch.setattr(c.m,'discover',lambda *a:inventory)
+    def process(anchors):
+        if du_started.is_set() and not usage_finished.is_set():c.m.anchor(anchors,str(c.repo),'measurement du source')
+        return c.m.ProcessEnvironments()
+    def references(_):assert du_started.wait(3);return {}
+    def usage(*a,**kw):
+        try:return original_usage(*a,**kw)
+        finally:usage_finished.set()
+    def command(argv,**kw):
+        if argv[0]=='du':
+            du_started.set();assert usage_finished.wait(3);return SimpleNamespace(stdout='4096\t'+argv[-1],returncode=0)
+        return raw_command(argv,**kw)
+    monkeypatch.setattr(c.m,'process_anchors',process);monkeypatch.setattr(c.m,'references',references);monkeypatch.setattr(c.m,'usage',usage);monkeypatch.setattr(c.m,'command',command)
+    monkeypatch.setattr(c.m,'bb_anchors',lambda *a:[]);monkeypatch.setattr(c.m,'config_anchors',lambda *a,**kw:[]);monkeypatch.setattr(c.m,'name_config_sources',lambda:[]);monkeypatch.setattr(c.m.shutil,'which',lambda _:None)
+    assert c.m.main(['--json','--state-dir',str(c.root/'state')])==0
+    report=json.loads(capsys.readouterr().out)
+    assert report['complete'] and report['items'][0]['action']=='remove',report['items']
+
+
+def test_deadline_crossed_by_final_stat_does_not_start_recursive_delete(case,monkeypatch):
+    c=case;row=plan(c);clock={'now':9.9};calls=[];original_stat=c.m.os.stat
+    def stat_call(*a,**kw):
+        result=original_stat(*a,**kw)
+        if 'dir_fd' in kw:clock['now']=10.1
+        return result
+    def never_delete(*a,**kw):calls.append(a)
+    never_delete.avoids_symlink_attacks=True
+    with monkeypatch.context() as patch:
+        patch.setattr(c.m,'DEADLINE',10.0);patch.setattr(c.m.time,'monotonic',lambda:clock['now']);patch.setattr(c.m.os,'stat',stat_call)
+        patch.setattr(c.m,'local_state',lambda *a:{key:row[key] for key in ('identity','objects','gitdir','main')});patch.setattr(c.m.shutil,'rmtree',never_delete)
+        with pytest.raises(c.m.ws.ScanIncomplete,match='budget'):c.m.remove(row,inv(c),{},{})
+    assert not calls and c.repo.exists()
+
+
+def test_recursive_delete_already_started_is_timed_without_midway_cancellation(case,monkeypatch):
+    c=case;inventory=inv(c);row=c.m.plan(str(c.repo),'clone',inventory,{},{});row['bytes']=4096
+    clock={'now':0.0};original_delete=c.m.shutil.rmtree
+    def delete(*a,**kw):clock['now']=11.0;return original_delete(*a,**kw)
+    delete.avoids_symlink_attacks=original_delete.avoids_symlink_attacks
+    with monkeypatch.context() as patch:
+        patch.setattr(c.m.time,'monotonic',lambda:clock['now']);patch.setattr(c.m,'DEADLINE',100.0)
+        patch.setattr(c.m,'bb_environment_inventory',lambda:[]);patch.setattr(c.m,'process_anchors',lambda anchors:{})
+        patch.setattr(c.m.shutil,'rmtree',delete)
+        c.m.execute([row],inventory,{},{},[str(c.root)],set(),'started',c.root/'events')
+    assert row['result']=='removed' and not c.repo.exists()
+    assert row['execution_timings']['delete']==11.0 and row['execution_timings']['total']==11.0
+
+
+@pytest.mark.parametrize('separator',['\u00a0','\u2028','\u0085','\v','\f'])
+def test_live_mount_path_keeps_non_ascii_and_non_newline_separators(case,monkeypatch,separator):
+    c=case;renamed=c.root/('retired'+separator+'clone');c.repo.rename(renamed);c.repo=renamed
+    payload=c.repo/'node_modules/payload';payload.mkdir(parents=True);age(c.repo)
+    inventory=inv(c);row=c.m.plan(str(c.repo),'clone',inventory,{},{});row['bytes']=4096
+    assert row['action']=='remove',row
+    monkeypatch.setattr(c.m,'process_anchors',lambda anchors:{});monkeypatch.setattr(c.m,'bb_environment_inventory',lambda:[])
+    actual_read=Path.read_text;original=c.m.remove;calls=[];device=c.repo.stat().st_dev
+    text=f'999 1 {os.major(device)}:{os.minor(device)} / {payload} rw - ext4 /dev/same-device rw\n'
+    def remove(item,*a,**kw):
+        monkeypatch.setattr(Path,'read_text',lambda p,*args,**kwargs:text if str(p)=='/proc/self/mountinfo' else actual_read(p,*args,**kwargs))
+        return original(item,*a,**kw)
+    def never_delete(*a,**kw):calls.append(a);raise AssertionError('mounted data must stay')
+    never_delete.avoids_symlink_attacks=True;monkeypatch.setattr(c.m,'remove',remove)
+    with monkeypatch.context() as patch:
+        patch.setattr(c.m.shutil,'rmtree',never_delete)
+        c.m.execute([row],inventory,{},{},[str(c.root)],set(),'unicode-mount',c.root/'events')
+    assert not calls and row.get('result')=='kept' and 'mounted path' in row.get('reason',''),row
+    assert c.repo.exists()

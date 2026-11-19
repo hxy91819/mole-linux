@@ -53,6 +53,20 @@ ENV_NAME = re.compile(r'^(PATH|.*_(HOME|ROOT|DIR))$')
 DEADLINE = float('inf')
 LIVE = {}
 LIVE_LOCK = threading.Lock()
+EXECUTION = threading.local()
+CLONE_RECHECK_SECONDS = 10
+
+
+@contextlib.contextmanager
+def execution_step(name):
+    row = getattr(EXECUTION, 'row', None)
+    started = time.monotonic()
+    try:
+        yield
+    finally:
+        if row is not None:
+            values = row.setdefault('execution_timings', {})
+            values[name] = round(values.get(name, 0) + time.monotonic() - started, 6)
 
 
 def live_query(path, url, symref=False):
@@ -105,6 +119,10 @@ def checkpoint():
 def command(args, cwd=None, timeout=120, check=True, env=None):
     global _bb_cli_helper
     checkpoint()
+    category = ('bb' if args[0] == 'bb' else 'du' if args[0] == 'du' else
+                'ls_remote' if args[0] == 'git' and 'ls-remote' in args else
+                'archive_push' if args[0] == 'git' and 'push' in args else
+                'git_status' if args[0] == 'git' and 'status' in args else 'other')
     if args and args[0] == 'bb':
         cli = os.environ.get('BB_CLI', '')
         if not os.path.isabs(cli) or not os.path.isfile(cli) or not os.access(cli, os.X_OK):
@@ -113,7 +131,14 @@ def command(args, cwd=None, timeout=120, check=True, env=None):
             _bb_cli_helper = sibling('git_tree_sweep_bb_cli')
         args = [*_bb_cli_helper.command_for(cli), *args[1:]]
         env = dict(ws.ENV if env is None else env, BB_CLI=cli)
-    return _run(args, cwd=cwd, timeout=max(.01, min(timeout, DEADLINE - time.monotonic())), check=check, env=env)
+    started = time.monotonic()
+    try:
+        return _run(args, cwd=cwd, timeout=max(.01, min(timeout, DEADLINE - time.monotonic())), check=check, env=env)
+    finally:
+        row = getattr(EXECUTION, 'row', None)
+        if row is not None:
+            values = row.setdefault('execution_subprocess_seconds', {})
+            values[category] = round(values.get(category, 0) + time.monotonic() - started, 6)
 
 
 # The shared Repo proof helper must observe the same overall deadline.
@@ -461,8 +486,12 @@ class ProcessEnvironments(dict):
 
 def process_mounts():
     mounts = set()
-    for line in Path('/proc/self/mountinfo').read_text().splitlines():
-        fields = line.split()
+    # Kernel mountinfo escapes ASCII space/tab/newline/backslash only. Other
+    # whitespace (including NBSP and Unicode line separators) is path data.
+    for line in Path('/proc/self/mountinfo').read_text().split('\n'):
+        if not line:
+            continue
+        fields = [field for field in line.split(' ') if field]
         if len(fields) < 6:
             raise ws.ScanIncomplete('mount inventory incomplete')
         path = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4])
@@ -489,10 +518,63 @@ def scope_directories(anchors, scopes, inventory):
                 anchor(anchors, tree, reason)
 
 
+def argument_paths(argv, cwd):
+    """Literal process operands only; never evaluate a shell or its variables."""
+    words = list(argv)
+    index = None
+    if argv and os.path.basename(argv[0]) in ('sh', 'bash', 'dash', 'zsh', 'ksh'):
+        cursor = 1
+        while cursor < len(argv):
+            option = argv[cursor]
+            if option == '--' or not option.startswith(('-', '+')) or option in ('-', '+'):
+                break
+            if re.fullmatch(r'-[A-Za-z]+', option) and 'c' in option:
+                index = cursor + 1
+                # -o/-O consume an option name before the pending command.
+                if any(flag in option[1:] for flag in ('o', 'O')):
+                    index += 1
+                break
+            cursor += 2 if option in ('-o', '+o', '-O', '+O', '--rcfile', '--init-file') else 1
+    if index is not None:
+        if index < len(argv):
+            words = list(argv[:index]) + list(argv[index + 1:])
+            try:
+                lexer = shlex.shlex(argv[index], posix=True, punctuation_chars=';&|()<>')
+                lexer.whitespace_split = True
+                lexer.commenters = ''
+                words.extend(lexer)
+            except ValueError:
+                # Here-doc content is not necessarily shell quoting. Preserve
+                # its literal absolute operands without running the command.
+                for quoted, plain in re.findall(r'''["'](/[^"'\n]+)["']|(?:^|[=\s])(/[^\s;|&<>()]+)''', argv[index]):
+                    words.append(quoted or plain)
+    operands = []
+    for word in words:
+        # The original may itself be a filename containing '='. Also inspect
+        # option/assignment values; neither spelling is discarded.
+        operands.append(word)
+        if '=' in word:
+            operands.append(word.split('=', 1)[1])
+        if word.startswith('-C') and len(word) > 2:
+            operands.append(word[2:])
+    for value in operands:
+        if value.startswith('file:'):
+            path = tc.local_path(value, cwd or '/')
+            if path:
+                yield path
+        elif value.startswith('/'):
+            yield value
+        elif cwd and value:
+            target = os.path.join(cwd, value)
+            if os.path.lexists(target) or (not value.startswith('-') and '/' in value and '\n' not in value and '\r' not in value and not re.match(r'^[^/]+:', value)):
+                yield target
+
+
 def process_anchors(anchors, proc='/proc'):
     environments = ProcessEnvironments()
     mounts = process_mounts()
     for pid in os.listdir(proc):
+        checkpoint()
         if not pid.isdigit():
             continue
         base = Path(proc, pid)
@@ -516,6 +598,9 @@ def process_anchors(anchors, proc='/proc'):
                     anchor(anchors, target, f'process {pid}')
                 except FileNotFoundError:
                     pass
+            argv = [os.fsdecode(part) for part in (base / 'cmdline').read_bytes().split(b'\0') if part]
+            for path in argument_paths(argv, cwd):
+                anchor(anchors, path, f'process {pid} argv')
             for line in (base / 'maps').read_text().splitlines():
                 fields = line.split(None, 5)
                 if len(fields) == 6:
@@ -1897,9 +1982,17 @@ def symlink_anchors(anchors, inventory):
             path = os.path.dirname(path)
 
 
-def usage(inventory, refs=None):
-    anchors = {}
-    environments = process_anchors(anchors)
+def usage(inventory, refs=None, *, process_snapshot=None):
+    if process_snapshot is None:
+        anchors = {}
+        environments = process_anchors(anchors)
+    else:
+        recorded_anchors, recorded_environment = process_snapshot
+        anchors = dict(recorded_anchors)
+        environments = ProcessEnvironments()
+        environments.update({key: set(values) for key, values in (recorded_environment or {}).items()})
+        environments.scopes = dict(getattr(recorded_environment, 'scopes', {}))
+        environments.contexts = [dict(context) for context in getattr(recorded_environment, 'contexts', [])]
     if environments is None:
         environments = {}
     scope_directories(anchors, getattr(environments, 'scopes', {}), inventory)
@@ -1914,13 +2007,8 @@ def usage(inventory, refs=None):
         anchor(anchors, path, reason)
     unknown = bb_anchors(anchors, environments) + config_anchors(anchors, environments=environments)
     symlink_anchors(anchors, inventory)
-    with open('/proc/self/mountinfo') as handle:
-        for line in handle:
-            fields = line.split()
-            if len(fields) < 6:
-                raise ws.ScanIncomplete('mount inventory incomplete')
-            mount = re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4])
-            anchor(anchors, mount, 'mounted descendant')
+    for mount in process_mounts():
+        anchor(anchors, mount, 'mounted descendant')
     unknown = scope_unknown(anchors, unknown, inventory)
     configuration_name_anchors(anchors, inventory, refs=refs)
     return anchors, unknown
@@ -2126,7 +2214,9 @@ def local_state(path, kind, inventory, anchors, refs):
             files = [f for f in files if f != '.git']
         elif '.git' in dirs or '.git' in files:
             raise ws.Keep('contains nested Git repository')
-        for name in dirs + files:
+        for index, name in enumerate(dirs + files):
+            if index % 128 == 0:
+                checkpoint()
             latest = max(latest, os.lstat(os.path.join(parent, name)).st_mtime)
     for directory in dict.fromkeys([common, gitdir]):
         # Borrowers may be removed. The lender is protected by references();
@@ -2141,7 +2231,9 @@ def local_state(path, kind, inventory, anchors, refs):
         for parent, dirs, files in os.walk(directory, followlinks=False, onerror=failed):
             checkpoint()
             dirs[:] = [d for d in dirs if d not in ('objects', 'worktrees', 'modules')]
-            for name in [None, *dirs, *files]:
+            for index, name in enumerate([None, *dirs, *files]):
+                if index % 128 == 0:
+                    checkpoint()
                 target = os.path.join(parent, name) if name else parent
                 latest = max(latest, os.lstat(target).st_mtime)
     if time.time() - latest < IDLE:
@@ -2166,40 +2258,49 @@ def local_state(path, kind, inventory, anchors, refs):
             'identity': [info.st_dev, info.st_ino], 'idle_hours': (time.time() - latest) / 3600}
 
 
+def recovery_state(path, objects):
+    item = {'objects': objects}
+    repo = LiveRepo(path, set(ws.DEFAULT_LOGINS))
+    # A remote inside this tree vanishes with it. External local remotes
+    # participate in the full reference index, which keeps their containing
+    # checkout; bare stores are reference sources, never deletion targets.
+    for name, (url, _) in list(repo.remotes.items()):
+        target = tc.local_path(url, path)
+        if target and inside(canonical(target), path):
+            repo.remotes.pop(name)
+            if repo.dest == name:
+                repo.dest = None
+    repo.load_live(include_tags=True)
+    if repo.unreachable:
+        raise ws.Keep('remote query incomplete: ' + ', '.join(sorted(repo.unreachable)))
+    if not repo.live:
+        raise ws.Keep('no independently recoverable remote')
+    item['remote_proofs'] = {ref: (repo.by_sha.get(sha) if ref.startswith('refs/tags/') else repo.proof(sha))
+                             for ref, sha in item['objects'].items()}
+    missing = {ref: sha for ref, sha in item['objects'].items() if not item['remote_proofs'][ref]}
+    item['archive_objects'] = missing
+    item['urls'] = [pair[0] for pair in repo.remotes.values()]
+    if missing:
+        if not repo.dest:
+            raise ws.Keep('unpushed refs and no personal or internal remote')
+        url = ws.transport_url(repo.remotes[repo.dest][1])
+        if any('mono2' in s.lower() for s in [path, *item['urls']]) and ws.parse_remote(url)[0] == 'github.com':
+            raise ws.Keep('mono2 must never be archived to GitHub')
+        item['archive_url'] = url
+    item.pop('objects')
+    return item
+
+
 def plan(path, kind, inventory, anchors, refs, error=None):
     item = {'path': path, 'type': kind, 'action': 'keep', 'archives': []}
     try:
-        item.update(local_state(path, kind, inventory, anchors, refs))
+        with execution_step('local_state'):
+            item.update(local_state(path, kind, inventory, anchors, refs))
         if error:
             raise ws.Keep(error)
-        repo = LiveRepo(path, set(ws.DEFAULT_LOGINS))
-        # A remote inside this tree vanishes with it. External local remotes
-        # participate in the full reference index, which keeps their containing
-        # checkout; bare stores are reference sources, never deletion targets.
-        for name, (url, _) in list(repo.remotes.items()):
-            target = tc.local_path(url, path)
-            if target and inside(canonical(target), path):
-                repo.remotes.pop(name)
-                if repo.dest == name:
-                    repo.dest = None
-        repo.load_live(include_tags=True)
-        if repo.unreachable:
-            raise ws.Keep('remote query incomplete: ' + ', '.join(sorted(repo.unreachable)))
-        if not repo.live:
-            raise ws.Keep('no independently recoverable remote')
-        item['remote_proofs'] = {ref: (repo.by_sha.get(sha) if ref.startswith('refs/tags/') else repo.proof(sha))
-                                 for ref, sha in item['objects'].items()}
-        missing = {ref: sha for ref, sha in item['objects'].items() if not item['remote_proofs'][ref]}
-        item['archive_objects'] = missing
-        item['urls'] = [pair[0] for pair in repo.remotes.values()]
-        if missing:
-            if not repo.dest:
-                raise ws.Keep('unpushed refs and no personal or internal remote')
-            url = ws.transport_url(repo.remotes[repo.dest][1])
-            if any('mono2' in s.lower() for s in [path, *item['urls']]) and ws.parse_remote(url)[0] == 'github.com':
-                raise ws.Keep('mono2 must never be archived to GitHub')
-            item['archive_url'] = url
-        item['action'] = 'archive+remove' if missing else 'remove'
+        with execution_step('remote_proof'):
+            item.update(recovery_state(path, item['objects']))
+        item['action'] = 'archive+remove' if item['archive_objects'] else 'remove'
     except Exception as exc:
         item['reason'] = str(exc) if isinstance(exc, ws.Keep) else 'check unknown: ' + ws.failure_text(exc)
     return item
@@ -2222,23 +2323,74 @@ def physical_parent(path):
         os.close(fd)
 
 
-def remove(item, inventory, anchors, refs):
+def clone_environment_anchors():
+    anchors = {}
+    for row in bb_environment_inventory():
+        if not row['protects'] or row.get('unmaterialized'):
+            continue
+        path = row.get('path')
+        if not path or not path.startswith('/'):
+            raise ws.ScanIncomplete('BB environment path unknown: ' + row['id'])
+        anchor(anchors, path, 'BB environment: ' + row['id'])
+    return anchors
+
+
+def verify_clone_recovery(item):
+    """A fresh server generation for this sink, including prior exact archives."""
+    LIVE.clear()
+    current = recovery_state(item['path'], item['objects'])
+    missing = current['archive_objects']
+    if missing:
+        expected = [a for a in item['archives'] if missing.get(a['source']) == a['sha']]
+        if set(missing) != {a['source'] for a in expected}:
+            raise ws.Keep('remote proof changed after plan')
+        verify_archives(item['path'], expected)
+        for archive in expected:
+            current['remote_proofs'][archive['source']] = archive['url'] + ':' + archive['ref']
+    item['remote_proofs'] = current['remote_proofs']
+    item['urls'] = current['urls']
+
+
+def remove(item, inventory, anchors, refs, *, live=False):
     path = item['path']
-    local = local_state(path, item['type'], inventory, anchors, refs)
+    if live:
+        with execution_step('remote_proof'):
+            verify_clone_recovery(item)
+        with execution_step('bb_environment'):
+            anchors = {**anchors, **clone_environment_anchors()}
+    with execution_step('local_state'):
+        local = local_state(path, item['type'], inventory, anchors, refs)
     for key in ('identity', 'objects', 'gitdir', 'main'):
         if local[key] != item[key]:
             raise ws.Keep(f'{key} changed after plan')
+    if live:
+        with execution_step('process_scan'):
+            processes = {}
+            environments = process_anchors(processes)
+            scope_directories(processes, getattr(environments, 'scopes', {}), {'trees': {path: item['type']}})
+            holder = ws.anchored(processes, path)
+            if holder:
+                raise ws.Keep(holder)
+    with execution_step('mount_scan'):
+        for mount in process_mounts():
+            if inside(mount, path):
+                raise ws.Keep('mounted path inside candidate: ' + mount)
+    checkpoint()
     with physical_parent(path) as (fd, name):
         current = os.stat(name, dir_fd=fd, follow_symlinks=False)
         if [current.st_dev, current.st_ino] != item['identity']:
             raise ws.Keep('directory identity changed')
+        # Opening ancestors and the final stat are IO too. A crossed deadline
+        # must stop before entering either destructive owner operation.
+        checkpoint()
         if item['type'] == 'linked':
             # Git refuses dirty/locked/submodule worktrees; never add --force.
             git(item['main'], 'worktree', 'remove', '--', path, timeout=600)
         else:
             if not shutil.rmtree.avoids_symlink_attacks:
                 raise ws.Keep('fd-based deletion unavailable')
-            shutil.rmtree(name, dir_fd=fd)
+            with execution_step('delete'):
+                shutil.rmtree(name, dir_fd=fd)
     item['result'] = 'removed'
 
 
@@ -2249,56 +2401,75 @@ def persist(path, value):
         os.fsync(handle.fileno())
 
 
+def verify_archives(path, archives, *, require_all=True):
+    groups = {}
+    for archive in archives:
+        groups.setdefault(archive['url'], []).append(archive)
+    verified = []
+    for url, entries in groups.items():
+        out = git(path, 'ls-remote', url, *(a['ref'] for a in entries)).stdout
+        observed = {ref: sha for sha, ref in (line.split() for line in out.splitlines())}
+        verified.extend(a for a in entries if observed.get(a['ref']) == a['sha'])
+    if require_all and len(verified) != len(archives):
+        raise ws.Keep('archive SHA verification failed')
+    return verified
+
+
 def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
-    prepared = []
+    global DEADLINE
+    round_deadline = DEADLINE
     for row in rows:
         if row['action'] == 'keep':
             continue
+        started = time.monotonic()
+        DEADLINE = min(round_deadline, started + CLONE_RECHECK_SECONDS)
+        EXECUTION.row = row
+        row['execution_started_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        row['global_inventory_at'] = inventory.get('snapshot_at')
+        persist(log, dict(row, event='candidate_started'))
         try:
             if row.get('bytes') is None:
                 raise ws.Keep('size measurement incomplete')
-            current_anchors, unknown = usage(inventory, refs)
-            if global_unknown(unknown):
-                raise ws.Keep('unresolved global config references: ' + '; '.join(global_unknown(unknown)))
-            LIVE.clear()  # New remote-proof generation for this execution preparation.
-            fresh = plan(row['path'], row['type'], inventory, current_anchors, refs)
+            LIVE.clear()
+            fresh = plan(row['path'], row['type'], inventory, anchors, refs)
             if fresh['action'] == 'keep':
                 raise ws.Keep(fresh['reason'])
             if fresh['objects'] != row['objects'] or fresh['identity'] != row['identity']:
                 raise ws.Keep('local evidence changed')
+            archives = []
             for source, sha in fresh['archive_objects'].items():
                 prefix = 'refs/tags' if source.startswith('refs/tags/') else 'refs/heads'
                 ref = f'{prefix}/archive/git-tree/{ws.archive_slug(row["path"])}-{stamp}/' + re.sub(r'[^A-Za-z0-9-]', '-', source)
                 url = fresh['archive_url']
-                # Exact objects only: deliberately bypass the old squash fallback.
-                git(row['path'], 'push', url, f'{sha}:{ref}', timeout=900)
-                proof = git(row['path'], 'ls-remote', url, ref).stdout.split()
-                if not proof or proof[0] != sha:
-                    raise ws.Keep('archive SHA verification failed')
-                row['archives'].append({'source': source, 'url': url, 'ref': ref, 'sha': sha})
-                persist(log, dict(row, event='archive_verified'))
-            prepared.append(row)
-        except Exception as exc:
-            row.update(result='kept', reason=ws.failure_text(exc))
-            persist(log, row)
-    # All remote IO has finished. Rewalk the disks and refresh EVERY consumer.
-    if not prepared:
-        return
-    for row in prepared:
-        try:
-            # Each sink gets its own complete generation. Another consumer or
-            # linked worktree may appear after the preceding sink.
-            fresh_inventory = discover(roots, excluded)
-            if fresh_inventory['errors']:
-                raise ws.Keep('final inventory incomplete: ' + '; '.join(fresh_inventory['errors']))
-            final_refs = references(fresh_inventory)
-            current_anchors, unknown = usage(fresh_inventory, final_refs)
-            if global_unknown(unknown):
-                raise ws.Keep('unresolved global config references: ' + '; '.join(global_unknown(unknown)))
+                archives.append({'source': source, 'url': url, 'ref': ref, 'sha': sha})
+            if archives:
+                persist(log, dict(row, event='archive_intent', requested_archives=archives))
+                with execution_step('archive'):
+                    # One push preserves all original objects; no squash or force.
+                    push_error = None
+                    try:
+                        pushed = git(row['path'], 'push', fresh['archive_url'], *(f'{a["sha"]}:{a["ref"]}' for a in archives), timeout=900, check=False)
+                        if pushed.returncode:
+                            push_error = ws.failure_text(pushed.stderr or pushed.stdout)
+                    except Exception as exc:
+                        push_error = ws.failure_text(exc)
+                    verified = verify_archives(row['path'], archives, require_all=False)
+                    row['archives'].extend(verified)
+                    if verified:
+                        persist(log, dict(row, event='archive_verified'))
+                    if push_error:
+                        raise ws.Keep('archive push failed: ' + push_error)
+                    if len(verified) != len(archives):
+                        raise ws.Keep('archive SHA verification failed')
             persist(log, dict(row, event='remove_intent'))
-            remove(row, fresh_inventory, current_anchors, final_refs)
+            remove(row, inventory, anchors, refs, live=True)
         except Exception as exc:
-            row.update(result='kept', reason=ws.failure_text(exc))
+            timed_out = time.monotonic() >= DEADLINE and DEADLINE < round_deadline
+            row.update(result='kept', reason=('clone live-check exceeded 10s; retry next round: ' if timed_out else '') + ws.failure_text(exc))
+        finally:
+            row.setdefault('execution_timings', {})['total'] = round(time.monotonic() - started, 6)
+            DEADLINE = round_deadline
+            EXECUTION.row = None
         persist(log, row)
 
 
@@ -2333,6 +2504,7 @@ def bb_environment_classify(env, threads, now=None):
     path = env.get('path') or ((env.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path')
     row = dict(id=env['id'], path=path, host_id=env.get('hostId'),
                provider=env.get('environmentProviderId'), managed=env.get('managed') is True,
+               unmaterialized=not path and env.get('status') == 'error' and not env.get('environmentProviderInstanceKey'),
                abandoned=False, protects=True, thread_ids=[t['id'] for t in threads])
     if env.get('status') == 'destroyed' or (env.get('lifecycle') or {}).get('phase') == 'destroyed':
         return dict(row, protects=False, reason='environment destroyed')
@@ -2884,10 +3056,11 @@ def main(argv=None):
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--reviewed-preview', help='First execution batch: stop before archive/removal if new candidates appear.')
     parser.add_argument('--json', action='store_true')
-    parser.add_argument('--budget-minutes', type=float, default=45)
+    parser.add_argument('--budget-minutes', type=float, default=30)
     parser.add_argument('--state-dir', default=os.path.expanduser('~/.local/state/devcloud-storage-upkeep'))
     args = parser.parse_args(argv)
     started = time.monotonic()
+    started_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     LIVE.clear()
     DEADLINE = started + args.budget_minutes * 60
     stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
@@ -2913,31 +3086,65 @@ def main(argv=None):
         timings = {'discovery_seconds': round(time.monotonic() - started, 3)}
         persist(log, {'event': 'discovered', 'seconds': timings['discovery_seconds'],
                       'trees': len(inventory['trees']), 'directories': inventory['directories'], 'errors': inventory['errors']})
-        anchors, refs, unknown = {}, {}, []
+        global_inventory = {'started_at': started_at,
+                            'discovered_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'scope': 'round'}
+        paths = sorted(path for path, kind in inventory['trees'].items() if kind != 'linked')
+        # Capture processes before starting our own du workers: their argv/fds
+        # must not become long-lived business anchors in this round snapshot.
+        process_started = time.monotonic()
+        process_error, process_snapshot = None, None
         try:
-            if inventory['errors']:
-                raise ws.ScanIncomplete('; '.join(inventory['errors'][:10]))
-            refs = references(inventory)
-            anchors, unknown = usage(inventory, refs)
+            process_points = {}
+            process_snapshot = (process_points, process_anchors(process_points))
         except Exception as exc:
-            error = 'usage/reference inventory incomplete: ' + ws.failure_text(exc)
-        if global_unknown(unknown):
-            error = 'unresolved global config references: ' + '; '.join(global_unknown(unknown))
-        timings['inventory_seconds'] = round(time.monotonic() - started, 3)
-        persist(log, {'event': 'references_checked', 'seconds': timings['inventory_seconds'], 'error': error})
-        with cf.ThreadPoolExecutor(8) as pool:
-            rows = list(pool.map(lambda p: plan(p, inventory['trees'][p], inventory, anchors, refs, error), sorted(path for path, kind in inventory['trees'].items() if kind != 'linked')))
-        timings['plan_seconds'] = round(time.monotonic() - started, 3)
-        persist(log, {'event': 'planned', 'seconds': timings['plan_seconds'], 'summary': summarize(rows)})
-        # Measurement is bounded too; failures remain null, never zero.
-        def measure(row):
+            process_error = ws.failure_text(exc)
+        timings['process_snapshot_seconds'] = round(time.monotonic() - process_started, 3)
+        global_inventory['processes_checked_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+        measurement_started = time.monotonic()
+        def measure(path):
             try:
-                out = command(['du', '-sx', '-B1', '--', row['path']], timeout=180, check=False)
-                row['bytes'] = int(out.stdout.split()[0]) if out.returncode == 0 else None
+                out = command(['du', '-sx', '-B1', '--', path], timeout=180, check=False)
+                size = int(out.stdout.split()[0]) if out.returncode == 0 else None
             except Exception:
-                row['bytes'] = None
-        with cf.ThreadPoolExecutor(8) as pool:
-            list(pool.map(measure, rows))
+                size = None
+            return size, time.monotonic()
+        # du does not depend on reference/config parsing or on the plan. Its
+        # bounded workers overlap that work; all results join before execution.
+        with cf.ThreadPoolExecutor(8) as measurements:
+            sizes = {path: measurements.submit(measure, path) for path in paths}
+            anchors, refs, unknown = {}, {}, []
+            try:
+                if inventory['errors']:
+                    raise ws.ScanIncomplete('; '.join(inventory['errors'][:10]))
+                if process_error:
+                    raise ws.ScanIncomplete('process snapshot incomplete: ' + process_error)
+                phase_started = time.monotonic()
+                refs = references(inventory)
+                timings['references_seconds'] = round(time.monotonic() - phase_started, 3)
+                phase_started = time.monotonic()
+                anchors, unknown = usage(inventory, refs, process_snapshot=process_snapshot)
+                timings['usage_seconds'] = round(time.monotonic() - phase_started, 3)
+            except Exception as exc:
+                error = 'usage/reference inventory incomplete: ' + ws.failure_text(exc)
+            if global_unknown(unknown):
+                error = 'unresolved global config references: ' + '; '.join(global_unknown(unknown))
+            global_inventory['references_checked_at'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+            inventory['snapshot_at'] = global_inventory['references_checked_at']
+            timings['inventory_seconds'] = round(time.monotonic() - started, 3)
+            persist(log, {'event': 'references_checked', 'seconds': timings['inventory_seconds'], 'error': error,
+                          'global_inventory': global_inventory})
+            phase_started = time.monotonic()
+            with cf.ThreadPoolExecutor(8) as pool:
+                rows = list(pool.map(lambda path: plan(path, inventory['trees'][path], inventory, anchors, refs, error), paths))
+            timings['planning_seconds'] = round(time.monotonic() - phase_started, 3)
+            timings['plan_seconds'] = round(time.monotonic() - started, 3)
+            persist(log, {'event': 'planned', 'seconds': timings['plan_seconds'], 'summary': summarize(rows)})
+            wait_started = time.monotonic()
+            measured = {path: future.result() for path, future in sizes.items()}
+            for row in rows:
+                row['bytes'] = measured[row['path']][0]
+            timings['measurement_wait_seconds'] = round(time.monotonic() - wait_started, 3)
+            timings['measurement_seconds'] = round(max((finished for _, finished in measured.values()), default=measurement_started) - measurement_started, 3)
         comparison = None
         if args.reviewed_preview:
             try:
@@ -2947,12 +3154,15 @@ def main(argv=None):
                     error = 'new candidates outside reviewed preview; no archive or removal performed'
             except Exception as exc:
                 error = 'reviewed preview unknown: ' + ws.failure_text(exc)
+        phase_started = time.monotonic()
         if args.execute and not error:
             execute(rows, inventory, anchors, refs, roots, excluded, stamp, log)
+        timings['execution_seconds'] = round(time.monotonic() - phase_started, 3)
         if time.monotonic() >= DEADLINE:
             error = error or 'time budget reached; partial plan retained'
         report = {'schema_version': 2, 'policy': 'clones', 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run', 'bb_cli': os.environ.get('BB_CLI'),
                   'roots': roots, 'complete': not bool(error or inventory['errors']), 'error': error,
+                  'global_inventory': global_inventory,
                   'unresolved': unknown, 'global_unresolved': global_unknown(unknown),
                   'reviewed_comparison': comparison,
                   'discovery': {k: v for k, v in inventory.items() if k not in ('trees', 'links', 'remote_urls')},
