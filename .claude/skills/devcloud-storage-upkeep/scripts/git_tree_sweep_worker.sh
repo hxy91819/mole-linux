@@ -4,9 +4,9 @@ set -uo pipefail
 git_sweep_python=$1
 shift
 git_sweep_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-git_sweep_clone_budget=45
+git_sweep_clone_budget=30
 if [[ $# -eq 1 && "$1" == --execute ]]; then
-    git_sweep_clone_budget=150
+    git_sweep_clone_budget=30
 elif [[ $# -ne 0 ]]; then
     echo 'Usage: git_tree_sweep_worker.sh PYTHON [--execute]' >&2
     exit 2

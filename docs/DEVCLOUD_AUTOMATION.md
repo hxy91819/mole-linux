@@ -5,7 +5,7 @@
 设计原因和踩坑记录见 [DEVCLOUD_STORAGE_DESIGN](DEVCLOUD_STORAGE_DESIGN.md)；
 逐目标能不能清的规则见
 [storage-rules](../.claude/skills/devcloud-patrol/references/storage-rules.md)。
-任务现状以 `bb automation list` / `bb automation show` 为准，本文是撰写时快照（Git 部分更新于 2026-11-18）。
+任务现状以 `bb automation list` / `bb automation show` 为准，本文是撰写时快照（Git 部分更新于 2026-11-19）。
 
 ## 1. 现行任务
 
@@ -100,7 +100,7 @@ export PATH=/root/.nvm/versions/node/v24.22.1/bin:/root/.nvm/versions/node/v24.1
 在 `/var/tmp` 或 `/data` 下解析会得到不同的 store。拿到共同根 `/data/.pnpm-store` 后，
 逐版本工具从中立目录运行并显式传 `--store-dir /data/.pnpm-store`，不能把 `vN` 目录当根。
 
-脚本任务超时：Docker/Go 600 秒，pnpm 900 秒。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 先给BB环境回收5分钟，再给 linked 15分钟，再给独立 clone 预演45分钟/执行150分钟，systemd 整体硬限分别68分钟/173分钟。预算按两条路径实测分别设置，不缩小发现范围。`--quiet` 只表示“没有实际
+脚本任务超时：Docker/Go 600 秒，pnpm 900 秒。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 先给BB环境回收5分钟，再给 linked 15分钟，再给独立 clone 预演/执行各30分钟，systemd 整体硬限均53分钟。预算按两条路径实测分别设置，不缩小发现范围。`--quiet` 只表示“没有实际
 清理且命令没有失败时保持安静”，BB 把它记为 `skipped`；`skipped` 不是失败。
 
 每日检查是 agent 任务，不是脚本任务：
@@ -121,9 +121,9 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 ## 2. 不可变快照与发布
 
 仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`，仅含
-当前七脚本快照为 `/data/tools/devcloud-storage-upkeep/releases/b70f81e79242476d/`，包含
+当前正式七脚本性能快照为 `/data/tools/devcloud-storage-upkeep/releases/3c35f7ad513b5140/`，包含
 `git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、`git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 七个脚本和 `manifest.json`。
-旧 `9217bf8ab4fc6204` 是六脚本历史快照，缺少 CLI binder，不用于当前部署。
+旧 `9217bf8ab4fc6204` 是六脚本历史快照，缺少 CLI binder；上一正式版为 `b70f81e79242476d`（clone预算150m）。线上切换以本轮验证与 `bb automation show` 回读为准。
 launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境，再运行linked登记路径和独立clone全盘路径；cwd=/，BB只负责120秒内启动。其他维护任务继续使用各自已有快照。
 
 1. 7脚本各记sha256，manifest稳定JSON+换行，目录名取manifest哈希前16位，文件0444/目录0555。两个Python入口与launcher的help均验证成功且无pycache。
@@ -132,7 +132,7 @@ launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境�
 4. 部署保存脚本 `bash <snap>/git_tree_sweep_run.sh --execute`，读回enabled、cron=30 6 * * *、Asia/Shanghai、timeout=120000及命令快照。launcher只接受无参数或--execute；手动绑定预演使用上面各自Python入口。
 5. 旧tmp任务auto_3jiqtmzreq8保持disabled+noop，不恢复或手动触发；每日检查prompt同步读回。其余维护任务不跟随更换快照。
 6. linked只按最新Git登记五条件、24h和Git remove/no-force判断，网络后立即复核BB/cwd/登记/HEAD/age/clean；实际Git状态文件计活动，不让管理目录的临时锁mtime刷活。Git prune按显式命令清失效登记，锁定登记仍保留。单主仓无法读登记只保留并报告该主仓，不扩大成全局阻断；BB/cwd整体读取未知则该阶段不执行。
-7. BB环境回收预算5m；linked预算15m；clone预算预演45m/执行150m；同一worker整体硬限预演68m/执行173m。一阶段失败仍尝试另一阶段并最终非零。06:30执行最迟09:23，07:30可为clone记pending，linked必须已有完整结果；同时检查上一轮已结束结果。
+7. BB环境回收预算5m；linked预算15m；clone预算预演/执行各30m；同一worker整体硬限均53m。一阶段失败仍尝试另一阶段并最终非零。06:30执行最迟07:23，07:30应已结束，linked必须已有完整结果；同时检查上一轮已结束结果。
 8. 环境阶段另写bb-environment-sweep-<UTC>.json(l)（schema1/policy=bb-environments）；两条Git路径分别写linked-worktree-sweep-<UTC>.json(l)（schema3/policy=linked）和git-tree-sweep-<UTC>.json(l)（schema2/policy=clones）。逐路径删除/保留/原SHA归档与Git拒绝原因、prune输出、目录原du及两盘可用容量变化分列。人工单独linked验证不算首次完整schedule。
 
 只读复现（命令不带路径筛选参数）：
@@ -141,9 +141,9 @@ launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境�
 (
   BB_CLI="$(/usr/bin/python3 -I <git-snap>/git_tree_sweep_bb_cli.py)" || exit 1
   export BB_CLI
-  python3 -I <git-snap>/git_tree_sweep.py --budget-minutes 45 --json
+  python3 -I <git-snap>/git_tree_sweep.py --budget-minutes 30 --json
 )
-# 定时等价：bash <git-snap>/git_tree_sweep_run.sh；linked→clone，环境→linked→clone，预演整体硬限68分钟
+# 定时等价：bash <git-snap>/git_tree_sweep_run.sh；环境→linked→clone，预演/执行整体硬限53分钟
 python3 -m pytest tests/test_git_tree_sweep.py tests/test_devcloud_storage_upkeep.py -q
 bb automation show auto_hukidoavox0 --project proj_8d3wrcajxn --json
 bb automation show auto_3jiqtmzreq8 --project proj_8d3wrcajxn --json
@@ -167,7 +167,7 @@ idle_hours、objects、remote_proofs、archive_objects；archive+remove 尚未�
 131候选（122 remove、9 archive+remove）；逐路径实占合计13.618 GiB，不是实际释放量。最终明细和逐条保护范围见线程审核包：
 `/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/scoped-rework/REPORT.md`。人工预演不算首次schedule运行。
 
-`bb automation` 的 succeeded 仅表示 worker 启动成功；实际成功以最新 JSON 报告和 JSONL 完整阶段为准。每日07:30读取两条路径的报告：linked 应已结束；全轮预演硬截止为07:38，执行整体硬截止为09:23（均以06:30启动计）。clone 仍在自身预算内运行时记 pending。核对本轮JSONL start时间与mode，预算内仍运行记pending并明确尚无完成结论，不能拿前一轮报告冒充本轮成功，同时核对上一轮已结束的完整报告及失败项，防止每天pending掩盖上一轮失败；超限或停止后无完整报告算失败。`systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result` 可查在途状态；collect 后 unit not-found 属正常，仍必须有当日完整报告。
+`bb automation` 的 succeeded 仅表示 worker 启动成功；实际成功以最新 JSON 报告和 JSONL 完整阶段为准。每日07:30读取两条路径的报告：linked 应已结束；全轮预演/执行硬截止均为07:23（均以06:30启动计）。clone 仍在自身预算内运行时记 pending。核对本轮JSONL start时间与mode，预算内仍运行记pending并明确尚无完成结论，不能拿前一轮报告冒充本轮成功，同时核对上一轮已结束的完整报告及失败项，防止每天pending掩盖上一轮失败；超限或停止后无完整报告算失败。`systemctl show devcloud-git-tree-sweep.service -p ActiveState -p Result` 可查在途状态；collect 后 unit not-found 属正常，仍必须有当日完整报告。
 
 linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` 后
 `git worktree add <path> <sha>`；独立 clone 用记录 URL clone 后恢复每个 branch/tag。
@@ -381,3 +381,19 @@ MainPID回退的host-daemon入口是env-node脚本；binder的command_for为探�
 第二轮审查补充：旧PATH回归现经过三条真实stage main及clone的ws.bb_anchors共享runner，只替换宿主磁盘发现和外部BB响应；三份隔离报告均完整。手动示例在扫描之前检查binder退出码，失败不启动Python。
 
 2026-11-19 CLI修复最终实测：正式快照b70f81e79242476d（7脚本）已部署06:30/AsiaShanghai/--execute/timeout120s，旧tmp disabled+noop、每日prompt回读一致。真实BB script人工run arun_3efzqydrbty通过临时预算快照13f015132208a4ba启动，随即恢复正式任务。三阶段complete=true/error=null，CLI均/root/.bb/bin/bb且0.49.0；耗时环境2.274s、linked237.994s、clone8197.665s（136m38s，仍在日常150m内），worker成功退出，BB服务未重启。53个有路径遗弃环境解除证据，provider实际回收0；另2未物化无路径记录不计目录回收。删除33树（1linked+32clone），18归档ref/14原SHA独立核验，17linked按Git/远端拒绝保留，1115主仓prune成功。删除前du9.714GiB；clone按目标盘删除窗口净增/data9.494GiB、/0.132GiB，全程净变化/data2.085GiB、/0.391GiB，含同期活动不当因果释放量。891全量回归通过，补强29项再过，2轮readonly review共5项P1闭合，工作区留owner提交。完整清单/快照/证据=/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/bb-cli-binding-20261119/REPORT.md。下一次schedule仍待11月20日06:30验证。
+
+### 2026-11-19：clone执行性能与本轮快照
+
+按owner明确选择，完整全盘引用库存在本轮复用。报告global_inventory.started_at/discovered_at/references_checked_at记录UTC，执行candidate_started及每行global_inventory_at绑定该轮；新建但不活跃的全局consumer下轮发现。每个sink实时检查cwd/fd/argv（源clone在--shared/--reference操作数里也保留）、status/untracked/stash/锁、该树所有refs/HEAD的实时远端或原SHA归档证明、BB环境。原exe/maps/进程环境、7天/凭据与物理身份保护继续保留。未知或单树复核超过10秒保留并记录，下一轮重试。
+
+每树execution_timings是组件墙钟秒数，execution_subprocess_seconds是其内的子命令时间，二者不能重复求和；total是整项耗时。全局timings增加references_seconds、usage_seconds、planning_seconds、measurement_seconds、measurement_wait_seconds、execution_seconds。旧plan_seconds仍是从阶段开始到计划完成的累计值。du与全局引用/配置/计划并发，measurement_seconds因此和其他阶段重叠，只把execution_seconds作为本次执行循环耗时。
+
+clone预演/执行预算均30分钟，worker仍先环境5分钟、linked15分钟，整体硬限53分钟；06:30轮最迟07:23，07:30检查应见完整结果。旧45/150与68/173为上述历史执行的预算，后续任务按本节。仅更新Git快照与其任务，不更换其他维护任务。发布、分项计时、全量预演和执行实测结果在本轮报告中补齐。
+
+性能审查修正：全局进程快照必须先于du启动，usage复用该快照；否则du的argv/fd会误护自己正在计量的树。最终sink实时核mountinfo并拒绝根/后代挂载（同设备bind也一样），身份stat后再查截止时间。10秒限制删前复核，递归删除已开始则完成并单列delete耗时，不中途取消。shell argv用保留引用的操作符词法拆分，紧邻分号/管道/重定向的源路径与带引号标点路径均覆盖。
+
+复审补强：mountinfo按ASCII空格/换行解析，保留路径中的NBSP等特殊空白；shell argv同时识别-lc/-xc等命令选项组合，保持argv唯一引用也会保护。生产快照必须包含这两项修复，99470bff9a1e5bda仅为二审前的历史准备版。
+
+2026-11-19性能最终实测：943项回归通过，两轮只读审查的6项发现均修复。完整两盘预演604.474秒，执行556.413秒（9分16秒），均complete=true/error=null；执行循环106.365秒，32棵任务自有基准clone全部删除，平均3.319秒/棵、最慢4.164秒，归档/失败0，业务新增候选0，reviewed_comparison.added=[]。基准每棵100个tracked文件，8棵另有2500个ignored文件；此批与旧32棵业务仓库的文件量不同，不将两批总时间直接当作同负载加速比。同条件两样本旧218.858/530.170秒→新3.808/3.743秒，瓶颈为重复全盘发现和全局usage；本轮32棵的实时进程合计57.551秒、BB环境41.543秒、远端1.287秒、实际删除1.231秒。全局库存UTC开始06:57:06、发现07:00:08、引用完成07:01:07；轮内复用，逐树实时核查照常。
+
+正式任务auto_hukidoavox0已回读：3c35快照、enabled、06:30/AsiaShanghai、--execute、120秒launcher；worker5/15/30分钟、硬限53分钟，每日prompt一致，旧tmp任务disabled+noop。人工本轮仅验证完整clone阶段，不冒充三阶段schedule；下一次定时验证为11月20日06:30。任务自有基准根及测试夹具已清理；未部署的8197/9947准备快照删除，补丁与审查日志保留。完整逐树耗时、容量净变与复现证据：`/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/clone-performance-20261119/REPORT.md`。改动留工作区，由owner提交。

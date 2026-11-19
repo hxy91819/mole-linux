@@ -2,18 +2,18 @@
 # Start the bounded host worker; BB script runs have a hard 900-second limit.
 set -euo pipefail
 if [[ "${1:-}" == "--help" ]]; then
-    echo 'Start BB environment sweep (5m), linked sweep (15m), clone sweep (45m preview / 150m execute); hard limit 68m / 173m. Manual reviewed previews use each Python entry separately.'
+    echo 'Start BB environment sweep (5m), linked sweep (15m), clone sweep (30m preview / 30m execute); hard limit 53m / 53m. Manual reviewed previews use each Python entry separately.'
     exit 0
 fi
 git_sweep_mode=dry-run
-git_sweep_hard_seconds=4080
+git_sweep_hard_seconds=3180
 if [[ $# -ne 0 ]]; then
     if [[ "${1:-}" != --execute ]] || [[ $# -ne 1 ]]; then
         echo 'Usage: git_tree_sweep_run.sh [--execute]' >&2
         exit 2
     fi
     git_sweep_mode=execute
-    git_sweep_hard_seconds=10380
+    git_sweep_hard_seconds=3180
 fi
 git_sweep_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 git_sweep_unit=devcloud-git-tree-sweep.service

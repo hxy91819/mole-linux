@@ -62,7 +62,7 @@ python3 -I <本技能根>/scripts/pnpm_store_prune.py             # 当前 store
 ```
 
 - BB环境先按storage-rules的遗弃规则处理：有未归档线程始终保留；全部归档/无线程且24h以上闲置的provider-owned环境用BB cleanup回收，路径型或BB拒绝时解除环境证据，再由原Git规则判定；异步回收只在show为destroyed后报完成，不直接改BB数据。
-- Git分工以storage-rules最新方向为准：linked只查Git登记、locked、未销毁BB环境、进程cwd、当前分支的远端/原SHA归档及24小时活动，移除/prune交Git，不加force；不走名称/项目兜底/嵌套/alternates等clone规则。独立clone保留完整全盘发现、7天和所有原保护。先预演，再按已有授权执行；每日launcher先环境回收，再linked和clone，linked无需等待另一次全盘扫描。
+- Git分工以storage-rules最新方向为准：linked只查Git登记、locked、未销毁BB环境、进程cwd、当前分支的远端/原SHA归档及24小时活动，移除/prune交Git，不加force；不走名称/项目兜底/嵌套/alternates等clone规则。独立clone保持完整全盘发现、7天和保护判据；全局引用库存在本轮复用，逐树实时核cwd/fd/argv、Git状态/锁/stash、远端证明与BB环境。轮内新增但不活跃的消费者下轮发现；报告记库存UTC与逐项耗时。clone预演/执行各30分钟，单树10秒超时保留。先预演，再按已有授权执行；每日launcher先环境回收，再linked和clone，linked无需等待另一次全盘扫描。
 - 删 worktree 之后再跑一次 `docker_leftovers.py --execute`，只清没人用的 Docker 残留。pnpm 在本项目目录用 `pnpm store path` 取得当前版本路径及共同根，再逐个存在版本调用 `--store-dir <共同根> store prune`；实测选择 pnpm 9→v3、10→v10、12→v11，当前版本匹配用现有 pnpm，否则通过 `npx --yes pnpm@<major>` 获取。先核 major 与显式根下的 store path 精确匹配，不可得或未知版本则跳过记原因；不能用当前 pnpm 去冒充旧格式。仅可能写 store 的 pnpm 子命令阻塞（含 ci/install-test、create/pipeline、pnpx/pnx 及别名；recursive/multi/m/pm 按内层命令判断，消费 pnpm/Node 前置选项与 `--`），npm/npx/yarn/Vite 及 pnpm run/exec/start/脚本不阻塞；`/proc` unknown 仍跳过。默认预演，执行在命令边界再查一次进程，JSONL 逐版本记录前后占用；真实 prune 失败记账并继续其余版本，最终非零。预演不能推算 pnpm 未引用对象大小，不把整个 store 大小报成可回收量。逐个目录 `du` 的合计会明显大于实际能腾出的空间，回收量以执行前后的 `df` 为准。
 - 保留下来的项都写有原因：`in use`、Git 的 `active within 7d (168h)` 等后续自然会处理；`unpushed work and no personal or internal remote` 和 `archive would push risky files` 需要 owner 决定推到哪里，或手动处理那个文件。
 
