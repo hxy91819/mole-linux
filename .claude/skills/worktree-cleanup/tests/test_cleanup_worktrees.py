@@ -157,8 +157,10 @@ else:
             text=True,
         )
 
-    def audit(self) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
-        result = self.run_helper("--dry-run", "--json")
+    def audit(
+        self, *extra_args: str
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, object]]:
+        result = self.run_helper("--dry-run", "--json", *extra_args)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result, json.loads(result.stdout)
 
@@ -208,17 +210,28 @@ else:
         self.assertEqual(applied["worktree_count_before"], 2)
         self.assertEqual(applied["worktree_count_after"], 1)
         self.assertFalse(self.worktree.exists())
-        backup_root = Path(applied["backup_root"])
+        archive_root = Path(applied["archive_root"])
+        self.assertEqual(archive_root, self.repo / ".local" / "worktree-archive")
+        entry = next(e for e in applied["entries"] if e["action"] == "removed")
+        archive_dir = Path(entry["backup_path"])
+        self.assertEqual(archive_dir.parent, archive_root)
+        self.assertRegex(archive_dir.name, r"^task-123-\d{8}T\d{6}Z$")
         self.assertEqual(
-            (backup_root / "task-123" / ".local" / "notes.txt").read_text(
-                encoding="utf-8"
-            ),
+            (archive_dir / ".local" / "notes.txt").read_text(encoding="utf-8"),
             "restore me\n",
         )
-        self.assertFalse((backup_root / "task-123" / ".env").exists())
+        self.assertFalse((archive_dir / ".local" / ".env").exists())
+        self.assertEqual(entry["preservation"]["status"], "archive")
+        self.assertEqual(
+            entry["preservation"]["moved_to"], str(archive_dir / ".local")
+        )
+        metadata = json.loads(
+            (archive_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertTrue(metadata["content_preserved"])
+        self.assertEqual(metadata["source_local_dir"], str(self.worktree / ".local"))
         branches = self.run_git("branch", "--format=%(refname:short)").stdout.splitlines()
         self.assertNotIn("task-123", branches)
-        entry = next(e for e in applied["entries"] if e["action"] == "removed")
         self.assertTrue(entry["branch_deletion"]["deleted"])
         self.assertIn("worktree-removal-proof", entry["branch_deletion"]["proof"])
 
@@ -409,9 +422,156 @@ else:
             CLEANUP_WORKTREES.print_text(report)
 
         rendered = output.getvalue()
-        self.assertIn("local_backup: yes", rendered)
+        self.assertIn("archive_root:", rendered)
+        self.assertIn("local_preservation: archive", rendered)
+        self.assertIn("local_archive_destination:", rendered)
+        self.assertIn("preserved: notes.txt", rendered)
         self.assertIn("ignored_roots_deleted_count: 51", rendered)
         self.assertIn("ignored_roots_deleted_sample_truncated: yes", rendered)
+
+    def test_worktree_without_local_is_removed_without_an_archive(self) -> None:
+        _, report = self.audit()
+        entry = report["entries"][0]
+
+        self.assertEqual(entry["preservation"]["status"], "none")
+        self.assertIsNone(entry["preservation"]["destination"])
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["removed"], 1)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse((self.repo / ".local" / "worktree-archive").exists())
+
+    def test_empty_local_directory_is_not_archived(self) -> None:
+        (self.worktree / ".local").mkdir()
+        _, report = self.audit()
+        entry = report["entries"][0]
+
+        self.assertEqual(entry["preservation"]["status"], "none")
+        self.assertEqual(entry["preservation"]["entry_count"], 0)
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["removed"], 1)
+        self.assertFalse(self.worktree.exists())
+        self.assertFalse((self.repo / ".local" / "worktree-archive").exists())
+
+    def test_primary_checkout_without_ignored_local_keeps_worktree(self) -> None:
+        local_dir = self.worktree / ".local"
+        local_dir.mkdir()
+        (local_dir / "RESULT.md").write_text("evidence\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text(".env\nignored-*/\n", encoding="utf-8")
+        self.run_git("add", ".gitignore")
+        self.run_git("commit", "-m", "stop ignoring local")
+
+        _, report = self.audit()
+        entry = report["entries"][0]
+
+        self.assertEqual(entry["action"], "skip")
+        self.assertEqual(entry["preservation"]["status"], "blocked")
+        self.assertIn("not gitignored", entry["skip_reason"])
+        self.assertIsNone(entry["approval_token"])
+        self.assertTrue((local_dir / "RESULT.md").exists())
+        self.assertFalse((self.repo / ".local" / "worktree-archive").exists())
+
+    def test_oversized_local_file_is_listed_and_not_moved(self) -> None:
+        local_dir = self.worktree / ".local"
+        local_dir.mkdir()
+        (local_dir / "RESULT.md").write_text("keep me\n", encoding="utf-8")
+        (local_dir / "trace.bin").write_bytes(b"x" * 4096)
+        limit_args = ("--max-local-file-mb", "0.001")
+
+        _, report = self.audit(*limit_args)
+        entry = report["entries"][0]
+        preservation = entry["preservation"]
+
+        self.assertEqual(preservation["status"], "oversized")
+        listed = {item["path"] for item in preservation["oversized_files"]}
+        self.assertIn("trace.bin", listed)
+        self.assertNotIn("RESULT.md", listed)
+        self.assertTrue(
+            any("largest file" in reason for reason in preservation["oversized_reasons"])
+        )
+        self.assertIn("trace.bin", {item["path"] for item in preservation["files"]})
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper(
+            "--apply", "--approve", token, "--json", *limit_args
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["removed"], 1)
+        self.assertFalse(self.worktree.exists())
+        applied_entry = next(
+            item for item in applied["entries"] if item["action"] == "removed"
+        )
+        archive_dir = Path(applied_entry["backup_path"])
+        self.assertRegex(archive_dir.name, r"^task-123-\d{8}T\d{6}Z$")
+        self.assertFalse((archive_dir / ".local").exists())
+        metadata = json.loads(
+            (archive_dir / "metadata.json").read_text(encoding="utf-8")
+        )
+        self.assertFalse(metadata["content_preserved"])
+        self.assertEqual(metadata["preservation"]["status"], "oversized")
+
+    def test_oversized_local_total_is_listed_and_not_moved(self) -> None:
+        local_dir = self.worktree / ".local"
+        local_dir.mkdir()
+        (local_dir / "a.bin").write_bytes(b"a" * 700)
+        (local_dir / "b.bin").write_bytes(b"b" * 700)
+        limit_args = ("--max-local-total-mb", "0.001")
+
+        _, report = self.audit(*limit_args)
+        entry = report["entries"][0]
+        preservation = entry["preservation"]
+
+        self.assertEqual(preservation["status"], "oversized")
+        self.assertTrue(
+            any("total size" in reason for reason in preservation["oversized_reasons"])
+        )
+        listed = {item["path"] for item in preservation["oversized_files"]}
+        self.assertEqual(listed, {"a.bin", "b.bin"})
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper(
+            "--apply", "--approve", token, "--json", *limit_args
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["removed"], 1)
+        self.assertFalse(self.worktree.exists())
+        applied_entry = next(
+            item for item in applied["entries"] if item["action"] == "removed"
+        )
+        archive_dir = Path(applied_entry["backup_path"])
+        self.assertFalse((archive_dir / ".local").exists())
+        self.assertTrue((archive_dir / "metadata.json").exists())
+
+    def test_preservation_limit_change_invalidates_approval(self) -> None:
+        local_dir = self.worktree / ".local"
+        local_dir.mkdir()
+        (local_dir / "trace.bin").write_bytes(b"x" * 4096)
+        _, report = self.audit()
+        token = self.approval_for(report, self.worktree)
+
+        result = self.run_helper(
+            "--apply",
+            "--approve",
+            token,
+            "--json",
+            "--max-local-file-mb",
+            "0.001",
+        )
+
+        self.assertEqual(result.returncode, 1)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["rejected_approvals"], [token[:12]])
+        self.assertEqual(applied["removed"], 0)
+        self.assertTrue(self.worktree.exists())
+        self.assertFalse((self.repo / ".local" / "worktree-archive").exists())
 
     def test_worktree_removal_does_not_probe_git_wrapper(self) -> None:
         _, report = self.audit()

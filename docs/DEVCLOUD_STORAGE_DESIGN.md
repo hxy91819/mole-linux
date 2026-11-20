@@ -395,6 +395,7 @@ BB script 的 timeout 最大 900 秒，不能因为更新失败而继续运行�
 | BuildKit 14 天规则只回收 130 B | `until` 按 last-used，条目都在窗口内 | 这是正常结论；不为凑数放宽门槛或改用创建时间 | storage-rules「Docker」；`docker_leftovers.py` |
 | 旧标签镜像被误当“很久没用” | 镜像不记录 last-used，`Created` 不是使用时间 | 30 天 + 无引用 + 同仓库有更新镜像；保留仓库最新/保护标签 | storage-rules「2026-11-14 owner 批准：带标签镜像」；`docker_leftovers.py` |
 | 删 worktree 可能丢唯一 `.env` | `git status` 不显示 ignored 文件 | ignored 凭据整棵保留，不因主 checkout 有同内容豁免 | `worktree_sweep.py`；`test_ignored_env_missing_from_main_keeps_the_worktree` |
+| 删 worktree 后 BB 子线程无法继续对话 | BB 子线程绑定 worktree 目录；目录删除后 resume 请求全部失败 | 这是 BB 限制，不尝试重绑；清理前把 `.local` 诊断产物归档到主检出 `.local/worktree-archive/`，从归档开新线程 | `worktree-cleanup` SKILL.md「BB child threads bound to a worktree」；`cleanup_worktrees.py` |
 | 同名 worktree 归档 ref 互相覆盖 | 只用目录名做 ref | ref 带路径哈希 | `worktree_sweep.py`；`test_same_named_worktrees_get_distinct_archive_branches` |
 | `bb environment delete` 后以为分支没了 | 它只清环境记录，不删 Git ref | 每轮每个环境只试一次；409 保留；恢复命令写 JSONL | storage-rules「2026-11-14 owner 批准：worktree 删除及每轮补扫 BB 环境」；`test_matching_bb_environment_is_deleted_with_recovery_command_after_worktree_removal` |
 | Codex 沙箱写不了 `~/.cache/go-build` | 可写根不含缓存目录（只有工作区、TMPDIR、Git 目录和 thread-storage） | 软链到 `.shared-cache`；长期由 BB 加 writable root | 本文件 3.1；`go_cache_trim.py`；BB `runtimeWorkspaceWriteRoots` |

@@ -2,12 +2,16 @@
 """Audit and retire Git worktrees whose commits are durable on a remote host.
 
 Inputs: a Git repository, a minimum age for PR-less worktrees, a reviewed dry-run
-report or selected approval tokens, an optional backup root, and an optional
-verifier-produced remote evidence file for hosts without a `gh` API (for example
-git.woa.com merge requests). Outputs: a bounded text or JSON report plus
-per-target metadata and a batch manifest in apply mode. Exit 0 means every
-approved candidate completed, 1 means discovery, approval, backup, or removal
-had a rejected item, and 2 is an argparse usage error.
+report or selected approval tokens, optional `.local` archive and size limits, and
+an optional verifier-produced remote evidence file for hosts without a `gh` API
+(for example git.woa.com merge requests). Outputs: a bounded text or JSON report
+plus per-target archive metadata in apply mode. Before a worktree is removed, a
+non-empty `.local` is copied to the primary checkout's
+`.local/worktree-archive/<worktree>-<UTC>/` unless the primary checkout does not
+gitignore `.local`, in which case the candidate is kept. Oversized `.local`
+content is listed but not archived. Exit 0 means every approved candidate
+completed, 1 means discovery, approval, archive, or removal had a rejected item,
+and 2 is an argparse usage error.
 
 With `--remote-evidence` the tool makes no GitHub call at all: the evidence file
 is the only durability witness, and every record it accepts must name the exact
@@ -38,6 +42,10 @@ PR_JSON_FIELDS = (
     "number,state,title,url,headRefName,headRefOid,mergedAt,closedAt"
 )
 IGNORED_SAMPLE_LIMIT = 50
+LOCAL_INVENTORY_LIST_LIMIT = 500
+PRESERVATION_TEXT_LIMIT = 20
+DEFAULT_MAX_LOCAL_FILE_MB = 50.0
+DEFAULT_MAX_LOCAL_TOTAL_MB = 500.0
 # External evidence replaces the GitHub query path, so the caller cannot rely on
 # a host-side age gate. 168h is the standing owner rule for worktree retirement;
 # a lower --min-no-pr-age-hours is refused in evidence mode instead of silently
@@ -762,7 +770,20 @@ def sweep_only_summary(args: argparse.Namespace) -> dict[str, Any]:
             "host": host or "unknown",
             "remote_evidence": None,
         },
+        "archive_root": "",
         "backup_root": "",
+        "local_limits": {
+            "max_file_bytes": int(
+                getattr(args, "max_local_file_mb", DEFAULT_MAX_LOCAL_FILE_MB)
+                * 1024
+                * 1024
+            ),
+            "max_total_bytes": int(
+                getattr(args, "max_local_total_mb", DEFAULT_MAX_LOCAL_TOTAL_MB)
+                * 1024
+                * 1024
+            ),
+        },
         "min_no_pr_age_hours": args.min_no_pr_age_hours,
         "worktree_count_before": len(worktrees),
         "worktree_count_after": len(worktrees),
@@ -795,16 +816,99 @@ def read_worktree_dirty(path: Path) -> tuple[bool | None, str | None]:
     return bool(result.stdout.strip()), None
 
 
-def read_local_tree_fingerprint(local_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
+def empty_local_inventory() -> dict[str, Any]:
+    return {
+        "exists": False,
+        "is_symlink": False,
+        "entry_count": 0,
+        "file_count": 0,
+        "total_bytes": 0,
+        "files": [],
+        "largest_files": [],
+        "files_truncated": False,
+        "max_file": None,
+    }
+
+
+def read_local_state(
+    local_dir: Path,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Return the approval fingerprint and the preservation inventory for `.local`.
+
+    The fingerprint covers every entry (mode, size, mtime, symlink target) so a
+    change between audit and apply invalidates the approval. The inventory counts
+    descendants only, never follows symlinks, and records regular files plus
+    symlinks so the dry-run can name what a removal would preserve.
+    """
+    try:
+        root_metadata = local_dir.lstat()
+    except FileNotFoundError:
+        encoded = b"[]"
+        return {
+            "fingerprint": {
+                "entry_count": 0,
+                "metadata_digest": hashlib.sha256(encoded).hexdigest(),
+            },
+            "inventory": empty_local_inventory(),
+        }, None
+    except OSError as exc:
+        return None, f"cannot inspect .local: {exc}"
+
+    if stat.S_ISLNK(root_metadata.st_mode):
+        try:
+            target = os.readlink(local_dir)
+        except OSError as exc:
+            return None, f"cannot read .local symlink {local_dir}: {exc}"
+        entry = {
+            "path": ".",
+            "mode": root_metadata.st_mode,
+            "size": root_metadata.st_size,
+            "mtime_ns": root_metadata.st_mtime_ns,
+            "symlink_target": target,
+        }
+        encoded = json.dumps([entry], sort_keys=True, separators=(",", ":")).encode()
+        file_entry = {
+            "path": ".",
+            "bytes": root_metadata.st_size,
+            "kind": "symlink",
+            "target": target,
+        }
+        return {
+            "fingerprint": {
+                "entry_count": 1,
+                "metadata_digest": hashlib.sha256(encoded).hexdigest(),
+            },
+            "inventory": {
+                "exists": True,
+                "is_symlink": True,
+                "entry_count": 1,
+                "file_count": 1,
+                "total_bytes": root_metadata.st_size,
+                "files": [file_entry],
+                "largest_files": [file_entry],
+                "files_truncated": False,
+                "max_file": file_entry,
+            },
+        }, None
+
+    if not stat.S_ISDIR(root_metadata.st_mode):
+        return None, f".local is not a directory: {local_dir}"
+
     pending = [local_dir]
     entries: list[dict[str, Any]] = []
+    files: list[dict[str, Any]] = []
+    largest_files: list[dict[str, Any]] = []
+    entry_count = 0
+    file_count = 0
+    total_bytes = 0
+    max_file: dict[str, Any] | None = None
+    files_truncated = False
+
     while pending:
         current = pending.pop()
         try:
             metadata = current.lstat()
         except FileNotFoundError:
-            if current == local_dir:
-                break
             return None, f"path disappeared while inventorying .local: {current}"
         except OSError as exc:
             return None, f"cannot inventory .local path {current}: {exc}"
@@ -817,11 +921,13 @@ def read_local_tree_fingerprint(local_dir: Path) -> tuple[dict[str, Any] | None,
             "mtime_ns": metadata.st_mtime_ns,
             "symlink_target": None,
         }
+        kind: str | None = None
         if stat.S_ISLNK(metadata.st_mode):
             try:
                 item["symlink_target"] = os.readlink(current)
             except OSError as exc:
                 return None, f"cannot read .local symlink {current}: {exc}"
+            kind = "symlink"
         elif stat.S_ISDIR(metadata.st_mode):
             try:
                 children = sorted(
@@ -832,12 +938,53 @@ def read_local_tree_fingerprint(local_dir: Path) -> tuple[dict[str, Any] | None,
             except OSError as exc:
                 return None, f"cannot inventory .local directory {current}: {exc}"
             pending.extend(children)
+            if current != local_dir:
+                entry_count += 1
+        elif stat.S_ISREG(metadata.st_mode):
+            kind = "file"
+            entry_count += 1
+        else:
+            kind = "special"
+            entry_count += 1
+
+        if kind in ("file", "symlink"):
+            file_count += 1
+            total_bytes += metadata.st_size
+            file_entry = {
+                "path": relative,
+                "bytes": metadata.st_size,
+                "kind": kind,
+            }
+            if kind == "symlink":
+                file_entry["target"] = item["symlink_target"]
+            if max_file is None or file_entry["bytes"] > max_file["bytes"]:
+                max_file = file_entry
+            largest_files.append(file_entry)
+            largest_files.sort(key=lambda item: item["bytes"], reverse=True)
+            del largest_files[PRESERVATION_TEXT_LIMIT:]
+            if len(files) < LOCAL_INVENTORY_LIST_LIMIT:
+                files.append(file_entry)
+            else:
+                files_truncated = True
         entries.append(item)
 
     encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
     return {
-        "entry_count": len(entries),
-        "metadata_digest": hashlib.sha256(encoded).hexdigest(),
+        "fingerprint": {
+            "entry_count": len(entries),
+            "metadata_digest": hashlib.sha256(encoded).hexdigest(),
+        },
+        "inventory": {
+            "exists": True,
+            "is_symlink": False,
+            "entry_count": entry_count,
+            "file_count": file_count,
+            "total_bytes": total_bytes,
+            "files": sorted(files, key=lambda file: file["path"]),
+            "largest_files": largest_files,
+            "files_truncated": files_truncated,
+            "max_file": max_file,
+        },
     }, None
 
 
@@ -859,9 +1006,9 @@ def read_ignored_roots(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or "git ls-files failed"
         return None, detail
-    local_tree, local_tree_error = read_local_tree_fingerprint(path / ".local")
-    if local_tree_error is not None:
-        return None, local_tree_error
+    local_state, local_state_error = read_local_state(path / ".local")
+    if local_state_error is not None:
+        return None, local_state_error
     roots = sorted(value for value in result.stdout.split("\0") if value)
     encoded = "\0".join(roots).encode("utf-8", errors="surrogateescape")
     discarded = [
@@ -879,10 +1026,179 @@ def read_ignored_roots(path: Path) -> tuple[dict[str, Any] | None, str | None]:
             "discarded_count": len(discarded),
             "discarded_sample": discarded[:IGNORED_SAMPLE_LIMIT],
             "discarded_sample_truncated": len(discarded) > IGNORED_SAMPLE_LIMIT,
-            "local_tree": local_tree,
+            "local_tree": local_state["fingerprint"],
+            "local_inventory": local_state["inventory"],
         },
         None,
     )
+
+
+def utc_timestamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def format_bytes(value: int) -> str:
+    size = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{value} B"
+
+
+def ensure_unique_archive_dir(
+    archive_root: Path, worktree_name: str, stamp: str | None = None
+) -> Path:
+    stem = f"{worktree_name}-{stamp or utc_timestamp()}"
+    candidate = archive_root / stem
+    if not candidate.exists():
+        return candidate
+    for index in range(2, 1000):
+        suffixed = archive_root / f"{stem}-{index}"
+        if not suffixed.exists():
+            return suffixed
+    raise CommandError(f"Unable to allocate archive directory for {worktree_name}")
+
+
+def check_path_ignored(repo_root: Path, path: Path) -> tuple[bool | None, str | None]:
+    """Return whether `path` is gitignored in `repo_root`; None means external."""
+    try:
+        relative = path.relative_to(repo_root)
+    except ValueError:
+        return None, None
+    if relative == Path("."):
+        return False, None
+    result = run_command(
+        ["git", "-C", str(repo_root), "check-ignore", "-q", "--", str(relative)],
+        check=False,
+    )
+    if result.returncode == 0:
+        return True, None
+    if result.returncode == 1:
+        return False, None
+    detail = (
+        result.stderr.strip()
+        or result.stdout.strip()
+        or f"git check-ignore exited {result.returncode}"
+    )
+    return None, detail
+
+
+def copy_local_evidence(source: Path, destination: Path) -> None:
+    """Copy `.local` without following symlinks; the caller removes it with the worktree."""
+    if source.is_symlink():
+        os.symlink(os.readlink(source), destination)
+    elif source.is_dir():
+        shutil.copytree(source, destination, symlinks=True)
+    else:
+        shutil.copy2(source, destination)
+
+
+def plan_local_preservation(
+    *,
+    worktree_name: str,
+    local_dir: Path,
+    inventory: dict[str, Any],
+    archive_root: Path,
+    archive_root_inside_primary: bool,
+    archive_root_ignored: bool | None,
+    archive_root_ignore_error: str | None,
+    max_file_bytes: int,
+    max_total_bytes: int,
+) -> dict[str, Any]:
+    destination = str(ensure_unique_archive_dir(archive_root, worktree_name))
+    preservation: dict[str, Any] = {
+        "status": "none",
+        "source": str(local_dir),
+        "destination": destination,
+        "archive_root": str(archive_root),
+        "ignored_by_git": archive_root_ignored,
+        "entry_count": inventory["entry_count"],
+        "file_count": inventory["file_count"],
+        "total_bytes": inventory["total_bytes"],
+        "files": inventory["files"],
+        "files_truncated": inventory["files_truncated"],
+        "max_file": inventory["max_file"],
+        "limits": {
+            "max_file_bytes": max_file_bytes,
+            "max_total_bytes": max_total_bytes,
+        },
+        "oversized_files": [],
+        "oversized_reasons": [],
+        "warning": None,
+        "moved_to": None,
+    }
+
+    if not inventory["exists"] or inventory["entry_count"] == 0:
+        preservation["destination"] = None
+        return preservation
+
+    if inventory["is_symlink"]:
+        preservation["status"] = "blocked"
+        preservation["warning"] = (
+            ".local is a symlink; resolve it to a real directory inside the "
+            "worktree before cleanup so the archived evidence is self-contained"
+        )
+        return preservation
+
+    if archive_root_inside_primary and archive_root_ignored is not True:
+        preservation["status"] = "blocked"
+        if archive_root_ignore_error is not None:
+            preservation["warning"] = (
+                "cannot prove the primary checkout archive path is gitignored: "
+                f"{archive_root_ignore_error}"
+            )
+        else:
+            preservation["warning"] = (
+                f"primary checkout archive path {archive_root} is not gitignored; "
+                ".local evidence cannot be archived, so the worktree is kept"
+            )
+        return preservation
+
+    oversized_files: list[dict[str, Any]] = []
+    oversized_reasons: list[str] = []
+    max_file = inventory["max_file"]
+    if (
+        max_file_bytes > 0
+        and max_file is not None
+        and max_file["bytes"] > max_file_bytes
+    ):
+        oversized_reasons.append(
+            f"largest file {max_file['path']} is {max_file['bytes']} bytes "
+            f"(limit {max_file_bytes})"
+        )
+        oversized_files = [
+            item for item in inventory["files"] if item["bytes"] > max_file_bytes
+        ]
+        if all(item["path"] != max_file["path"] for item in oversized_files):
+            oversized_files.append(max_file)
+    if max_total_bytes > 0 and inventory["total_bytes"] > max_total_bytes:
+        oversized_reasons.append(
+            f"total size is {inventory['total_bytes']} bytes "
+            f"(limit {max_total_bytes})"
+        )
+        largest = inventory.get("largest_files") or inventory["files"]
+        for item in largest:
+            if all(existing["path"] != item["path"] for existing in oversized_files):
+                oversized_files.append(item)
+        if max_file is not None and all(
+            item["path"] != max_file["path"] for item in oversized_files
+        ):
+            oversized_files.append(max_file)
+
+    if oversized_reasons:
+        preservation["status"] = "oversized"
+        preservation["oversized_files"] = sorted(
+            oversized_files, key=lambda item: item["bytes"], reverse=True
+        )
+        preservation["oversized_reasons"] = oversized_reasons
+        preservation["warning"] = (
+            ".local exceeds the preservation size limits; only its manifest is "
+            "recorded and the listed files are discarded when the worktree is removed"
+        )
+    else:
+        preservation["status"] = "archive"
+    return preservation
 
 
 def worktree_age_hours(path: Path) -> float | None:
@@ -929,30 +1245,14 @@ def approval_token(entry: dict[str, Any], repo_root: Path) -> str:
         "head": entry["head"],
         "branch": entry["branch"],
         "local_fingerprint": entry["local_fingerprint"],
+        # The dry-run report tells the operator whether `.local` will be archived,
+        # listed as oversized, or blocked. Bind that decision to the approval so a
+        # different limit or ignore state cannot silently change the sink.
+        "preservation_status": entry["preservation"]["status"],
     }
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-
-
-def ensure_unique_backup_dir(batch_root: Path, worktree_name: str) -> Path:
-    candidate = batch_root / worktree_name
-    if not candidate.exists():
-        return candidate
-    for index in range(2, 1000):
-        suffixed = batch_root / f"{worktree_name}-{index}"
-        if not suffixed.exists():
-            return suffixed
-    raise CommandError(f"Unable to allocate backup directory for {worktree_name}")
-
-
-def default_backup_root(primary_repo_root: Path, common_git_dir: Path) -> Path:
-    state_home = Path(
-        os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
-    ).expanduser()
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", primary_repo_root.name).strip("-")
-    repo_id = hashlib.sha256(str(common_git_dir.resolve()).encode()).hexdigest()[:10]
-    return state_home / "worktree-cleanup" / f"{slug or 'repository'}-{repo_id}"
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -1064,8 +1364,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backup-root",
         help=(
-            "Backup root; relative paths resolve from --repo "
-            "(default: XDG state directory namespaced by repository)"
+            "Archive root for preserved .local evidence; relative paths resolve "
+            "from --repo (default: <primary checkout>/.local/worktree-archive)"
+        ),
+    )
+    parser.add_argument(
+        "--max-local-file-mb",
+        type=parse_nonnegative_float,
+        default=DEFAULT_MAX_LOCAL_FILE_MB,
+        metavar="MB",
+        help=(
+            "Do not move .local when any file exceeds this size in MiB "
+            f"(default: {DEFAULT_MAX_LOCAL_FILE_MB:g}; 0 disables the limit)"
+        ),
+    )
+    parser.add_argument(
+        "--max-local-total-mb",
+        type=parse_nonnegative_float,
+        default=DEFAULT_MAX_LOCAL_TOTAL_MB,
+        metavar="MB",
+        help=(
+            "Do not move .local when its total size exceeds this size in MiB "
+            f"(default: {DEFAULT_MAX_LOCAL_TOTAL_MB:g}; 0 disables the limit)"
         ),
     )
     parser.add_argument(
@@ -1125,13 +1445,35 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
         if evidence is not None
         else query_repository(selected_root)
     )
+    # The requested archive location is the primary checkout (the parent of the
+    # common Git directory), not the checkout selected by --repo: a linked
+    # worktree may be removed, while the primary checkout and its ignored .local
+    # survive every candidate.
+    primary_checkout_root = common_git_dir.parent
     if args.backup_root:
         backup_root = Path(args.backup_root).expanduser()
         if not backup_root.is_absolute():
             backup_root = selected_root / backup_root
         backup_root = backup_root.resolve()
     else:
-        backup_root = default_backup_root(primary_repo_root, common_git_dir)
+        backup_root = (primary_checkout_root / ".local" / "worktree-archive").resolve()
+    archive_root_inside_primary = path_is_relative_to(
+        backup_root, primary_checkout_root
+    )
+    if archive_root_inside_primary:
+        archive_root_ignored, archive_ignore_error = check_path_ignored(
+            primary_checkout_root, backup_root
+        )
+    else:
+        archive_root_ignored, archive_ignore_error = None, None
+    max_file_bytes = int(
+        getattr(args, "max_local_file_mb", DEFAULT_MAX_LOCAL_FILE_MB) * 1024 * 1024
+    )
+    max_total_bytes = int(
+        getattr(args, "max_local_total_mb", DEFAULT_MAX_LOCAL_TOTAL_MB)
+        * 1024
+        * 1024
+    )
 
     entries: list[dict[str, Any]] = []
     for worktree in worktrees:
@@ -1140,6 +1482,43 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
 
         dirty, dirty_error = read_worktree_dirty(worktree.path)
         ignored, ignored_error = read_ignored_roots(worktree.path)
+        if ignored is not None:
+            local_inventory = ignored.pop("local_inventory")
+            preservation = plan_local_preservation(
+                worktree_name=worktree.path.name,
+                local_dir=worktree.path / ".local",
+                inventory=local_inventory,
+                archive_root=backup_root,
+                archive_root_inside_primary=archive_root_inside_primary,
+                archive_root_ignored=archive_root_ignored,
+                archive_root_ignore_error=archive_ignore_error,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+            )
+            if preservation["status"] == "oversized":
+                ignored["discarded_count"] += 1
+                sample = [".local", *ignored["discarded_sample"]]
+                if len(sample) > IGNORED_SAMPLE_LIMIT:
+                    sample = sample[:IGNORED_SAMPLE_LIMIT]
+                    ignored["discarded_sample_truncated"] = True
+                ignored["discarded_sample"] = sample
+        else:
+            preservation = plan_local_preservation(
+                worktree_name=worktree.path.name,
+                local_dir=worktree.path / ".local",
+                inventory=empty_local_inventory(),
+                archive_root=backup_root,
+                archive_root_inside_primary=archive_root_inside_primary,
+                archive_root_ignored=archive_root_ignored,
+                archive_root_ignore_error=archive_ignore_error,
+                max_file_bytes=max_file_bytes,
+                max_total_bytes=max_total_bytes,
+            )
+            preservation["status"] = "unknown"
+            preservation["destination"] = None
+            preservation["warning"] = (
+                f"local evidence inventory failed: {ignored_error}"
+            )
         age_hours = worktree_age_hours(worktree.path)
         entry: dict[str, Any] = {
             "name": worktree.path.name,
@@ -1154,6 +1533,7 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             "age_hours": round(age_hours, 2) if age_hours is not None else None,
             "dirty": dirty,
             "ignored": ignored,
+            "preservation": preservation,
             "local_fingerprint": local_fingerprint(worktree, dirty, ignored),
             "pr": None,
             "expiration_reason": None,
@@ -1178,6 +1558,12 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             skip_reason = f"ignored-file inventory failed: {ignored_error}"
         elif dirty:
             skip_reason = "worktree has staged, unstaged, or untracked changes"
+        elif preservation["status"] == "blocked":
+            skip_reason = preservation["warning"]
+        elif preservation["status"] == "unknown":
+            skip_reason = (
+                preservation["warning"] or "local evidence inventory failed"
+            )
 
         pr_info: PullRequestInfo | None = None
         if skip_reason is None and evidence is not None:
@@ -1315,7 +1701,14 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             "remote_evidence": evidence["path"] if evidence is not None else None,
         },
         "managed_worktrees_root": str(managed_worktrees_root),
+        "primary_checkout_root": str(primary_checkout_root),
+        "archive_root": str(backup_root),
+        # Keep the old key so existing consumers keep reading the archive base.
         "backup_root": str(backup_root),
+        "local_limits": {
+            "max_file_bytes": max_file_bytes,
+            "max_total_bytes": max_total_bytes,
+        },
         "min_no_pr_age_hours": args.min_no_pr_age_hours,
         "worktree_count_before": len(worktrees),
         "worktree_count_after": len(worktrees),
@@ -1407,35 +1800,19 @@ def apply_candidates(
         )
         return
 
-    backup_root = Path(summary["backup_root"]).resolve()
+    archive_root = Path(summary["backup_root"]).resolve()
     for candidate in candidates:
         worktree_path = Path(candidate["path"]).resolve()
-        if path_is_relative_to(backup_root, worktree_path):
+        if path_is_relative_to(archive_root, worktree_path):
             raise CommandError(
-                f"Backup root {backup_root} is inside cleanup target {worktree_path}"
+                f"Archive root {archive_root} is inside cleanup target {worktree_path}"
             )
 
-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    batch_root = backup_root / timestamp
-    batch_root.mkdir(parents=True, mode=0o700, exist_ok=False)
-    batch_root.chmod(0o700)
-    summary["backup_root"] = str(batch_root)
-    manifest_path = batch_root / "manifest.json"
-    def update_manifest() -> None:
-        write_json(
-            manifest_path,
-            {
-                "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-                "backup_root": str(batch_root),
-                "rejected_approvals": summary["rejected_approvals"],
-                "items": summary["entries"],
-            },
-        )
-
-    update_manifest()
     for candidate in candidates:
         worktree_path = Path(candidate["path"])
         local_dir = worktree_path / ".local"
+        preservation = candidate["preservation"]
+        status = preservation["status"]
         metadata_path: Path | None = None
 
         def update_metadata() -> None:
@@ -1448,6 +1825,9 @@ def apply_candidates(
                     .astimezone()
                     .isoformat(timespec="seconds"),
                     "source_local_dir": str(local_dir),
+                    "archive_root": str(archive_root),
+                    "content_preserved": status == "archive",
+                    "preservation": preservation,
                     "worktree": candidate,
                 },
             )
@@ -1457,7 +1837,6 @@ def apply_candidates(
             candidate["error"] = error
             summary["failed"] += 1
             update_metadata()
-            update_manifest()
 
         state_error = revalidate_local_state(
             candidate, Path(summary["common_repo_root"])
@@ -1467,20 +1846,32 @@ def apply_candidates(
             continue
 
         try:
-            backup_dir = ensure_unique_backup_dir(batch_root, candidate["name"])
-            backup_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
-            backup_dir.chmod(0o700)
-            candidate["backup_path"] = str(backup_dir)
+            if status in ("archive", "oversized"):
+                archive_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+                archive_dir = ensure_unique_archive_dir(
+                    archive_root, candidate["name"]
+                )
+                archive_dir.mkdir(parents=True, mode=0o700, exist_ok=False)
+                archive_dir.chmod(0o700)
+                candidate["backup_path"] = str(archive_dir)
+                preservation["destination"] = str(archive_dir)
+                metadata_path = archive_dir / "metadata.json"
+                if status == "archive":
+                    copy_local_evidence(local_dir, archive_dir / ".local")
+                    preservation["moved_to"] = str(archive_dir / ".local")
+                else:
+                    preservation["moved_to"] = None
+            elif status != "none":
+                fail_candidate(
+                    f"local evidence preservation is {status}; refusing removal"
+                )
+                continue
             candidate["action"] = "remove-pending"
-            metadata_path = backup_dir / "metadata.json"
-            if local_dir.exists():
-                shutil.copytree(local_dir, backup_dir / ".local", symlinks=True)
-        except OSError as exc:
-            fail_candidate(f"backup failed: {exc}")
+        except (OSError, CommandError) as exc:
+            fail_candidate(f"local archive failed: {exc}")
             continue
 
         update_metadata()
-        update_manifest()
 
         state_error = revalidate_local_state(
             candidate, Path(summary["common_repo_root"])
@@ -1511,7 +1902,6 @@ def apply_candidates(
             )
 
         update_metadata()
-        update_manifest()
 
     sweep_orphan_branches(summary, keep_branches)
     summary["branches_removed"] = len(
@@ -1540,7 +1930,7 @@ def print_text(summary: dict[str, Any]) -> None:
     print(f"github_repo: {summary['repository']['name_with_owner']}")
     print(f"host: {summary['repository'].get('host', 'github.com')}")
     print(f"default_branch: {summary['repository']['default_branch']}")
-    print(f"backup_root: {summary['backup_root']}")
+    print(f"archive_root: {summary['archive_root']}")
     print(f"worktrees_before: {summary['worktree_count_before']}")
     print(f"worktrees_after: {summary['worktree_count_after']}")
     print(f"scanned: {summary['scanned']}")
@@ -1577,10 +1967,6 @@ def print_text(summary: dict[str, Any]) -> None:
             f"{ignored['count'] if ignored else 'unknown'}"
         )
         if ignored:
-            print(
-                "  local_backup: "
-                f"{'yes' if ignored['local_tree']['entry_count'] else 'no'}"
-            )
             print(f"  ignored_roots_deleted_count: {ignored['discarded_count']}")
             print(f"  ignored_roots_deleted_sample: {ignored['discarded_sample']}")
             print(
@@ -1588,10 +1974,67 @@ def print_text(summary: dict[str, Any]) -> None:
                 f"{'yes' if ignored['discarded_sample_truncated'] else 'no'}"
             )
         else:
-            print("  local_backup: unknown")
             print("  ignored_roots_deleted_count: unknown")
             print("  ignored_roots_deleted_sample: unknown")
             print("  ignored_roots_deleted_sample_truncated: unknown")
+        preservation = entry.get("preservation") or {
+            "status": "unknown",
+            "destination": None,
+            "file_count": 0,
+            "total_bytes": 0,
+            "files": [],
+            "oversized_files": [],
+            "warning": "preservation state unavailable",
+        }
+        print(f"  local_preservation: {preservation['status']}")
+        if preservation["status"] != "none":
+            print(
+                "  local_archive_destination: "
+                f"{preservation.get('destination') or 'none'}"
+            )
+        if preservation.get("warning"):
+            print(f"  local_warning: {preservation['warning']}")
+        if preservation["status"] == "archive":
+            print(f"  local_preserved_files: {preservation['file_count']}")
+            print(f"  local_preserved_bytes: {preservation['total_bytes']}")
+            for item in preservation.get("files", [])[:PRESERVATION_TEXT_LIMIT]:
+                print(
+                    f"    preserved: {item['path']} "
+                    f"({format_bytes(item['bytes'])})"
+                )
+            remaining = preservation["file_count"] - min(
+                len(preservation.get("files", [])), PRESERVATION_TEXT_LIMIT
+            )
+            if remaining > 0:
+                print(f"    preserved: ... {remaining} more")
+        elif preservation["status"] == "oversized":
+            print("  local_preserved_files: 0")
+            print(f"  local_discarded_files: {preservation['file_count']}")
+            print(f"  local_discarded_bytes: {preservation['total_bytes']}")
+            listed = sorted(
+                preservation.get("files", []),
+                key=lambda item: item["bytes"],
+                reverse=True,
+            )
+            for item in listed[:PRESERVATION_TEXT_LIMIT]:
+                print(
+                    f"    not-preserved: {item['path']} "
+                    f"({format_bytes(item['bytes'])})"
+                )
+            remaining = preservation["file_count"] - min(
+                len(listed), PRESERVATION_TEXT_LIMIT
+            )
+            if remaining > 0:
+                print(f"    not-preserved: ... {remaining} more")
+        elif preservation["status"] == "blocked":
+            print("  local_preserved_files: 0")
+            for item in preservation.get("files", [])[:PRESERVATION_TEXT_LIMIT]:
+                print(
+                    f"    would-preserve: {item['path']} "
+                    f"({format_bytes(item['bytes'])})"
+                )
+        else:
+            print("  local_preserved_files: 0")
         print(f"  action: {entry['action']}")
         if entry["approval_token"]:
             print(f"  approval_token: {entry['approval_token']}")

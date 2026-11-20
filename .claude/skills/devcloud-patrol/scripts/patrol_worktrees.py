@@ -1153,7 +1153,7 @@ def main() -> int:
                     failed.append({"path": e["path"], "error": ent.get("error") or ent.get("skip_reason") or res.get("error") or "执行器未执行"})
 
     # --- 5b. 工蜂（非 GitHub host）：证据经 owner 工具 --remote-evidence 走同一 sink ---
-    # 唯一执行器不变（`git worktree remove` 非 --force、.local 备份、apply 前指纹复验）；
+    # 唯一执行器不变（`git worktree remove` 非 --force、.local 归档到主检出、apply 前指纹复验）；
     # 分支按 owner 2026-09-19 政策默认删除（远端证明就是删除分支的依据）；
     # 工蜂场景只是把「远端已有」的证人从 gh API 换成 gongfengcli 核验结果，sink 端仍按完整对象名全等校验。
     verified_remaining = list(verified_reclaimable)
