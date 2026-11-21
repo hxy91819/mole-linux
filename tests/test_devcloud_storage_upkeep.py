@@ -2938,11 +2938,13 @@ def test_growth_migrated_components_alert_without_parent(tmp_path, monkeypatch):
     assert [r['root'] for r in comparisons if g.is_alert(r)] == [leaf]
 
 
-def test_pnpm_physical_inventory_discovers_cli_only_store_but_not_nested_format(pnpm_case, monkeypatch):
+def test_pnpm_physical_inventory_discovers_cli_only_store_but_not_nested_format(pnpm_case, monkeypatch, request):
     p, store, root = pnpm_case
     standalone = root / 'cli-only' / 'v3'
     nested = store / 'v3'
     incomplete = root / 'unrelated' / 'v3'
+    for path in (standalone.parent, nested):
+        request.addfinalizer(lambda directory=path: shutil.rmtree(directory, ignore_errors=True))
     for path in (standalone, nested):
         for bucket in p.CAS_BUCKETS:
             (path / 'files' / bucket).mkdir(parents=True)
