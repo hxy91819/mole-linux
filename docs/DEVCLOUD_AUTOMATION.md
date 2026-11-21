@@ -120,10 +120,11 @@ Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
 
 | 任务 | ID | 时间 | 执行 | 行为 |
 |---|---|---|---|---|
-| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对六个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源；全部符合只回一句，不符合才发协调线程 |
+| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对六个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源、Git 清理效果、prompt 同步和 BB CLI 版本；全部符合只回一句，不符合才发协调线程 |
 
-prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)。改检查项时
-两边同步：改文件 → 用完整文件（含末尾换行）更新 `bb automation update ... --prompt` → `show` 回读逐字核对。
+[DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md) 是唯一来源。改完运行
+`python3 -I scripts/sync_daily_check_prompt.py --apply`，脚本更新 BB 并回读比对完整内容（含末尾换行）。
+每日检查运行同一脚本的 `--check`；不同则输出 diff 并以非零退出。
 协调线程换了也要同步改 prompt 里的 `bb thread tell` 目标。每日检查只看 `trigger=schedule`
 的运行，`manual` 是人工测试，不算周期成功。
 
@@ -133,9 +134,10 @@ prompt 原文在 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md)�
 
 ## 2. 不可变快照与发布
 
-仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`，仅含
-当前正式七脚本性能快照为 `/data/tools/devcloud-storage-upkeep/releases/3c35f7ad513b5140/`，包含
-`git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、`git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py` 七个脚本和 `manifest.json`。
+仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `948f718f89baba0e`），包含
+`git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、
+`git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py`、
+`daily_git_cleanup_check.py` 八个脚本和 `manifest.json`。上一版七脚本性能快照为 `3c35f7ad513b5140`。
 旧 `9217bf8ab4fc6204` 是六脚本历史快照，缺少 CLI binder；上一正式版为 `b70f81e79242476d`（clone预算150m）。线上切换以本轮验证与 `bb automation show` 回读为准。
 launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境，再运行linked登记路径和独立clone全盘路径；cwd=/，BB只负责120秒内启动。其他维护任务继续使用各自已有快照。
 
@@ -164,6 +166,18 @@ bb automation runs auto_hukidoavox0 --project proj_8d3wrcajxn --limit 3 --json
 ```
 
 旧测试的临时夹具固定写 `/var/tmp`，测试复现需在宿主可写环境运行；沙箱只读挂载的创建失败不算脚本行为回归。
+
+每日用 `python3 -I <git-snap>/daily_git_cleanup_check.py` 只读核对新快照。
+三阶段最终报告和 JSONL finish 有保留原因排名：`by_bytes` 含已计量字节、数量、未测数量和
+最多五个路径，`by_count` 列出按数量排序的原因及计数。同原因内嵌套的已测目录不重复计量；
+不同原因/阶段的字节不可相加，也不能视为可释放空间。任一原因超过 20 GiB 告警。
+linked/clone 以 BB 定时 launcher 的 systemd invocation ID 对应报告；连续三个自然日的执行
+均完整且零删除、同日 07:00–07:30 的三个有效样本显示保留路径对应的最具体计量根持续增长，
+才告警。旧版、手动或不完整报告不计入；缺测不视为零。增长计量任务本身无需更换快照。
+脚本同时在固定的干净 PATH 下比较 `bb --version` 与运行中服务端包的版本。
+clone 报告的 `discovery.invalid_parent_markers` 单列 Git 不承认的父标记；报告只建议另行核查，
+标记不进入 Git 树计量或候选，清理器不删除标记。复现用 `git -C <parent> rev-parse --show-toplevel`。依赖包生成内容不参与
+ignored 凭据探测；已证实缺失的本地远端不提供 refs 证明，其他远端的网络或认证失败仍保留。
 
 JSON 报告在 `~/.local/state/devcloud-storage-upkeep/git-tree-sweep-<UTC>.json`；
 JSONL 同前缀，含阶段时点与每对象证据。schema_version=2 的 `unresolved` 每条含 source、expression、scope、

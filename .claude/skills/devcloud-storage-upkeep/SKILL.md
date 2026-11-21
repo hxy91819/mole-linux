@@ -75,7 +75,7 @@ python3 -I <本技能根>/scripts/pnpm_store_prune.py             # 发现的各
 ## 易错点
 
 - `/tmp` 是 `/data/system-tmp` 的 bind mount：清 `/tmp` 腾的是数据盘，不是系统盘。
-- 全局 gitignore 会隐藏凭据，clean status 不能证明没有私有状态。新全盘入口不豁免主 checkout 中相同内容，也不豁免依赖目录内 ignored 凭据。
+- 全局 gitignore 会隐藏凭据，clean status 不能证明没有私有状态。全盘 clone 的 ignored 凭据和可重建依赖例外、无效父 Git 标记、远端缺失与失败的判据以 storage-rules 的「本地全条件」及「恢复证明」为准。
 - mono2 有一个指向公开 GitHub 的 `gh-public` 远端。脚本只把归档推到同主机下你的命名空间或内部 origin，不要绕过这条规则手工推送。
 - git.woa.com 的 committer-check 可能拒绝历史中的个人邮箱；当前全盘归档必须保留原 SHA，拒绝就保留，不能沿用旧 linked helper 的压缩快照 fallback。
 - 本机推 GitHub 没有 SSH agent（`Permission denied (publickey)`），要走 `gh` 的 https 凭据，脚本会自动改写 GitHub 的地址。GitHub 偶尔返回 500，失败项下一轮重跑即可。
@@ -85,6 +85,6 @@ python3 -I <本技能根>/scripts/pnpm_store_prune.py             # 发现的各
 - lightspace 已把 `/root/.cache/go-build` 与 `/root/.cache/golangci-lint` 指向 `/data/bb-data/thread-storage/.shared-cache/` 的两个共享缓存。取 realpath 后分别核固定 README 首行（Go build system / golangci-lint），共用 24h 哈希普通文件修剪；`.shared-cache` 不得当线程遗留删除或误报，只有 go_cache_trim 可修剪。
 - clean-tmp 每批 128 项完整 `/proc` 快照、8 项并发；隔离及最终 sink 只探新增/starttime 变化 PID（owner 明确授权），unknown 拒绝；每项仍校结构、年龄、物理身份、完整指纹，过 Mole dry-run/final guard。普通树 5 秒、缓存树 60 秒；两根预算 300/1400 秒，外层 timeout 1790 秒，实际 cron 见规则源。
 - systemd-tmpfiles 已不再清理 /tmp（`/etc/tmpfiles.d/tmp.conf` 不再按年龄删），破坏闲置 worktree 的原因见 storage-rules「临时目录与 worktree」一节。
-- 定时任务以 `bb automation list/show` 为准。Git快照包含两条判定路径、systemd launcher/worker与旧两个helper（共7脚本），文件 `0444`、目录 `0555`，manifest 字节哈希前 16 位为目录名；`python3 -I --help` 后复算哈希且无 pycache。仅更新相关任务，不改其他维护任务的快照。短文件名 `--script-file` 更新后 check=True，再读回核对命令模式符合本轮已满足的授权条件、06:30、Asia/Shanghai 与 timeout。旧 06:45 tmp clone 任务停用且替换为空操作（避免旧水位任务手动触发）；每日检查同步验证其停用。完整部署与预算见自动化手册。
+- 定时任务以 `bb automation list/show` 为准。Git快照包含两条判定路径、systemd launcher/worker、旧 helper 和每日成效检查（清单见自动化手册），文件 `0444`、目录 `0555`，manifest 字节哈希前 16 位为目录名；`python3 -I --help` 后复算哈希且无 pycache。仅更新相关任务，不改其他维护任务的快照。短文件名 `--script-file` 更新后 check=True，再读回核对命令模式符合本轮已满足的授权条件、06:30、Asia/Shanghai 与 timeout。旧 06:45 tmp clone 任务停用且替换为空操作（避免旧水位任务手动触发）；每日检查同步验证其停用。完整部署与预算见自动化手册。
 
 - Git launcher继承BB script注入的BB_CLI（真实探针已确认0.49.0），为空时由bb-dev-server.service MainPID exe的安装包推导host-daemon/dist/bb；不回落PATH。启动前和worker入口验证thread list的include-archived/include-hidden/json、environment cleanup和machine list所需选项，再用systemd --setenv转交；所有阶段的BB子命令使用绝对绑定；env-node的JS入口显式使用同包bin/node，探针与阶段命令一致，报告bb_cli留证。绑定不可得/不支持时给出原因和下一步并失败。

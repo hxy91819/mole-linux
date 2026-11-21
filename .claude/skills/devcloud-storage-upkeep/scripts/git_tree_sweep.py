@@ -69,18 +69,46 @@ def execution_step(name):
             values[name] = round(values.get(name, 0) + time.monotonic() - started, 6)
 
 
+def remote_failure(exc):
+    if isinstance(exc, subprocess.TimeoutExpired):
+        return 'remote timeout'
+    message = str(getattr(exc, 'stderr', None) or exc).lower()
+    for reason, patterns in (
+        ('remote timeout', ('timed out', 'operation too slow')),
+        ('remote authentication failed', ('authentication failed', 'permission denied (publickey',
+                                          'could not read username', 'http 401', 'http 403', 'returned error: 401',
+                                          'returned error: 403', 'host key verification failed')),
+        ('remote network failure', ('could not resolve', 'connection refused', 'network is unreachable',
+                                    'connection reset', 'failed to connect', 'no route to host')),
+        ('remote repository missing or access denied', ('repository not found', 'does not appear to be a git repository')),
+    ):
+        if any(pattern in message for pattern in patterns):
+            return reason
+    return 'remote query failed'
+
+
 def live_query(path, url, symref=False):
     """One live server query per effective URL in a planning generation."""
-    key = (url, symref)
+    target = tc.local_path(url, path) if url else None
+    key = (('local', target) if target else ('remote', url), symref)
     with LIVE_LOCK:
         entry = LIVE.setdefault(key, {'lock': threading.Lock()})
     with entry['lock']:
         if 'result' not in entry:
-            try:
-                entry['result'] = git(path, 'ls-remote', *(['--symref'] if symref else ['--heads', '--tags']),
-                                      url, *(['HEAD'] if symref else []), timeout=90).stdout
-            except Exception as exc:
-                entry['result'] = exc
+            until = min(time.monotonic() + 90, DEADLINE)
+            for attempt in range(2):
+                left = until - time.monotonic()
+                if left <= 0:
+                    entry.setdefault('result', ws.ScanIncomplete('remote query budget exhausted'))
+                    break
+                try:
+                    entry['result'] = git(path, 'ls-remote', *(['--symref'] if symref else ['--heads', '--tags']),
+                                          '--', url, *(['HEAD'] if symref else []), timeout=left / (2 - attempt)).stdout
+                    break
+                except Exception as exc:
+                    entry['result'] = exc
+                    if remote_failure(exc) != 'remote timeout':
+                        break
         if isinstance(entry['result'], Exception):
             raise entry['result']
         return entry['result']
@@ -88,11 +116,13 @@ def live_query(path, url, symref=False):
 
 class LiveRepo(ws.Repo):
     def load_live(self, include_tags=True):
+        self.remote_errors = {}
         for name, (url, _) in self.remotes.items():
             try:
                 out = live_query(self.main, ws.transport_url(url))
-            except Exception:
+            except Exception as exc:
                 self.unreachable.add(name)
+                self.remote_errors[name] = remote_failure(exc)
                 continue
             refs = {ref: sha for sha, ref in (line.split('\t') for line in out.splitlines() if '\t' in line)}
             self.live[name] = refs
@@ -104,7 +134,10 @@ class LiveRepo(ws.Repo):
             sym = git(self.main, 'symbolic-ref', '-q', f'refs/remotes/{name}/HEAD', check=False).stdout.strip()
             branch = sym.split('/', 3)[3] if sym.count('/') >= 3 else None
             if not branch:
-                out = live_query(self.main, ws.transport_url(self.remotes[name][0]), symref=True)
+                try:
+                    out = live_query(self.main, ws.transport_url(self.remotes[name][0]), symref=True)
+                except Exception as exc:
+                    raise ws.Keep(f'{remote_failure(exc)}: {name} (default branch)') from exc
                 match = re.match(r'ref: refs/heads/(\S+)\tHEAD', out)
                 branch = match[1] if match else None
             self._default[name] = branch
@@ -412,8 +445,8 @@ def discover(roots, excluded):
     """
     trees, bare, links, errors, skipped = {}, set(), [], [], {}
     visited = set()
-    for root in roots:
-        root = canonical(root)
+    scan_roots = [canonical(root) for root in roots]
+    for root in scan_roots:
         try:
             device = os.stat(root).st_dev
             pending = [root]
@@ -463,7 +496,7 @@ def discover(roots, excluded):
         except Exception as exc:
             errors.append(f'{parent if "parent" in locals() else root}: {ws.failure_text(exc)}')
     return {'trees': trees, 'bare': sorted(bare), 'links': links, 'errors': errors,
-            'excluded': skipped, 'directories': len(visited)}
+            'excluded': skipped, 'directories': len(visited), 'scan_roots': scan_roots}
 
 
 def add_environment(anchors, values, reason, base=None):
@@ -2176,23 +2209,73 @@ def same_origin_nested(path, kind, parent, parent_kind):
         return False  # An unreadable relationship cannot exempt a nested tree.
 
 
-def local_state(path, kind, inventory, anchors, refs):
+def parent_git_state(path):
+    """A marker alone does not give a directory Git ownership of descendants."""
+    marker = os.path.join(path, '.git')
+    try:
+        result = source_git(path, 'rev-parse', '--show-toplevel', check=False)
+        if result.returncode == 0:
+            if result.stdout.rstrip('\n') and canonical(result.stdout.rstrip('\n')) == path:
+                return 'valid', None
+            return 'invalid', 'Git top-level is another directory'
+        if 'not a git repository' in result.stderr or 'invalid gitfile format' in result.stderr:
+            return 'invalid', 'Git does not recognize this .git marker'
+        if 'this operation must be run in a work tree' in result.stderr:
+            return 'invalid', 'Git does not recognize a working tree here'
+        return 'unknown', 'Git top-level probe failed'
+    except (OSError, subprocess.SubprocessError, ws.ScanIncomplete):
+        return 'unknown', f'could not verify {marker}'
+
+
+def parent_git_inventory(trees):
+    parents = {str(parent) for path in trees for parent in Path(path).parents if str(parent) in trees}
+    ordered = sorted(parents)
+    with cf.ThreadPoolExecutor(8) as pool:
+        return dict(zip(ordered, pool.map(parent_git_state, ordered)))
+
+
+def ignored_dependency_file(rel):
+    parts = Path(rel).parts[:-1]  # Directory components only, never the leaf name.
+    if any(part in {'node_modules', 'vendor', '.venv', 'site-packages'} for part in parts):
+        return True
+    for i, part in enumerate(parts[:-2]):
+        store = part == '.pnpm-store' or (part == 'store' and i > 0 and parts[i - 1] == 'pnpm')
+        if store and re.fullmatch(r'v[0-9]+', parts[i + 1]) and parts[i + 2] in ('files', 'index'):
+            return True
+    return False
+
+
+def local_state(path, kind, inventory, anchors, refs, live_parents=False):
     checkpoint()
     if path != canonical(path) or not stat.S_ISDIR(os.lstat(path).st_mode):
         raise ws.Keep('symlink or nonphysical directory')
     if os.path.ismount(path):
         raise ws.Keep('filesystem root or mount point')
+    parent_states = {} if live_parents else inventory.get('parent_git_states', {})
     nested_child, nested_kind = path, kind
-    parent = os.path.dirname(path)
-    while parent != path:
-        if parent in inventory['trees']:
-            if not same_origin_nested(nested_child, nested_kind, parent, inventory['trees'][parent]):
-                raise ws.Keep(f'嵌套于 {parent}，由该项目自行保留')
-            # Check each ownership boundary. A descendant with remotes A+B
-            # must not bridge a foreign B snapshot inside an A project.
-            nested_child, nested_kind = parent, inventory['trees'][parent]
-        if parent == '/': break
-        parent = os.path.dirname(parent)
+    for ancestor in Path(path).parents:
+        parent = str(ancestor)
+        marker = ancestor / '.git'
+        parent_kind = inventory['trees'].get(parent)
+        if live_parents and (parent_kind is not None or
+                             any(inside(parent, root) for root in inventory.get('scan_roots', []))):
+            try:
+                marker_info = marker.lstat()
+            except FileNotFoundError:
+                continue
+            parent_kind = ('clone' if stat.S_ISDIR(marker_info.st_mode) else
+                           'linked' if stat.S_ISREG(marker_info.st_mode) else 'unknown')
+        if parent_kind is None:
+            continue
+        state, detail = parent_states[parent] if parent in parent_states else parent_git_state(parent)
+        if state == 'invalid':
+            continue
+        if state == 'unknown':
+            raise ws.Keep(f'parent Git worktree unknown: {parent}: {detail}')
+        if not same_origin_nested(nested_child, nested_kind, parent, parent_kind):
+            raise ws.Keep(f'嵌套于 {parent}，由该项目自行保留')
+        # A descendant with remotes A+B must not bridge foreign B under A.
+        nested_child, nested_kind = parent, parent_kind
     for index in (anchors, refs):
         holder = ws.anchored(index, path)
         if holder:
@@ -2244,10 +2327,11 @@ def local_state(path, kind, inventory, anchors, refs):
         raise ws.Keep('stash exists')
     if ws.populated_submodule(path):
         raise ws.Keep('populated submodule')
-    # No dependency or main-checkout exemption for ignored credentials.
+    # Owner-rebuildable installed dependency files are not repository secrets.
     out = git(path, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard', timeout=600).stdout
     for rel in out.split('\0'):
-        if rel and ws.SECRET_NAME.search(rel) and not ws.SECRET_TEMPLATE.search(rel):
+        if (rel and ws.SECRET_NAME.search(rel) and not ws.SECRET_TEMPLATE.search(rel)
+                and not ignored_dependency_file(rel)):
             raise ws.Keep(f'ignored credential: {rel}')
     head = git(path, 'rev-parse', 'HEAD').stdout.strip()
     objects = dict(line.split(None, 1) for line in git(path, 'for-each-ref',
@@ -2264,24 +2348,45 @@ def recovery_state(path, objects):
     # A remote inside this tree vanishes with it. External local remotes
     # participate in the full reference index, which keeps their containing
     # checkout; bare stores are reference sources, never deletion targets.
+    missing_local = {}
     for name, (url, _) in list(repo.remotes.items()):
-        target = tc.local_path(url, path)
-        if target and inside(canonical(target), path):
+        target = tc.local_path(url, path) if url else None
+        if not target:
+            continue
+        if inside(canonical(target), path):
             repo.remotes.pop(name)
             if repo.dest == name:
                 repo.dest = None
+            continue
+        try:
+            os.stat(target)
+        except (FileNotFoundError, NotADirectoryError):
+            missing_local[name] = target
+            repo.remotes.pop(name)
+        except OSError as exc:
+            raise ws.Keep(f'local remote could not be checked: {name} ({target}); {exc.strerror}') from exc
+    if missing_local:
+        repo.dest = repo._archive_destination(set(ws.DEFAULT_LOGINS))
     repo.load_live(include_tags=True)
     if repo.unreachable:
-        raise ws.Keep('remote query incomplete: ' + ', '.join(sorted(repo.unreachable)))
-    if not repo.live:
+        first = sorted(repo.unreachable)[0]
+        failures = ', '.join(f'{name} ({repo.remote_errors[name]})' for name in sorted(repo.unreachable))
+        # Network/authentication failure does not prove refs are absent.
+        cache = ' [AgentFlow knowledge-cache]' if inside(path, str(Path.home() / '.agentflow/knowledge-cache')) else ''
+        raise ws.Keep(f'{repo.remote_errors[first]}: {failures}{cache}')
+    if not repo.live and not missing_local:
         raise ws.Keep('no independently recoverable remote')
     item['remote_proofs'] = {ref: (repo.by_sha.get(sha) if ref.startswith('refs/tags/') else repo.proof(sha))
                              for ref, sha in item['objects'].items()}
     missing = {ref: sha for ref, sha in item['objects'].items() if not item['remote_proofs'][ref]}
     item['archive_objects'] = missing
     item['urls'] = [pair[0] for pair in repo.remotes.values()]
+    item['missing_local_remotes'] = missing_local
     if missing:
         if not repo.dest:
+            if missing_local:
+                lost = ', '.join(f'{name} ({target})' for name, target in sorted(missing_local.items()))
+                raise ws.Keep(f'unpushed refs; local remote missing and no archive destination: {lost}')
             raise ws.Keep('unpushed refs and no personal or internal remote')
         url = ws.transport_url(repo.remotes[repo.dest][1])
         if any('mono2' in s.lower() for s in [path, *item['urls']]) and ws.parse_remote(url)[0] == 'github.com':
@@ -2291,11 +2396,11 @@ def recovery_state(path, objects):
     return item
 
 
-def plan(path, kind, inventory, anchors, refs, error=None):
+def plan(path, kind, inventory, anchors, refs, error=None, *, live_parents=False):
     item = {'path': path, 'type': kind, 'action': 'keep', 'archives': []}
     try:
         with execution_step('local_state'):
-            item.update(local_state(path, kind, inventory, anchors, refs))
+            item.update(local_state(path, kind, inventory, anchors, refs, live_parents))
         if error:
             raise ws.Keep(error)
         with execution_step('remote_proof'):
@@ -2349,6 +2454,7 @@ def verify_clone_recovery(item):
             current['remote_proofs'][archive['source']] = archive['url'] + ':' + archive['ref']
     item['remote_proofs'] = current['remote_proofs']
     item['urls'] = current['urls']
+    item['missing_local_remotes'] = current['missing_local_remotes']
 
 
 def remove(item, inventory, anchors, refs, *, live=False):
@@ -2359,7 +2465,7 @@ def remove(item, inventory, anchors, refs, *, live=False):
         with execution_step('bb_environment'):
             anchors = {**anchors, **clone_environment_anchors()}
     with execution_step('local_state'):
-        local = local_state(path, item['type'], inventory, anchors, refs)
+        local = local_state(path, item['type'], inventory, anchors, refs, live)
     for key in ('identity', 'objects', 'gitdir', 'main'):
         if local[key] != item[key]:
             raise ws.Keep(f'{key} changed after plan')
@@ -2431,7 +2537,7 @@ def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
             if row.get('bytes') is None:
                 raise ws.Keep('size measurement incomplete')
             LIVE.clear()
-            fresh = plan(row['path'], row['type'], inventory, anchors, refs)
+            fresh = plan(row['path'], row['type'], inventory, anchors, refs, live_parents=True)
             if fresh['action'] == 'keep':
                 raise ws.Keep(fresh['reason'])
             if fresh['objects'] != row['objects'] or fresh['identity'] != row['identity']:
@@ -2484,8 +2590,74 @@ def summarize(rows):
             result['unmeasured'] += 1
         else:
             result['bytes'][key] = result['bytes'].get(key, 0) + row['bytes']
-    # Nested rows overlap: totals are inventory sizes, not additive freed space.
+    result['retention'] = retention_ranking(rows)
+    # Nested rows and shared blocks can overlap: inventory size is not freed space.
     return result
+
+
+def retention_ranking(rows):
+    groups = {}
+    for row in rows:
+        if row.get('result', row['action']) not in ('keep', 'kept'):
+            continue
+        reason = ws.reason_key(row.get('reason', 'unknown'))
+        groups.setdefault(reason, []).append(row)
+    buckets = []
+    for reason, items in groups.items():
+        measured = {}
+        for row in items:
+            if row.get('bytes') is not None and row.get('path'):
+                path = os.path.normpath(row['path'])
+                measured[path] = max(measured.get(path, 0), row['bytes'])
+        # Within a bucket, count a measured subtree only once per lexical
+        # root. Per-path du still cannot deduplicate hardlinks across roots.
+        largest_roots = {
+            path: size for path, size in measured.items()
+            if not any(str(parent) in measured for parent in Path(path).parents)
+        }
+        buckets.append(dict(
+            reason=reason, count=len(items),
+            unmeasured=sum(row.get('bytes') is None for row in items),
+            bytes=sum(largest_roots.values()) if largest_roots else None,
+            largest_paths=[dict(path=path, bytes=size) for path, size in
+                           sorted(largest_roots.items(), key=lambda pair: (-pair[1], pair[0]))[:5]],
+        ))
+    by_bytes = sorted(buckets, key=lambda row: (-(row['bytes'] if row['bytes'] is not None else -1), row['reason']))
+    by_count = sorted(buckets, key=lambda row: (-row['count'], row['reason']))
+    return {'by_bytes': by_bytes,
+            'by_count': [{'reason': row['reason'], 'count': row['count']} for row in by_count]}
+
+
+def environment_retention(rows, host):
+    # This is a reporting view only: a release/refusal hands the path to Git.
+    measured = []
+    until = min(time.monotonic() + 20, DEADLINE - 5)
+
+    def size(path):
+        try:
+            left = until - time.monotonic()
+            if left > 0 and os.path.isdir(path) and not os.path.islink(path):
+                out = command(['du', '-sx', '-B1', '--', path], timeout=left, check=False)
+                if out.returncode == 0:
+                    return int(out.stdout.split()[0])
+        except (OSError, ValueError, IndexError, subprocess.SubprocessError, ws.ScanIncomplete):
+            pass
+        return None
+
+    for row in rows:
+        outcome = row.get('result', row['action'])
+        if row['reason'] == 'environment destroyed' or outcome not in ('keep', 'kept', 'cleanup requested; pending'):
+            continue
+        reason = row.get('cleanup_error', outcome if outcome == 'cleanup requested; pending' else row['reason'])
+        measured.append(dict(row, action='keep', result='kept', reason=reason, bytes=None))
+
+    def measure(row):
+        path = row['path']
+        if row['host_id'] == host and path and os.path.isabs(path) and os.path.normpath(path) != '/':
+            row['bytes'] = size(path)
+    with cf.ThreadPoolExecutor(8) as pool:
+        list(pool.map(measure, measured))
+    return retention_ranking(measured)
 
 
 def reviewed_comparison(rows, preview_path):
@@ -2610,7 +2782,7 @@ def bb_environment_main(argv=None):
     stamp = time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())
     os.makedirs(args.state_dir, mode=0o700, exist_ok=True)
     output = Path(args.state_dir, f'bb-environment-sweep-{stamp}.json'); log = output.with_suffix('.jsonl')
-    rows, error, failures = [], None, []
+    rows, error, failures, host = [], None, [], None
     with open(Path(args.state_dir, 'git-tree-sweep.lock'), 'a') as lock:
         try: fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
@@ -2664,12 +2836,15 @@ def bb_environment_main(argv=None):
         except Exception as exc: error = ws.failure_text(exc)
         error = error or ('; '.join(failures) if failures else None)
         if time.monotonic() >= DEADLINE: error = error or 'time budget reached'
+        retention = environment_retention(rows, host) if host is not None else retention_ranking([])
         report = dict(schema_version=1, policy='bb-environments', bb_cli=os.environ.get('BB_CLI'), mode='execute' if args.execute else 'dry-run',
-                      timestamp=stamp,complete=not bool(error),error=error,failures=failures,items=rows,
+                      timestamp=stamp,invocation_id=os.environ.get('INVOCATION_ID'),complete=not bool(error),error=error,failures=failures,items=rows,
+                      summary={'retention': retention},
                       timings={'total_seconds':round(time.monotonic()-started,3)},output=str(output))
         with open(output,'w',opener=lambda p,flags:os.open(p,flags,0o600)) as handle: json.dump(report,handle,ensure_ascii=True,indent=2)
         for row in rows: persist(log,row)
-        print(json.dumps(report if args.json else {key:report[key] for key in ('policy','mode','complete','error','timings','output')}))
+        persist(log, {'event': 'finish', 'complete': report['complete'], 'summary': report['summary']})
+        print(json.dumps(report if args.json else {key:report[key] for key in ('policy','mode','complete','error','timings','summary','output')}))
         return 1 if error else 0
 
 
@@ -3041,11 +3216,12 @@ def linked_main(argv=None):
         except Exception as exc: error = ws.failure_text(exc)
         if time.monotonic() >= DEADLINE: error = error or 'time budget reached'
         report = {'schema_version':3,'policy':'linked','mode':'execute' if args.execute else 'dry-run','timestamp':stamp,'bb_cli':os.environ.get('BB_CLI'),
-                  'complete':not bool(error),'error':error,'indexed_discovery':indexed,'mains':sorted(mains),
+                  'invocation_id':os.environ.get('INVOCATION_ID'),'complete':not bool(error),'error':error,'indexed_discovery':indexed,'mains':sorted(mains),
                   'unresolved_mains':failures,'items':rows,'prunes':prunes,'reviewed_comparison':comparison,
                   'timings':{'total_seconds':round(time.monotonic()-started,3)},'summary':summarize(rows),'output':str(output)}
         with open(output,'w',opener=lambda p,flags:os.open(p,flags,0o600)) as handle: json.dump(report,handle,ensure_ascii=True,indent=2)
         for row in rows: persist(log,row)
+        persist(log, {'event': 'finish', 'complete': report['complete'], 'summary': report['summary']})
         print(json.dumps(report if args.json else {key:report[key] for key in ('policy','mode','complete','error','timings','summary','output')}))
         return 1 if error else 0
 
@@ -3081,6 +3257,12 @@ def main(argv=None):
         except Exception as exc:
             error = 'managed storage unknown: ' + ws.failure_text(exc)
         inventory = discover(roots, excluded)
+        inventory['parent_git_states'] = parent_git_inventory(inventory['trees'])
+        inventory['invalid_parent_markers'] = [
+            {'path': os.path.join(parent, '.git'), 'reason': detail,
+             'recommendation': 'inspect and remove separately only after confirming it is unused'}
+            for parent, (state, detail) in inventory['parent_git_states'].items() if state == 'invalid'
+        ]
         inventory['linked_markers'] = [path for path, kind in inventory['trees'].items() if kind == 'linked']
         inventory['marker_counts'] = {kind: sum(value == kind for value in inventory['trees'].values()) for kind in set(inventory['trees'].values())}
         timings = {'discovery_seconds': round(time.monotonic() - started, 3)}
@@ -3088,7 +3270,12 @@ def main(argv=None):
                       'trees': len(inventory['trees']), 'directories': inventory['directories'], 'errors': inventory['errors']})
         global_inventory = {'started_at': started_at,
                             'discovered_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'scope': 'round'}
-        paths = sorted(path for path, kind in inventory['trees'].items() if kind != 'linked')
+        invalid_parents = {path for path, (state, _) in inventory['parent_git_states'].items()
+                           if state == 'invalid'}
+        # Diagnostic markers are not Git trees. Never charge a container's
+        # entire footprint to its invalid marker or send it to a deletion plan.
+        paths = sorted(path for path, kind in inventory['trees'].items()
+                       if kind != 'linked' and path not in invalid_parents)
         # Capture processes before starting our own du workers: their argv/fds
         # must not become long-lived business anchors in this round snapshot.
         process_started = time.monotonic()
@@ -3161,17 +3348,18 @@ def main(argv=None):
         if time.monotonic() >= DEADLINE:
             error = error or 'time budget reached; partial plan retained'
         report = {'schema_version': 2, 'policy': 'clones', 'timestamp': stamp, 'mode': 'execute' if args.execute else 'dry-run', 'bb_cli': os.environ.get('BB_CLI'),
-                  'roots': roots, 'complete': not bool(error or inventory['errors']), 'error': error,
+                  'invocation_id': os.environ.get('INVOCATION_ID'), 'roots': roots, 'complete': not bool(error or inventory['errors']), 'error': error,
                   'global_inventory': global_inventory,
                   'unresolved': unknown, 'global_unresolved': global_unknown(unknown),
                   'reviewed_comparison': comparison,
-                  'discovery': {k: v for k, v in inventory.items() if k not in ('trees', 'links', 'remote_urls')},
+                  'discovery': {k: v for k, v in inventory.items() if k not in ('trees', 'links', 'remote_urls', 'parent_git_states')},
                   'timings': dict(timings, total_seconds=round(time.monotonic() - started, 3)),
                   'summary': summarize(rows), 'items': rows, 'output': str(output)}
         with open(output, 'w', opener=lambda p, flags: os.open(p, flags, 0o600)) as handle:
             json.dump(report, handle, ensure_ascii=True, indent=2)
         for row in rows:
             persist(log, row)
+        persist(log, {'event': 'finish', 'complete': report['complete'], 'summary': report['summary']})
         print(json.dumps(report if args.json else {k: report[k] for k in ('mode', 'complete', 'error', 'timings', 'summary', 'output')}, ensure_ascii=True))
         return 1 if not report['complete'] else 0
 
