@@ -135,8 +135,10 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     文件系统根和挂载点只列出保留；clone 仅 fd-based 删除该目录，逐级打开 ancestor 时 O_NOFOLLOW，不跟随任何软链。预演与执行共用判定。
     不删除 BB 环境。每对象 JSON/JSONL 包含路径、类型、实占（失败为 null）、
     决定/原因、refs/SHA、归档证据和耗时；嵌套占用不相加冒充可回收量。完整发现或引用扫描失败整轮保留。
-- **2026-11-14 owner 批准：pnpm store 每周日 05:30 owner prune**：`pnpm_store_prune.py` 在
-  `/data/code/mole-linux` 用 `pnpm store path` 得到当前版本路径，再取共同 store 根（当前 `/data/.pnpm-store`）。
+- **pnpm store 每周日 05:30 owner prune**：2026-11-21 扩至本机发现的所有根。枚举 PATH、
+  NVM、pnpm 自管理工具目录和 Corepack 已下载的 pnpm，分别在任务目录、HOME 和中立目录运行 `store path`；
+  加入 HOME/XDG 默认 store、本地 npmrc 的 `store-dir` 和具有 CAS 桶与格式标记的物理 store，按真实路径去重。
+  不进入 Git 元数据和 node_modules 查配置；解析失败单列，宿主文件清单不完整则不执行。
   逐个存在的版本目录执行对应 pnpm 的 `--store-dir <共同根> store prune`；禁止把 `vN` 目录再当 store 根。
   本机实测选用 pnpm 9 → v3、pnpm 10 → v10、pnpm 12 → v11；工具通过现有 pnpm 或 `npx --yes pnpm@<major>`
   获取，先核版本及同一显式根下的 `store path` 精确匹配；工具不可得、格式未知或路径不符则跳过该版本并记原因。
@@ -146,6 +148,11 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   pnpm run/exec/start/脚本、npm、npx、yarn、vite 不阻塞，pnpm 子进程按自身命令判断。`/proc` 未知仍跳过，
   每次 prune 前再查一次。只调用 owner 命令，不直接递归删 store。逐版本 JSONL 记录前后字节及结果；真实 prune
   失败记账并继续其余版本，最终非零。默认预演、`--execute` 执行、`--quiet` 无动作静默。
+  版本和内容根拒绝软链、布局不符和子挂载；命令边界复查身份。人工可用 `--root` 限定已发现根。
+- **Cursor Agent 版本由更新器收尾**：Personal 的 `auto_bgngb9bbyqk` 每天 04:22 调
+  `~/.local/share/agent-cli-updates/update.py --tool cursor`。版本校验成功后，保留 `agent`
+  软链实际指向的当前版本、紧邻的上一版及有活进程 exe、cwd 或 maps 引用的版本；仅处理
+  `~/.local/share/cursor-agent/versions` 内的物理版本目录，其他数据不动。
 - **共享缓存不是线程遗留**：`/data/bb-data/thread-storage/.shared-cache/` 是 lightspace 建立的共享 Go 和
   golangci-lint 缓存，`/root/.cache/go-build` 与 `/root/.cache/golangci-lint` 的 realpath 指向其中。
   只能由 `go_cache_trim.py` 按上述 24h 规则修剪；不得当作线程遗留删除或误报为待清线程目录。
@@ -336,7 +343,9 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | 路径指纹 | 归属 |
 |---|---|
 | `/data/itfs` | itfs |
-| `/data/.pnpm-store` | pnpm store |
+| `/data/.pnpm-store` | pnpm store (pnpm_store_prune.py) |
+| `/data/root-storage-20260912/root/.local/share/pnpm/store` | pnpm store (pnpm_store_prune.py) |
+| `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` | agent-cli-updates 更新器 |
 | `/data/codex` | Codex sessions |
 | `/data/bb-data/thread-storage/.shared-cache/go-build` | shared Go build cache |
 | `/data/bb-data/thread-storage/.shared-cache/golangci-lint` | shared golangci-lint cache |

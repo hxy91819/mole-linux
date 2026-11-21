@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位刹车使用快照 `8833479afbddfa7c`，增长计量使用快照 `56806e44ddcbe176`：
+水位刹车使用快照 `8833479afbddfa7c`，增长计量使用快照 `7d9f2b6b43819ccd`：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -58,7 +58,10 @@ Docker、Go、全盘 Git 清理、pnpm 与 clean-tmp `/data/system-tmp`，/ 对�
 du以 `LC_ALL=C` 运行。非零退出时，仅当stdout有本根合法总量、stderr每行均为
 条目消失（`No such file or directory`）才保留 `status=ok`；附 `vanished` 诊断行数与
 最多5条 `vanished_examples`。子项随临时目录消失是正常并发变化，不算每日检查不符合。
-code/cache/BB的分项输出只在实际扫描父根附备注，避免重复计数。
+迁移目录 `/data/root-storage-20260912` 使用同一次物理遍历，按原迁移项细分，Cursor
+`versions` 和 pnpm `store` 是独立指标。中间汇总不参与告警；两项分别保留 20 GiB/天和
+三次连续增长累计 3 GiB 的判据，新历史尚不足时不误报。
+code/cache/BB及迁移目录的分项输出只在实际扫描父根附备注，避免重复计数。
 混有权限、I/O等其他错误、无本根合法总量、信号退出或超时仍记unknown。
 
 预演和只读复现：
@@ -73,7 +76,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 维护脚本任务都属于 project `proj_8d3wrcajxn`，时区 `Asia/Shanghai`。
 它们跑的是 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 下的不可变副本，
 不是仓库工作区。`<sha16>` 是 `manifest.json` 规范化内容 sha256 的前 16 位；
-2026-11-14 当前快照是 `0a809fb13caabb6c`，发布新快照后替换。
+Docker/Go 沿用原快照；pnpm 使用 `e6b1df5c51c125aa`。
 
 | 任务 | ID | 时间 | 工作目录 | 命令 | 无动作时 |
 |---|---|---|---|---|---|
@@ -81,7 +84,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 | Go 缓存修剪 | `auto_vad6yvkpdeq` | 每小时第 37 分 | `/var/tmp` | `${PY} -I <snap>/go_cache_trim.py --execute --quiet` | `skipped`，exit 0 |
 | BB环境→linked→独立clone | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `bash <git-snap>/git_tree_sweep_run.sh --execute` | 输出异步报告位置；实际结果以完整JSON/JSONL为准 |
 | 旧 tmp 独立 clone | `auto_3jiqtmzreq8` | 已停用 | `/var/tmp` | 保留历史记录；新统一入口覆盖其范围 | enabled=false |
-| pnpm store prune | `auto_yfr5p14dvnc` | 周日 05:30 | `/data/code/mole-linux` | `${PY} -I <snap>/pnpm_store_prune.py --execute --quiet` | `skipped`，exit 0 |
+| pnpm store prune | `auto_yfr5p14dvnc` | 周日 05:30 | `/data/code/mole-linux` | `${PY} -I <store-snap>/pnpm_store_prune.py --execute --quiet` | `skipped`，exit 0 |
 
 脚本任务共同的解释器与 PATH：
 
@@ -96,11 +99,21 @@ export PATH=/root/.nvm/versions/node/v24.15.0/bin:/root/.nvm/versions/node/v24.2
 export PATH=/root/.nvm/versions/node/v24.22.1/bin:/root/.nvm/versions/node/v24.15.0/bin:/usr/local/go/bin:/root/.local/bin:/usr/local/bin:/usr/bin:/bin
 ```
 
-工作目录必须是 `/data/code/mole-linux`，因为 `pnpm store path` 会随项目/目录变化；
-在 `/var/tmp` 或 `/data` 下解析会得到不同的 store。拿到共同根 `/data/.pnpm-store` 后，
-逐版本工具从中立目录运行并显式传 `--store-dir /data/.pnpm-store`，不能把 `vN` 目录当根。
+pnpm 从 `/data/code/mole-linux` 启动，联合各已安装 pnpm 在项目、HOME 和中立目录的
+`store path`、HOME/XDG 默认根、npmrc 的 `store-dir` 和具备 pnpm CAS 布局的自定义根。
+Docker 自管存储不纳入。逐格式 owner 命令从中立目录运行，
+显式传已发现的真实共同根，不能把 `vN` 目录当根。人工只处理 HOME 根时，用同一个
+`--root ~/.local/share/pnpm/store` 先看预演，再加 `--execute`；正常周任务不传 `--root`。
 
-脚本任务超时：Docker/Go 600 秒，pnpm 900 秒。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 先给BB环境回收5分钟，再给 linked 15分钟，再给独立 clone 预演/执行各30分钟，systemd 整体硬限均53分钟。预算按两条路径实测分别设置，不缩小发现范围。`--quiet` 只表示“没有实际
+`<store-snap>` 包含 `pnpm_store_prune.py`、`local_storage_inventory.py`、`worktree_sweep.py`；
+JSONL 写到 `~/.local/state/devcloud-storage-upkeep/pnpm-store-prune-*`。盘可用空间差
+与目录分项的已分配字节差分列，前者含后台写入。
+
+Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
+`python3 /root/.local/share/agent-cli-updates/update.py --tool cursor`。更新器目录独立于此仓；
+每轮校验成功后的保留和删除记录写入 `~/.local/state/agent-cli-updates/cursor.json`。
+
+脚本任务超时：Docker/Go 600 秒，pnpm 900 秒（宿主清单有独立 650 秒预算）。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 先给BB环境回收5分钟，再给 linked 15分钟，再给独立 clone 预演/执行各30分钟，systemd 整体硬限均53分钟。预算按两条路径实测分别设置，不缩小发现范围。`--quiet` 只表示“没有实际
 清理且命令没有失败时保持安静”，BB 把它记为 `skipped`；`skipped` 不是失败。
 
 每日检查是 agent 任务，不是脚本任务：
