@@ -22,8 +22,8 @@ def command_for(cli):
     return [cli]
 
 
-def resolve():
-    value = os.environ.get('BB_CLI')
+def resolve(*, server_only=False):
+    value = None if server_only else os.environ.get('BB_CLI')
     if not value:
         try:
             out = subprocess.run(['/usr/bin/systemctl', 'show', 'bb-dev-server.service',

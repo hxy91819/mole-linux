@@ -6,6 +6,13 @@
 现行任务和复现见 [DEVCLOUD_AUTOMATION](../../../../docs/DEVCLOUD_AUTOMATION.md)。
 新规则按 [本机账本与晋升条件](../../../../docs/DEVCLOUD_STORAGE_DESIGN.md#linux-devcloud-audit-ledger) 记账并晋升到这里。
 
+## 保护规则的证据
+
+优先用数据 owner 自带的登记清单与最终判断。比如，以 `git worktree list` 确认登记，
+交给 `git worktree remove` 在不加 `--force` 的情况下拒绝不安全的删除。每新增一条保护，
+都要写清它防的是哪个具体问题、证据从哪里取。只有确实缺少可靠证据、无法把保护收窄到
+受影响对象时，才允许整体宽保护；同时记录缺失的证据和当前可证明的最小范围。
+
 ## 本机可再生残留的长期授权
 
 - **owner 2026-11-03**：「所有不是近期在用、可恢复的东西都能清理。」按本机现有年龄及引用判据，
@@ -117,12 +124,23 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     owner核验的 account-limits/v0.3.2、devcloudtool/vim、bats-core-1.13.0 及 lighthouse-bak 不加路径例外；名称碰撞按上述同源归属规则处理；没有其他保留副本时才保留并说明。
   - **本地全条件**：所有非 `.git` 条目及 Git 元数据（含 FETCH_HEAD、ORIG_HEAD、refs 与 reflog）最新 mtime 满 7 天（168h），所有位置统一；
     status 含全部 untracked 为空、无 stash、无进行中的 Git 操作/锁、无已填充子模块，
-    ignored 中无凭据（无主 checkout 同内容豁免，也不豁免依赖目录内凭据）。包含嵌套仓库的父树保留；
-    位于另一Git树内的子树（含ignored目录）若是父仓库的linked worktree，或其有效remote与父仓库任一remote规范化后相同，就不适用嵌套保护，继续判定其他全部条件；否则（异源、无remote或关系未知）保留，原因写“嵌套于 <父仓库>，由该项目自行保留”。每次本地复核重读当前common gitdir及有效fetch/push URL，应用Git重写/物理本地路径归一，不沿用旧库存中的同源结论；多层嵌套逐层判断，异源外层仍保护取证快照。
+    ignored 中无凭据；`node_modules`、`vendor`、`.venv`、`site-packages` 和 pnpm
+    `vN/{files,index}` 格式布局内的安装产物不参加 ignored 凭据探测，避免依赖自带测试证书锁住整树。
+    仓库自身的 `.env`、`id_*`、`*.key` 等仍保护；没有主 checkout 同内容豁免。
+    包含嵌套标记的父树仍保留；对子树，只有 `git rev-parse --show-toplevel` 证明
+    父目录是其自己的 Git 工作树才适用嵌套规则。探针未知时保留子树；Git 已明确否定的
+    标记单列报告，保留原标记，建议独立核查；不再把空 `.git` 当作拥有全部后代的仓库。
+    在有效父树内，Git 登记同主仓或有效 remote 同源的子树继续判定其余条件；异源、无 remote 或关系
+    未知仍保留以保护项目所有的克隆和取证快照。删前实时重验父 Git 根、common gitdir 和有效 fetch/push URL；
+    多层逐界判断，不能以多 remote 跨过异源父树。
     主仓库还有登记 linked worktree 时保留；被其他发现仓库（含 bare）的 remote URL /
     pushurl（含 Git insteadOf/pushInsteadOf 展开后的全部有效 URL）/ alternates 引用时保留。借用对象的一方自身存在 `objects/info/alternates` 不构成保留理由；删除仅作用于借用方自己的目录，不会删除外部对象库。借用方仍须满足干净、7天、所有refs实时远端证明或先归档核SHA等全部条件；借用配置文件的近期mtime仍计为Git活动。主 checkout 仅在这些保护下判定，不再按路径或身份一律排除。
   - **恢复证明**：每个本地 branch、HEAD 和 tag 都要在实时远端上证明；tag 验 exact object SHA，
-    branch/HEAD 可验位于实时远端分支历史。远端查询失败保留；指向待删树自身/内部的 local/file remote 不作独立恢复证明；外部本地 remote 的包含仓库由完整 URL 引用索引保护，bare 库只作引用源不进入删除。缺失 ref 只能向同主机个人命名空间或内部 origin 的 `archive/git-tree/*`
+    branch/HEAD 可验位于实时远端分支历史。网络超时在既有预算内重试一次；网络、认证或权限未知
+    仍保留且单列诊断。指向待删树自身/内部的 local/file remote 不算独立恢复证明；外部本地 remote 的
+    包含仓库由完整 URL 引用索引保护，bare 库只作引用源。已证实路径不存在的 local/file remote 没有
+    可恢复的 refs；排除后按未推送处理，不能用旧 tracking ref 代替实时证据。缺失 ref 只能向既有授权规则
+    选出的个人命名空间或内部 origin 的 `archive/git-tree/*`
     推原始对象，逐 ref `ls-remote` 核 exact SHA；tag 用 tag ref，不能用压缩快照替代原历史，不 force push，
     mono2 不推 GitHub，无目的地/归档失败均保留。预演只查询，不推送。
   - **2026-11-19 owner 性能边界**：全盘发现、remote/alternates、配置/名称/容器/自动化引用库存在本轮完整建立一次并复用；报告global_inventory记开始、发现完成和引用完成的UTC时间。轮内新增但未活跃读取的全局消费者下轮发现；不做每树全盘重扫。owner确认候选已闲置7天，新增borrower仍可从已经证明/归档的远端恢复，接受此快照边界。

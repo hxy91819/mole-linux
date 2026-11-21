@@ -169,7 +169,7 @@ def test_clean_old_published_clone_is_candidate_and_preview_does_not_mutate(case
 
 
 @pytest.mark.parametrize('guard', ['untracked', 'dirty', 'stash', 'recent_file', 'recent_metadata',
-                                   'ignored_secret', 'dependency_secret', 'operation'])
+                                   'ignored_secret', 'operation'])
 def test_local_refusals(case, guard):
     c = case
     if guard == 'untracked': (c.repo / 'untracked').write_text('unique')
@@ -181,15 +181,12 @@ def test_local_refusals(case, guard):
     if guard == 'recent_file': (c.repo / 'a').touch()
     if guard == 'recent_metadata': (c.repo / '.git/HEAD').touch()
     if guard == 'ignored_secret': (c.repo / '.env').write_text('secret')
-    if guard == 'dependency_secret':
-        (c.repo / 'node_modules').mkdir()
-        (c.repo / 'node_modules/key.pem').write_text('private')
     if guard == 'operation': (c.repo / '.git/MERGE_HEAD').write_text('x')
     if guard not in ('recent_file', 'recent_metadata'): age(c.repo)
     row = plan(c)
     assert row['action'] == 'keep', row
     expect = {'untracked': 'dirty', 'dirty': 'dirty', 'stash': 'stash', 'recent_file': '168h',
-              'recent_metadata': '168h', 'ignored_secret': 'credential', 'dependency_secret': 'credential',
+              'recent_metadata': '168h', 'ignored_secret': 'credential',
               'operation': 'progress'}
     assert expect[guard] in row['reason'], row
 
@@ -3352,3 +3349,150 @@ def test_live_mount_path_keeps_non_ascii_and_non_newline_separators(case,monkeyp
         c.m.execute([row],inventory,{},{},[str(c.root)],set(),'unicode-mount',c.root/'events')
     assert not calls and row.get('result')=='kept' and 'mounted path' in row.get('reason',''),row
     assert c.repo.exists()
+
+
+@pytest.mark.parametrize('empty_inside_outer', [False, True])
+def test_empty_git_marker_is_not_an_owner_and_is_reported(case, monkeypatch, capsys, empty_inside_outer):
+    c = case
+    parent = (c.repo if empty_inside_outer else c.root) / 'container'
+    parent.mkdir()
+    (parent / '.git').mkdir()
+    child = parent / 'child'
+    shell('git', 'clone', '-q', str(c.bare), str(child))
+    shell('git', 'remote', 'set-url', 'origin', 'https://git.example.invalid/group/repo.git', cwd=child)
+    age(parent)
+    inventory = inv(c)
+    monkeypatch.setenv('INVOCATION_ID', 'a' * 32)
+    monkeypatch.setattr(c.m, 'discover', lambda *a: inventory)
+    monkeypatch.setattr(c.m, 'managed_roots', lambda: set())
+    monkeypatch.setattr(c.m, 'process_anchors', lambda *a: {})
+    monkeypatch.setattr(c.m, 'usage', lambda *a, **kw: ({}, []))
+    assert c.m.main(['--json', '--state-dir', str(c.root / 'state')]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['invocation_id'] == 'a' * 32
+    rows = {row['path']: row for row in report['items']}
+    assert rows[str(child)]['action'] == 'remove', rows[str(child)]
+    assert str(parent) not in rows
+    assert [item['path'] for item in report['discovery']['invalid_parent_markers']] == [str(parent / '.git')]
+    assert (parent / '.git').is_dir() and child.is_dir()
+
+
+def test_sink_rechecks_previously_empty_parent_marker(case, monkeypatch):
+    c = case
+    parent = c.repo.parent
+    (parent / '.git').mkdir()
+    inventory = inv(c)
+    inventory['parent_git_states'] = c.m.parent_git_inventory(inventory['trees'])
+    row = c.m.plan(str(c.repo), 'clone', inventory, {}, {})
+    assert row['action'] == 'remove'
+    row['bytes'] = 4096
+    shell('git', 'init', '-q', str(parent))
+    monkeypatch.setattr(c.m, 'process_anchors', lambda *a: {})
+    monkeypatch.setattr(c.m, 'bb_environment_inventory', lambda: [])
+    c.m.execute([row], inventory, {}, {}, [str(c.root)], set(), 'new-parent', c.root / 'events')
+    assert row['result'] == 'kept' and str(parent) in row['reason'] and c.repo.exists()
+
+
+@pytest.mark.parametrize('fixture', [
+    'node_modules/ssh2/test/fixtures/https_cert.pem',
+    'vendor/example/test/id_rsa',
+    '.venv/lib/python3.12/example/.env',
+    'python/site-packages/example/private.key',
+    '.pnpm-store/v10/files/ab/cert.pem',
+    'pnpm/store/v11/index/ab/cert.pem',
+])
+def test_generated_dependency_credentials_do_not_block_published_clone(case, fixture):
+    c = case
+    shell('git', 'config', 'core.excludesFile', str(c.root / 'exclude'), cwd=c.repo)
+    (c.root / 'exclude').write_text('*\n')
+    path = c.repo / fixture
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch()
+    assert shell('git', 'check-ignore', '--', fixture, cwd=c.repo) == fixture
+    age(c.repo)
+    row = plan(c)
+    assert row['action'] == 'remove', row
+    path.unlink()
+    non_dependency = c.repo / 'config/id_ed25519'
+    non_dependency.parent.mkdir()
+    non_dependency.touch()
+    age(c.repo)
+    row = plan(c)
+    assert row['reason'] == 'ignored credential: config/id_ed25519', row
+
+
+@pytest.mark.parametrize('file_url', [False, True])
+def test_missing_local_remote_is_unpushed_even_with_stale_tracking_ref(case, file_url):
+    c = case
+    missing = c.root / 'missing-origin'
+    shell('git', 'remote', 'set-url', 'origin', missing.as_uri() if file_url else str(missing), cwd=c.repo)
+    sha = shell('git', 'rev-parse', 'HEAD', cwd=c.repo)
+    shell('git', 'update-ref', 'refs/remotes/origin/main', sha, cwd=c.repo)
+    age(c.repo)
+    row = plan(c)
+    assert row['action'] == 'keep'
+    assert row['reason'] == f'unpushed refs; local remote missing and no archive destination: origin ({missing})'
+    assert not any('ls-remote' in call for call in c.calls)
+
+
+def test_missing_local_remote_archives_to_remaining_approved_origin_before_removal(case, monkeypatch):
+    c = case
+    missing = c.root / 'missing-origin'
+    shell('git', 'remote', 'set-url', 'origin', missing.as_uri(), cwd=c.repo)
+    shell('git', 'remote', 'add', 'fork', 'https://git.example.invalid/hxy91819/repo.git', cwd=c.repo)
+    raw = c.m._run
+    monkeypatch.setattr(c.m, '_run', lambda argv, **kw: raw(
+        [str(c.bare) if part == 'https://git.example.invalid/hxy91819/repo.git' else part for part in argv], **kw))
+    (c.repo / 'a').write_text('unpublished')
+    shell('git', 'commit', '-qam', 'unique', cwd=c.repo)
+    sha = shell('git', 'rev-parse', 'HEAD', cwd=c.repo)
+    age(c.repo)
+    row, _ = execute_case(c, monkeypatch)
+    assert row['action'] == 'archive+remove' and row['result'] == 'removed', row
+    assert row['missing_local_remotes'] == {'origin': str(missing)}
+    assert row['archives'] and all(shell('git', 'rev-parse', a['ref'], cwd=c.bare) == sha for a in row['archives'])
+
+
+@pytest.mark.parametrize('failure,reason,attempts', [
+    ('timeout-once', None, 2),
+    ('timeout', 'remote timeout', 2),
+    ('Authentication failed', 'remote authentication failed', 1),
+    ('Connection refused', 'remote network failure', 1),
+    ('Git repository not found', 'remote repository missing or access denied', 1),
+])
+def test_remote_failures_are_distinct_and_only_timeout_is_retried(case, monkeypatch, failure, reason, attempts):
+    c = case
+    raw = c.m._run
+    calls = []
+    def run(cmd, **kw):
+        if 'ls-remote' in cmd:
+            calls.append(kw['timeout'])
+            if failure.startswith('timeout') and (failure == 'timeout' or len(calls) == 1):
+                raise subprocess.TimeoutExpired(cmd, timeout=kw['timeout'])
+            if not failure.startswith('timeout'):
+                raise subprocess.CalledProcessError(128, cmd, stderr=fatal_line(failure))
+        return raw(cmd, **kw)
+    def fatal_line(message):
+        return f'fatal: {message}'
+    monkeypatch.setattr(c.m, '_run', run)
+    row = plan(c)
+    assert len(calls) == attempts
+    if reason:
+        assert row['action'] == 'keep' and row['reason'].startswith(reason + ':'), row
+    else:
+        assert row['action'] == 'remove', row
+
+
+def test_relative_local_remotes_cannot_share_cached_refs_between_checkouts(case, monkeypatch):
+    c = case
+    calls = []
+    def git(path, *args, **kwargs):
+        calls.append(path)
+        return SimpleNamespace(stdout=path)
+    monkeypatch.setattr(c.m, 'git', git)
+    first = str(c.repo)
+    second = str(c.root / 'another' / 'checkout')
+    assert c.m.live_query(first, './remote.git') == first
+    assert c.m.live_query(second, './remote.git') == second
+    assert c.m.live_query(first, './remote.git') == first
+    assert calls == [first, second]
