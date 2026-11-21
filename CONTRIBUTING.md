@@ -11,7 +11,7 @@ ledger data in `.local/`; use synthetic examples when documenting or testing.
 brew install shfmt shellcheck bats-core golangci-lint
 
 # Install goimports for better Go formatting
-go install golang.org/x/tools/cmd/goimports@latest
+go install golang.org/x/tools/cmd/goimports@v0.49.0
 
 # Install pre-commit hook (runs format/lint checks on every commit)
 git config core.hooksPath .githooks
