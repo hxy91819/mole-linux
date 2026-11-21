@@ -19,7 +19,9 @@ Before drafting, confirm:
 5. **Issue reporters and PR contributors in this cycle**. Use the merged PRs and fixed issues in the release range. Keep it short, for example `Issue reporters and PR contributors this cycle: @a · @b.` Exclude `tw93` and bots.
 6. **Verify release exists**. `gh release view V<version> --repo tw93/Mole --json id,name` should return non-empty. If it doesn't, the workflow hasn't finished, wait, don't `gh release create`.
 
-## Pre-flight (cross-check against AGENTS.md)
+## Pre-flight
+
+The release checks come from the [release-flow checklist](../release-flow/SKILL.md#pre-flight-checklist).
 
 These should already be true if the tag was pushed correctly. Confirm before publishing notes:
 
