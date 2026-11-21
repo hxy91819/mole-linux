@@ -42,7 +42,7 @@ class CleanupWorktreesTest(unittest.TestCase):
         self.run_git("config", "user.name", "Test User")
         self.run_git("config", "user.email", "test@example.invalid")
         (self.repo / ".gitignore").write_text(
-            ".local/\n.env\nignored-*/\n", encoding="utf-8"
+            ".local/\n.env\nignored-*/\n.local-test/\n", encoding="utf-8"
         )
         (self.repo / "tracked.txt").write_text("baseline\n", encoding="utf-8")
         self.run_git("add", ".")
@@ -50,6 +50,13 @@ class CleanupWorktreesTest(unittest.TestCase):
         self.default_head = self.run_git("rev-parse", "HEAD").stdout.strip()
         self.worktree = self.add_worktree("task-123")
         self.install_fake_gh()
+        self.docker_state = self.root / "docker-state.json"
+        self.docker_state.write_text(
+            json.dumps({"containers": [], "unavailable": False, "fail_down": False}),
+            encoding="utf-8",
+        )
+        self.service_log = self.root / "services.log"
+        self.install_fake_docker()
 
     def run_git(self, *args: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -137,6 +144,46 @@ else:
         gh.write_text(script, encoding="utf-8")
         gh.chmod(0o755)
 
+    def install_fake_docker(self) -> None:
+        script = """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+with open(os.environ["FAKE_DOCKER_STATE"], encoding="utf-8") as handle:
+    state = json.load(handle)
+args = sys.argv[1:]
+if state.get("unavailable"):
+    print("Cannot connect to the Docker daemon", file=sys.stderr)
+    sys.exit(1)
+if args[:1] == ["ps"]:
+    for row in state.get("containers", []):
+        print("\\t".join([row["name"], row["project"], row["working_dir"]]))
+    sys.exit(0)
+if args[:1] == ["compose"]:
+    with open(os.environ["FAKE_SERVICE_LOG"], "a", encoding="utf-8") as log:
+        log.write("docker " + " ".join(args) + "\\n")
+    if state.get("fail_down"):
+        print("simulated compose down failure", file=sys.stderr)
+        sys.exit(1)
+    sys.exit(0)
+print("unexpected docker invocation: " + " ".join(args), file=sys.stderr)
+sys.exit(2)
+"""
+        docker = self.fake_bin / "docker"
+        docker.write_text(script, encoding="utf-8")
+        docker.chmod(0o755)
+
+    def set_docker_state(self, **updates: object) -> None:
+        state = json.loads(self.docker_state.read_text(encoding="utf-8"))
+        state.update(updates)
+        self.docker_state.write_text(json.dumps(state), encoding="utf-8")
+
+    def service_commands(self) -> list[str]:
+        if not self.service_log.exists():
+            return []
+        return self.service_log.read_text(encoding="utf-8").splitlines()
+
     def helper_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
         environment["PATH"] = f"{self.fake_bin}:/usr/bin:/bin"
@@ -146,6 +193,8 @@ else:
         environment["FAKE_NO_PR"] = "1" if self.fake_no_pr else "0"
         environment["FAKE_DURABLE"] = "1" if self.fake_durable else "0"
         environment["FAKE_DEFAULT_HEAD"] = self.default_head
+        environment["FAKE_DOCKER_STATE"] = str(self.docker_state)
+        environment["FAKE_SERVICE_LOG"] = str(self.service_log)
         return environment
 
     def run_helper(self, *args: str) -> subprocess.CompletedProcess[str]:
@@ -443,6 +492,255 @@ else:
         self.assertEqual(applied["removed"], 1)
         self.assertFalse(self.worktree.exists())
         self.assertFalse((self.repo / ".local" / "worktree-archive").exists())
+
+    def test_worktree_compose_project_is_listed_and_stopped(self) -> None:
+        (self.worktree / "deploy").mkdir()
+        self.set_docker_state(
+            containers=[
+                {
+                    "name": "yongyuan-ui-gates-postgres-1",
+                    "project": "yongyuan-ui-gates",
+                    "working_dir": str(self.worktree / "deploy"),
+                },
+                {
+                    "name": "yongyuan-ui-gates-s3-1",
+                    "project": "yongyuan-ui-gates",
+                    "working_dir": str(self.worktree / "deploy"),
+                },
+            ]
+        )
+
+        _, report = self.audit()
+        entry = report["entries"][0]
+        services = entry["services"]
+        self.assertEqual(services["status"], "would-stop")
+        self.assertEqual(
+            [project["project"] for project in services["compose_projects"]],
+            ["yongyuan-ui-gates"],
+        )
+        project = services["compose_projects"][0]
+        self.assertEqual(project["action"], "would-stop")
+        self.assertEqual(
+            project["containers"],
+            ["yongyuan-ui-gates-postgres-1", "yongyuan-ui-gates-s3-1"],
+        )
+        self.assertEqual(
+            project["working_dirs"], [str(self.worktree / "deploy")]
+        )
+        self.assertEqual(self.service_commands(), [])
+
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["removed"], 1)
+        self.assertEqual(applied["services_stopped"], 1)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(
+            self.service_commands(),
+            ["docker compose -p yongyuan-ui-gates down"],
+        )
+        stopped = applied["entries"][0]["services"]["compose_projects"][0]
+        self.assertEqual(stopped["action"], "stopped")
+
+    def test_text_report_lists_the_compose_project_it_would_stop(self) -> None:
+        (self.worktree / "deploy").mkdir()
+        self.set_docker_state(
+            containers=[
+                {
+                    "name": "yongyuan-ui-gates-postgres-1",
+                    "project": "yongyuan-ui-gates",
+                    "working_dir": str(self.worktree / "deploy"),
+                },
+                {
+                    "name": "yongyuan-ui-gates-s3-1",
+                    "project": "yongyuan-ui-gates",
+                    "working_dir": str(self.worktree / "deploy"),
+                },
+            ]
+        )
+
+        _, report = self.audit()
+        output = io.StringIO()
+        with redirect_stdout(output):
+            CLEANUP_WORKTREES.print_text(report)
+
+        rendered = output.getvalue()
+        self.assertIn("services_would_stop: 1", rendered)
+        self.assertIn("compose_project: yongyuan-ui-gates (would-stop)", rendered)
+        self.assertIn("containers: yongyuan-ui-gates-postgres-1", rendered)
+        self.assertIn("yongyuan-ui-gates-s3-1", rendered)
+
+    def test_mixed_ownership_compose_project_is_not_stopped(self) -> None:
+        (self.worktree / "deploy").mkdir()
+        self.set_docker_state(
+            containers=[
+                {
+                    "name": "shared-postgres-1",
+                    "project": "shared-project",
+                    "working_dir": str(self.worktree / "deploy"),
+                },
+                {
+                    "name": "main-postgres-1",
+                    "project": "shared-project",
+                    "working_dir": str(self.repo / "deploy"),
+                },
+            ]
+        )
+
+        _, report = self.audit()
+        entry = report["entries"][0]
+        self.assertEqual(entry["services"]["status"], "ambiguous")
+        self.assertEqual(entry["services"]["compose_projects"], [])
+        self.assertEqual(
+            [project["project"] for project in entry["services"]["ambiguous_projects"]],
+            ["shared-project"],
+        )
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["removed"], 1)
+        self.assertEqual(self.service_commands(), [])
+
+    def test_worktree_without_compose_project_skips_docker_down(self) -> None:
+        _, report = self.audit()
+        entry = report["entries"][0]
+
+        self.assertEqual(entry["services"]["status"], "none")
+        self.assertEqual(entry["services"]["compose_projects"], [])
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["removed"], 1)
+        self.assertEqual(self.service_commands(), [])
+
+    def test_compose_projects_outside_worktree_are_not_touched(self) -> None:
+        other = self.add_worktree("other")
+        self.set_docker_state(
+            containers=[
+                {
+                    "name": "main-postgres-1",
+                    "project": "main-project",
+                    "working_dir": str(self.repo / "deploy"),
+                },
+                {
+                    "name": "other-postgres-1",
+                    "project": "other-project",
+                    "working_dir": str(other / "deploy"),
+                },
+            ]
+        )
+
+        _, report = self.audit()
+        entry = next(
+            item for item in report["entries"] if item["path"] == str(self.worktree)
+        )
+        self.assertEqual(entry["services"]["status"], "none")
+        self.assertEqual(entry["services"]["compose_projects"], [])
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["removed"], 1)
+        self.assertEqual(self.service_commands(), [])
+
+    def test_docker_unavailable_skips_service_cleanup_without_blocking(self) -> None:
+        self.set_docker_state(unavailable=True)
+
+        _, report = self.audit()
+        entry = report["entries"][0]
+        self.assertEqual(entry["services"]["docker"], "unavailable")
+        self.assertEqual(entry["services"]["status"], "docker-unavailable")
+        self.assertIn("docker is unavailable", entry["services"]["warning"])
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["removed"], 1)
+        self.assertEqual(applied["services_docker_unavailable"], 1)
+        self.assertEqual(self.service_commands(), [])
+        self.assertFalse(self.worktree.exists())
+        applied_entry = applied["entries"][0]
+        self.assertEqual(applied_entry["services"]["status"], "docker-unavailable")
+
+    def test_compose_down_failure_keeps_worktree(self) -> None:
+        (self.worktree / "deploy").mkdir()
+        self.set_docker_state(
+            containers=[
+                {
+                    "name": "yongyuan-ui-gates-postgres-1",
+                    "project": "yongyuan-ui-gates",
+                    "working_dir": str(self.worktree / "deploy"),
+                }
+            ],
+            fail_down=True,
+        )
+
+        _, report = self.audit()
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 1)
+        applied = json.loads(result.stdout)
+        self.assertEqual(applied["removed"], 0)
+        entry = applied["entries"][0]
+        self.assertEqual(entry["action"], "failed")
+        self.assertIn("Compose shutdown failed", entry["error"])
+        self.assertEqual(entry["services"]["status"], "failed")
+        self.assertTrue(self.worktree.exists())
+        self.assertEqual(
+            self.service_commands(),
+            ["docker compose -p yongyuan-ui-gates down"],
+        )
+
+    def test_local_test_destroy_runs_before_compose_down(self) -> None:
+        (self.worktree / ".local-test" / "run").mkdir(parents=True)
+        lt_dir = self.worktree / "bin"
+        lt_dir.mkdir()
+        lt = lt_dir / "lt"
+        lt.write_text(
+            """#!/usr/bin/env bash
+set -euo pipefail
+printf 'lt destroy\\n' >> "$FAKE_SERVICE_LOG"
+""",
+            encoding="utf-8",
+        )
+        lt.chmod(0o755)
+        exclude = self.repo / ".git" / "info" / "exclude"
+        exclude.write_text("bin/lt\n", encoding="utf-8")
+        (self.worktree / "deploy").mkdir()
+        self.set_docker_state(
+            containers=[
+                {
+                    "name": "yongyuan-ui-gates-postgres-1",
+                    "project": "yongyuan-ui-gates",
+                    "working_dir": str(self.worktree / "deploy"),
+                }
+            ]
+        )
+
+        _, report = self.audit()
+        entry = report["entries"][0]
+        self.assertEqual(
+            entry["services"]["local_test"]["action"], "would-destroy"
+        )
+        self.assertEqual(self.service_commands(), [])
+        token = self.approval_for(report, self.worktree)
+        result = self.run_helper("--apply", "--approve", token, "--json")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.worktree.exists())
+        self.assertEqual(
+            self.service_commands(),
+            [
+                "lt destroy",
+                "docker compose -p yongyuan-ui-gates down",
+            ],
+        )
 
     def test_empty_local_directory_is_not_archived(self) -> None:
         (self.worktree / ".local").mkdir()
