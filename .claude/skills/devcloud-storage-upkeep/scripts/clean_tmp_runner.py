@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 
-EXECUTOR = '/data/tools/devcloud-maintenance/releases/64a16a707b7a1da1/bin/devcloud.py'
+EXECUTOR = '/data/tools/devcloud-maintenance/releases/71d282c3d6426609/bin/devcloud.py'
 LOCK = Path('/var/lib/devcloud-storage-upkeep/clean-tmp.lock')
 LOG = Path('/data/metrics/devcloud-clean-tmp.log')
 STDERR = Path('/data/metrics/devcloud-clean-tmp.stderr.log')

@@ -2139,7 +2139,7 @@ def test_watermark_thresholds(gib, expected):
     assert w.level(gib * w.GIB) == expected
 
 
-@pytest.mark.parametrize('disk,count', [('/', 1), ('/data', 6)])
+@pytest.mark.parametrize('disk,count', [('/', 1), ('/data', 5)])
 def test_watermark_selects_only_low_disk_and_prints_trigger_summary(watermark_case, monkeypatch, capsys, disk, count):
     w, calls = watermark_case
     monkeypatch.setattr(w, 'available', lambda p: (100 if p == disk else 200) * w.GIB)
@@ -2149,6 +2149,7 @@ def test_watermark_selects_only_low_disk_and_prints_trigger_summary(watermark_ca
     output = capsys.readouterr().out
     assert len(output.splitlines()) == 1 and f'{disk} warning' in output
     assert invoked == [aid for _, aid in w.TASKS[disk]] and len(invoked) == count
+    assert 'auto_3jiqtmzreq8' not in invoked  # Retired clone automation is a no-op.
     assert len(calls) == 1 and calls[0][:3] == ('thread', 'tell', 'thr_tikzbd34dg')
 
 
@@ -2174,11 +2175,11 @@ def test_watermark_cooldown_silent_and_expiry_retriggers(watermark_case, monkeyp
         assert w.main([]) == 0
         assert capsys.readouterr().out == ''
         assert w.STATE.read_bytes() == snapshot
-    assert len(calls) == 1 and len(fired) == 6
+    assert len(calls) == 1 and len(fired) == 5
     now[0] = 100000 + 7200
     assert w.main([]) == 0
     assert 'warning' in capsys.readouterr().out
-    assert len(calls) == 2 and len(fired) == 12
+    assert len(calls) == 2 and len(fired) == 10
 
 
 def test_watermark_escalation_notifies_but_downgrade_stays_silent(watermark_case, monkeypatch, capsys):
@@ -2465,11 +2466,11 @@ def test_watermark_notification_failure_preserves_cooldown(watermark_case, monke
     monkeypatch.setattr(w, 'bb', mock.Mock(side_effect=subprocess.TimeoutExpired('notification-stub', 8)))
     with pytest.raises(subprocess.TimeoutExpired):
         w.main([])
-    assert w.STATE.exists() and len(fired) == 6
+    assert w.STATE.exists() and len(fired) == 5
     capsys.readouterr()
     snapshot = w.STATE.read_bytes()
     assert w.main([]) == 0
-    assert capsys.readouterr().out == '' and len(fired) == 6
+    assert capsys.readouterr().out == '' and len(fired) == 5
     assert w.STATE.read_bytes() == snapshot and w.bb.call_count == 1
 
 

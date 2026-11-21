@@ -14,7 +14,7 @@ PROJECT = 'proj_8d3wrcajxn'
 STATE = Path(os.environ.get('MOLE_WATERMARK_STATE', '/var/lib/devcloud-storage-upkeep/watermark.json'))
 TASKS = {
     '/data': [('docker', 'auto_1ih1erjpbqo'), ('go', 'auto_vad6yvkpdeq'),
-              ('worktree', 'auto_hukidoavox0'), ('tmp-clone', 'auto_3jiqtmzreq8'),
+              ('worktree', 'auto_hukidoavox0'),
               ('pnpm', 'auto_yfr5p14dvnc'), ('clean-tmp /data/system-tmp', '/data/system-tmp')],
     '/': [('clean-tmp /var/tmp', '/var/tmp')],
 }

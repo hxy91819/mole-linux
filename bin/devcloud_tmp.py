@@ -21,7 +21,9 @@ import math
 import os
 import re
 import signal
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,6 +49,7 @@ VAR_RUN_SECONDS = 300
 # Leave time for the existing per-item probes, Mole calls and restoration.
 ITEM_RUN_RESERVE_SECONDS = 120
 ITEM_SECONDS = 5
+ITEM_RECHECK_SECONDS = 20
 CACHE_SECONDS = 60
 BATCH_SIZE = 128
 DELETE_WORKERS = 8
@@ -62,8 +65,9 @@ POLICY_SHARDS = 32
 POLICY_SECONDS = 180
 PROTECTED_PREFIXES = ('dsh-s04-', 'cc-daemon', 'playwright_', 'node-addon-')
 PROTECTED_NAMES = {'.X11-unix', '.ICE-unix', '.XIM-unix', '.font-unix', '.Test-unix', 'receipt.json'}
-PERSISTENT_NAMES = {'.git', '.env', '.ssh', '.aws', '.gnupg', 'credentials.json', 'auth.json'}
-PERSISTENT_SUFFIXES = ('.pem', '.key', '.bak', '.patch', '.diff', '.db', '.sqlite', '.sqlite3', '.sql')
+PERSISTENT_NAMES = {'.env', '.ssh', '.aws', '.gnupg', 'credentials.json', 'auth.json'}
+PERSISTENT_SUFFIXES = ('.pem', '.key', '.bak', '.patch', '.diff')
+DATABASE_NAME = re.compile(r'\.(?:db|sqlite3?|sql)(?:-wal|-shm|-journal)?$', re.IGNORECASE)
 MOLE_POLICY = '''set -euo pipefail
 source "$1/lib/core/app_protection.sh"
 source "$1/lib/core/file_ops.sh"
@@ -408,8 +412,111 @@ def cache_member(kind, relative, mode):
     return False
 
 
-def tree_snapshot(path, cutoff, watches, deadline, cache_type=None):
+def unix_socket_dump(deadline):
+    """Get bound filesystem inodes (not socket fd inodes or possibly stale path names)."""
+    header = struct.Struct('=IHHII')
+    request = struct.pack('=BBHIIIII', socket.AF_UNIX, 0, 0, 0xffffffff, 0, 2, 0, 0)
+    with socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, 4) as diag:  # NETLINK_SOCK_DIAG
+        diag.settimeout(max(0.001, deadline - time.monotonic()))
+        diag.send(header.pack(header.size + len(request), 20, 0x301, 1, 0) + request)
+        while True:
+            checkpoint(deadline)
+            diag.settimeout(max(0.001, deadline - time.monotonic()))
+            data, _, flags, sender = diag.recvmsg(65536)
+            if not data or flags & socket.MSG_TRUNC or sender[0] != 0:
+                raise ValueError('incomplete Unix socket diagnostic dump')
+            offset = 0
+            while offset < len(data):
+                length, kind, flags, seq, _ = header.unpack_from(data, offset)
+                end = offset + length
+                if length < header.size or end > len(data) or seq != 1 or flags & 0x10:  # NLM_F_DUMP_INTR
+                    raise ValueError('invalid Unix socket diagnostic message')
+                if kind == 3:  # NLMSG_DONE
+                    if length != header.size and (length < header.size + 4 or
+                                                 struct.unpack_from('=i', data, offset + header.size)[0]):
+                        raise ValueError('failed Unix socket diagnostic dump')
+                    return
+                attrs = offset + header.size + 16  # unix_diag_msg
+                if kind != 20 or attrs > end:
+                    raise ValueError('unexpected Unix socket diagnostic response')
+                while attrs < end:
+                    attr_len, attr_type = struct.unpack_from('=HH', data, attrs)
+                    if attr_len < 4 or attrs + attr_len > end:
+                        raise ValueError('invalid Unix socket diagnostic attribute')
+                    if attr_type == 1:  # UNIX_DIAG_VFS, kernel dev_t and low 32 inode bits
+                        if attr_len != 12:
+                            raise ValueError('invalid Unix socket VFS identity')
+                        ino, dev = struct.unpack_from('=II', data, attrs + 4)
+                        yield dev, ino
+                    attrs += (attr_len + 3) & ~3
+                offset += (length + 3) & ~3
+
+
+def bound_unix_sockets(deadline):
+    """Read one kernel socket dump per live network namespace, always restoring ours."""
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    def enter(fd):
+        if libc.setns(fd, 0x40000000):  # CLONE_NEWNET; changes only the calling thread
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+    sockets = set(unix_socket_dump(deadline))
+    with open('/proc/thread-self/ns/net', 'rb') as original:
+        seen = {os.fstat(original.fileno()).st_ino}
+        for proc in PROC_ROOT.iterdir():
+            checkpoint(deadline)
+            if not proc.name.isdigit():
+                continue
+            try:
+                namespace = (proc / 'ns/net').open('rb')
+            except (FileNotFoundError, ProcessLookupError):
+                # A zombie or exited process cannot hold a bound socket.
+                try:
+                    fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                if fields[0] == 'Z' or int(fields[6]) & 0x200000:
+                    continue
+                raise
+            with namespace:
+                identity = os.fstat(namespace.fileno()).st_ino
+                if identity in seen:
+                    continue
+                enter(namespace.fileno())
+                try:
+                    sockets.update(unix_socket_dump(deadline))
+                finally:
+                    enter(original.fileno())
+                seen.add(identity)
+    return sockets
+
+
+class UnixSockets:
+    """Lazy, complete observation for a plan or batch; sinks take fresh evidence."""
+
+    def __init__(self, deadline):
+        self.deadline = deadline
+        self.lock = threading.Lock()
+        self.bound = None
+        self.unknown = False
+
+    def check(self, inode, deadline):
+        with self.lock:
+            if self.bound is None and not self.unknown:
+                try:
+                    self.bound = bound_unix_sockets(min(self.deadline, deadline))
+                except (OSError, ValueError, IndexError, struct.error):
+                    self.unknown = True
+            if self.unknown:
+                raise CandidateSkipped('Unix socket evidence unavailable')
+            if inode in self.bound:
+                raise CandidateSkipped('live Unix socket')
+
+
+def tree_snapshot(path, cutoff, watches, deadline, cache_type=None, sockets=None):
     digest, size, entries, latest = hashlib.sha256(), 0, 0, 0.0
+    relaxed, hardlinks = set(), {}
     device = path.lstat().st_dev
     stack = [path]
     while stack:
@@ -417,34 +524,66 @@ def tree_snapshot(path, cutoff, watches, deadline, cache_type=None):
         item = stack.pop()
         s = item.lstat()
         relative = str(item.relative_to(path))
-        if s.st_dev != device or item.is_mount():
+        is_dir, is_reg, is_link = (stat.S_ISDIR(s.st_mode), stat.S_ISREG(s.st_mode), stat.S_ISLNK(s.st_mode))
+        if s.st_dev != device or (is_dir and item.is_mount()):
             raise CandidateSkipped('mounted descendant')
-        if not (stat.S_ISREG(s.st_mode) or stat.S_ISDIR(s.st_mode)):
-            raise CandidateSkipped('symlink, socket or special file')
-        if s.st_uid != 0 or s.st_mode & 0o022 or (stat.S_ISREG(s.st_mode) and s.st_nlink != 1):
-            raise CandidateSkipped('foreign owner, writable tree or shared file')
+        if is_link and item == path:
+            raise CandidateSkipped('entry symlink')
+        if s.st_uid != 0:
+            raise CandidateSkipped('foreign owner')
+        if not is_link and s.st_mode & 0o022:
+            raise CandidateSkipped('group or world writable')
         if cache_type and not cache_member(cache_type, relative, s.st_mode):
             raise CandidateSkipped('mixed cache layout')
         owner_database = (cache_type == 'pnpm-store' and len(Path(relative).parts) == 2
                           and item.name in ('index.db', 'index.db-wal', 'index.db-shm'))
-        if (item.name in PERSISTENT_NAMES or item.name.endswith(PERSISTENT_SUFFIXES)) and not owner_database:
-            raise CandidateSkipped('repository or persistent state')
-        if stat.S_ISREG(s.st_mode):
+        if item.name == '.git':
+            raise CandidateSkipped('Git state')
+        name = item.name.lower()
+        if name in PERSISTENT_NAMES or name.startswith('.env.') or name.endswith(PERSISTENT_SUFFIXES):
+            raise CandidateSkipped('credential or backup')
+        if DATABASE_NAME.search(name) and not owner_database:
+            raise CandidateSkipped('database or SQL data')
+        if is_reg:
             latest = max(latest, s.st_mtime)
-        if s.st_mtime > cutoff and (not cache_type or stat.S_ISREG(s.st_mode)):
+        if s.st_mtime > cutoff and (not cache_type or is_reg):
             raise CandidateSkipped('recent descendant')
         key = (os.major(s.st_dev) << 20 | os.minor(s.st_dev), s.st_ino)
         if key in watches:
             raise CandidateSkipped('inotify reference')
+        if is_link:
+            relaxed.add('nested symlink')
+        elif not (is_reg or is_dir):
+            if stat.S_ISSOCK(s.st_mode):
+                if sockets is None:
+                    sockets = UnixSockets(deadline)
+                sockets.check((key[0], key[1] & 0xffffffff), deadline)
+            elif not (stat.S_ISFIFO(s.st_mode) or stat.S_ISCHR(s.st_mode) or stat.S_ISBLK(s.st_mode)):
+                raise CandidateSkipped('unknown file type')
+            relaxed.add('idle socket, FIFO or device')
         digest.update(json.dumps([relative, s.st_dev, s.st_ino, s.st_mode, s.st_uid,
                                   s.st_gid, s.st_nlink, s.st_size, s.st_mtime_ns,
                                   s.st_ctime_ns if relative != '.' else 0]).encode())
-        size += s.st_blocks * 512
+        blocks = s.st_blocks * 512
+        if not is_dir and s.st_nlink > 1:
+            # Count blocks once only if this tree owns all links. Other links remain intact.
+            seen, _, _ = hardlinks.get(key, (0, 0, 0))
+            hardlinks[key] = (seen + 1, s.st_nlink, blocks)
+            if is_reg:
+                relaxed.add('hard-linked file')
+        else:
+            size += blocks
         entries += 1
-        if stat.S_ISDIR(s.st_mode):
+        if is_dir:
             with os.scandir(item) as children:
-                stack.extend(sorted((Path(child.path) for child in children), reverse=True))
-    result = {'fingerprint': digest.hexdigest(), 'bytes': size, 'entries': entries}
+                members = sorted((child.name for child in children), reverse=True)
+            # A bare repository has no .git entry, including local archive remotes.
+            if {'HEAD', 'objects', 'refs'}.issubset(members):
+                raise CandidateSkipped('Git state')
+            stack.extend(item / member for member in members)
+    size += sum(blocks for seen, total, blocks in hardlinks.values() if seen == total)
+    result = {'fingerprint': digest.hexdigest(), 'bytes': size, 'entries': entries,
+              'relaxed_rules': sorted(relaxed)}
     if cache_type:
         result.update(cache_type=cache_type, latest_file_mtime=latest)
     return result
@@ -452,6 +591,7 @@ def tree_snapshot(path, cutoff, watches, deadline, cache_type=None):
 
 def build_plan(root, cutoff, deadline):
     live = process_snapshot(root, deadline)
+    sockets = UnixSockets(deadline)
     plan, skipped = [], Counter()
     with os.scandir(root) as children:
         names = sorted(child.name for child in children)
@@ -466,7 +606,7 @@ def build_plan(root, cutoff, deadline):
             kind = cache_kind(root / name)
             snapshot = tree_snapshot(root / name, time.time() - CACHE_AGE_SECONDS if kind else cutoff,
                                      live['watches'], min(deadline, time.monotonic() +
-                                                         (CACHE_SECONDS if kind else ITEM_SECONDS)), kind)
+                                                         (CACHE_SECONDS if kind else ITEM_SECONDS)), kind, sockets)
             return {'name': name, **snapshot}, None
         except Refused as error:
             return None, str(error)
@@ -584,7 +724,7 @@ def final_guard(receipt):
     item = receipt.parent / record['name']
     if item.parent != receipt.parent or item.name != record['name']:
         raise Refused('invalid staged item')
-    deadline = time.monotonic() + (CACHE_SECONDS if record.get("cache_type") else 20)
+    deadline = time.monotonic() + (CACHE_SECONDS if record.get("cache_type") else ITEM_RECHECK_SECONDS)
     live = process_snapshot(item, deadline, record.get('process_identities'))
     if live['reserved']:
         raise CandidateSkipped('staged item acquired a process or mount reference')
@@ -661,8 +801,14 @@ def execute_item(root, candidate, cutoff, deadline, batch_live=None):
         cutoff = time.time() - CACHE_AGE_SECONDS
         if cache_kind(root / name) != kind:
             raise CandidateSkipped('cache layout changed since preview')
-    current = tree_snapshot(root / name, cutoff, live['watches'],
-                            min(deadline, time.monotonic() + (CACHE_SECONDS if kind else ITEM_SECONDS)), kind)
+    try:
+        current = tree_snapshot(root / name, cutoff, live['watches'],
+                                min(deadline, time.monotonic() + (CACHE_SECONDS if kind else ITEM_RECHECK_SECONDS)),
+                                kind, live.get('sockets'))
+    except TimeoutError as error:
+        checkpoint(deadline)
+        # Nothing was moved; a slow item does not invalidate the rest of a complete plan.
+        raise CandidateSkipped('slow tree before staging') from error
     if any(current[key] != candidate[key] for key in ('fingerprint', 'bytes', 'entries')):
         raise CandidateSkipped('candidate changed since preview')
     stage = Path(tempfile.mkdtemp(prefix='item-', dir=state_for(root)))
@@ -748,9 +894,16 @@ def _main(argv=None):
         cutoff = time.time() - options.age_days * 86400
         plan, scan_skipped = build_plan(root, cutoff, started + SCAN_SECONDS)
         selected = plan
+        rule_groups = {}
+        for row in selected:
+            if row.get('relaxed_rules'):
+                group = rule_groups.setdefault(' + '.join(row['relaxed_rules']), {'count': 0, 'bytes': 0})
+                group['count'] += 1
+                group['bytes'] += row['bytes']
         summary.update(scan='complete', candidates=len(selected), eligible=len(plan),
                        deferred=len(plan) - len(selected), scan_skipped=scan_skipped,
                        candidate_bytes=sum(row['bytes'] for row in selected),
+                       relaxed_candidates=rule_groups,
                        sample=[row['name'] for row in selected[:options.limit]],
                        cache_roots=[{'path': str(root / row['name']),
                                      **{key: row[key] for key in ('cache_type', 'bytes', 'latest_file_mtime')}}
@@ -767,7 +920,8 @@ def _main(argv=None):
                 execute_item(root, candidate, cutoff, started + run_seconds, live)
                 append_log({'ts': time.strftime('%Y-%m-%dT%H:%M:%S%z'), 'event': 'deleted',
                             'path': str(root / candidate['name']), 'bytes': candidate['bytes'],
-                            'cache_type': candidate.get('cache_type')})
+                            'cache_type': candidate.get('cache_type'),
+                            'relaxed_rules': candidate.get('relaxed_rules', [])})
                 return True
 
             with ThreadPoolExecutor(max_workers=DELETE_WORKERS) as pool:
@@ -776,6 +930,7 @@ def _main(argv=None):
                         break
                     # A complete, fresh scan per bounded batch. Never use a partial snapshot.
                     live = process_snapshot(root, started + run_seconds)
+                    live['sockets'] = UnixSockets(started + run_seconds)
                     batch = selected[offset:offset + BATCH_SIZE]
                     futures = [pool.submit(remove, candidate, live) for candidate in batch]
                     cancellation = None
