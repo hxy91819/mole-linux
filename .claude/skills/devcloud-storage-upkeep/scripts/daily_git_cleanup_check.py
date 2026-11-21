@@ -17,6 +17,7 @@ METRICS = Path('/var/lib/devcloud-storage-upkeep/metrics')
 STAGES = {'bb-environments': 'bb-environment-sweep', 'linked': 'linked-worktree-sweep',
           'clones': 'git-tree-sweep'}
 THRESHOLD = 20 * 2**30
+GROWTH_THRESHOLD = 3 * 2**30
 CLEAN_PATH = '/root/.local/bin:/usr/local/bin:/usr/bin:/bin'
 PROJECT = 'proj_8d3wrcajxn'
 
@@ -95,6 +96,74 @@ def affected_root_sizes(rows, samples):
             for root in sorted(affected)]
 
 
+# Absolute alerts need positive evidence of a broken or uncertain check.
+# New protection reasons default to trend checks, not daily size alerts.
+EVIDENCE_GAP = re.compile(
+    r'unknown|unresolved|unavailable|incomplete|indeterminate|'
+    r'gitdir missing|invalid git|registration disappeared|'
+    r'remote (?:query|network|authentication|timeout|repository missing)|'
+    r'local remote (?:missing|could not be checked)|'
+    r'name collision|name reference|exceeded .*s|timed out|timeout|budget exhausted|'
+    r'archive (?:push failed|sha verification failed)', re.I,
+)
+
+
+def retention_class(reason):
+    if reason.startswith(('unpushed refs', 'unpushed branch')):
+        return 'protection'
+    return 'evidence-gap' if EVIDENCE_GAP.search(reason) else 'protection'
+
+
+def stable_reason(reason):
+    # PIDs are evidence, not bucket identities across dates.
+    return re.sub(r'^process \d+ ', 'live process ', reason)
+
+
+def protection_totals(ranking):
+    totals = {}
+    for bucket in ranking['by_bytes']:
+        if retention_class(bucket['reason']) != 'protection':
+            continue
+        key = stable_reason(bucket['reason'])
+        size = bucket.get('bytes')
+        if type(size) is not int or bucket.get('unmeasured', 0):
+            totals[key] = None
+        elif totals.get(key, 0) is not None:
+            totals[key] = totals.get(key, 0) + size
+    return totals
+
+
+def retention_alerts(stage, ranking, history, usable):
+    if not ranking:
+        return []
+    samples = []
+    for report, ok in zip(history, usable):
+        prior = report.get('summary', {}).get('retention') if ok else None
+        samples.append(protection_totals(prior) if prior else {})
+    alerts, emitted = [], set()
+    for bucket in ranking['by_bytes']:
+        reason = bucket['reason']
+        if retention_class(reason) == 'evidence-gap':
+            if bucket['bytes'] is not None and bucket['bytes'] > THRESHOLD:
+                alerts.append(dict(stage=stage, kind='retention_over_20_gib', **bucket))
+            continue
+        key = stable_reason(reason)
+        if key in emitted:
+            continue
+        emitted.add(key)
+        sizes = [sample.get(key) for sample in samples]
+        if (all(type(size) is int for size in sizes) and sizes[0] < sizes[1] < sizes[2]
+                and sizes[2] - sizes[0] >= GROWTH_THRESHOLD):
+            current = [row for row in ranking['by_bytes'] if stable_reason(row['reason']) == key]
+            paths = sorted((path for row in current for path in row['largest_paths']),
+                           key=lambda path: (-path['bytes'], path['path']))
+            alerts.append(dict(stage=stage, kind='retention_protection_continuous_growth',
+                               reason=key, bytes=sizes[-1], count=sum(row['count'] for row in current),
+                               unmeasured=0, largest_paths=paths[:5],
+                               bytes_by_day=sizes, growth_total_bytes=sizes[-1] - sizes[0]))
+    return alerts
+
+
 def assess(days, invocations, reports, samples):
     alerts, stages = [], {}
     for stage in STAGES:
@@ -104,10 +173,7 @@ def assess(days, invocations, reports, samples):
         ranking = latest.get('summary', {}).get('retention') if latest else None
         stages[stage] = status = {'report': latest.get('output') if latest else None,
                                   'complete': usable[-1], 'retention': ranking}
-        # A measured lower bound can still prove a blocker in a partial report.
-        for bucket in ranking['by_bytes'] if ranking else []:
-            if bucket['bytes'] is not None and bucket['bytes'] > THRESHOLD:
-                alerts.append(dict(stage=stage, kind='retention_over_20_gib', **bucket))
+        alerts.extend(retention_alerts(stage, ranking, history, usable))
         if stage == 'bb-environments':
             continue
         removed = [sum(row.get('result') == 'removed' for row in report['items']) if ok else None

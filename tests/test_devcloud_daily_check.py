@@ -67,14 +67,14 @@ def test_environment_retention_distinguishes_local_unknown_and_released_paths(tm
 @pytest.mark.parametrize('stage', list(daily.STAGES))
 @pytest.mark.parametrize('size,alert', [(20 * GIB, False), (20 * GIB + 1, True)])
 def test_large_retention_threshold_for_each_stage(stage, size, alert):
-    rows = [kept('/data/code/large', size)]
+    rows = [kept('/data/code/large', size, reason='Git registration unavailable')]
     reports = {(stage, 'today'): dict(complete=True, items=rows, summary=sweep.summarize(rows))}
     result = daily.assess(DAYS, {DAYS[-1]: 'today'}, reports, [{}, {}, {}])
     assert bool(result['alerts']) is alert
     if alert:
         [item] = result['alerts']
         assert item['stage'] == stage
-        assert item['reason'] == 'locked'
+        assert item['reason'] == 'Git registration unavailable'
         assert item['largest_paths'] == [{'path': '/data/code/large', 'bytes': size}]
 
 
@@ -180,3 +180,98 @@ print(json.dumps(dict(id=args[2], projectId=args[4], execution=dict(mode="agent"
     state.write_text('drift')
     monkeypatch.setenv('MOCK_TRIM', '1')
     assert sync.main(['--apply']) == 1  # Update success alone proves nothing.
+
+
+@pytest.mark.parametrize('reasons', [
+    ['BB project source'] * 3,
+    ['BB environment'] * 3,
+    ['unarchived threads'] * 3,
+    ['dirty working tree (including untracked)'] * 3,
+    ['active within 7d (168h)'] * 3,
+    ['unpushed refs and no personal or internal remote'] * 3,
+    ['process 10 cwd', 'process 11 cwd', 'process 12 cwd'],
+])
+@pytest.mark.parametrize('scenario', ['growth', 'flat', 'small', 'missing', 'partial', 'unmeasured'])
+def test_normal_protection_only_alerts_on_valid_three_day_growth(reasons, scenario):
+    stage = 'bb-environments'
+    sizes = [30 * GIB, 31 * GIB, 33 * GIB]
+    if scenario == 'flat':
+        sizes[1] = sizes[0]
+    if scenario == 'small':
+        sizes[-1] -= 1
+    reports = {}
+    for day, reason, size in zip(DAYS, reasons, sizes):
+        rows = [kept('/data/big', size, reason=reason)]
+        if day == DAYS[1] and scenario == 'unmeasured':
+            rows.append(kept('/data/unknown', None, reason=reason))
+        reports[(stage, day)] = dict(complete=(scenario != 'partial' or day != DAYS[1]),
+                                     items=rows, summary=sweep.summarize(rows))
+    if scenario == 'missing':
+        del reports[(stage, DAYS[1])]
+    result = daily.assess(DAYS, {day: day for day in DAYS}, reports, [{}, {}, {}])
+    if scenario == 'growth':
+        [alert] = result['alerts']
+        assert alert['kind'] == 'retention_protection_continuous_growth'
+        assert alert['growth_total_bytes'] == 3 * GIB
+        assert alert['largest_paths'][0]['path'] == '/data/big'
+    else:
+        assert result['alerts'] == []
+
+
+@pytest.mark.parametrize('reason', ['Git registration unavailable', 'gitdir missing',
+                                    'remote query incomplete', 'check unknown',
+                                    'clone recheck exceeded 120s; retry next round',
+                                    'unresolved project reference', 'name collision'])
+def test_evidence_gap_is_an_absolute_threshold_category(reason):
+    assert daily.retention_class(reason) == 'evidence-gap'
+
+
+@pytest.mark.parametrize('execute', [False, True])
+def test_bb_storage_inventory_defers_unbound_destructive_operations(execute, monkeypatch):
+    storage = load(SCRIPTS / 'bb_storage_maintenance.py')
+    host = 'local'
+    scan = dict(hostId=host, scannedAt=2, orphanCount=2, orphanBytes=10,
+                leftoverWorktreeBytes=20, leftoverWorktrees=[{'path': '/local/worktree'}],
+                externalWorktrees=[{'path': '/local/external'}],
+                developerStorage={'path': '/local/dev', 'entries': [
+                    dict(name='missing', current=False, sourcePathState='missing', sizeBytes=30),
+                    dict(name='unknown', current=False, sourcePathState='unknown', sizeBytes=40),
+                    dict(name='current', current=True, sourcePathState='missing', sizeBytes=50),
+                ]})
+    calls = []
+    def call(*args):
+        calls.append(args)
+        if args[:2] == ('machine', 'list'):
+            return [dict(id=host, type='persistent', status='connected', machineProviderId=None)]
+        if args == ('storage', 'retention'):
+            return {'policy': {'deleteDevDataOnCheckoutRemoval': False}}
+        if args == ('storage', 'usage', '--machine', host):
+            return {'report': {'scannedAt': 1}}
+        if args == ('storage', 'usage', '--machine', host, '--rescan'):
+            return {'report': scan, 'scan': {'state': 'idle'}}
+        raise AssertionError(args)
+    result = storage.maintain(call, execute)
+    assert result['removed_bytes'] == 0
+    assert result['external_worktree_count'] == 1
+    assert result['actions']['remove-dev-instances']['paths'] == ['/local/dev/missing']
+    assert result['actions']['remove-dev-instances']['unknown_entries'] == ['unknown']
+    assert {row['result'] for row in result['actions'].values()} == {'deferred' if execute else 'preview'}
+
+
+def test_bb_storage_rescan_refuses_enabled_developer_auto_cleanup():
+    storage = load(SCRIPTS / 'bb_storage_maintenance.py')
+    def call(*args):
+        assert args == ('storage', 'retention')
+        return {'policy': {'deleteDevDataOnCheckoutRemoval': True}}
+    with pytest.raises(ValueError, match='may auto-remove'):
+        storage.fresh_report(call, 'local')
+
+
+def test_bb_storage_rescan_rejects_stale_report():
+    storage = load(SCRIPTS / 'bb_storage_maintenance.py')
+    def call(*args):
+        if args == ('storage', 'retention'):
+            return {'policy': {'deleteDevDataOnCheckoutRemoval': False}}
+        return {'report': {'hostId': 'local', 'scannedAt': 1}, 'scan': {'state': 'idle'}}
+    with pytest.raises(ValueError, match='no fresh'):
+        storage.fresh_report(call, 'local')

@@ -132,12 +132,25 @@ Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
 `/data/bb-data/thread-storage/thr_2j6ff75sxy/upgrade-049`（cutover-backup 约 11.5 GiB）。
 它不是周期任务，删除前仍要核实版本、回滚状态和 `who-uses`。
 
+BB owner 盘点任务 `auto_ziaxnfa6kx4` 每天 05:45（Asia/Shanghai），调用同一 Git 快照的
+`/usr/bin/python3 -I <git-snap>/bb_storage_maintenance.py --execute`，750 秒任务上限。
+它仅扫描唯一联网的 BB 服务端宿主，最多等 600 秒，拒读过期报告；若 retention 已启用
+“checkout 删除后清理开发数据”，直接拒绝 rescan，避免盘点隐式触发删除。策略本身不修改。
+手工去掉 `--execute` 预演；执行模式零候选不调用删除，有候选按下面的边界标记 `deferred`：
+
+| BB 命令 | 预览证据 | 当前接口的执行边界 |
+|---|---|---|
+| remove-orphans | `usage` 只给孤儿数量和字节 | 无精确路径计划；会重新查归属，且可停止 cwd 在候选内的进程，暂不自动执行 |
+| remove-dev-instances | `developerStorage.entries` 的 missing、非 current 条目 | 批量删除会停止 missing checkout 下的进程，且不能绑定预演；`--instance` 能越过 checkout 缺失限制，不自动用 |
+| retry-worktree-cleanup | `leftoverWorktrees` 可列已测残留 | 无 dry-run；执行实时选退休环境，可能包含扫描未测的对象，不以列表当完整计划 |
+| remove-external-worktrees | `externalWorktrees` | 现有 BB 判断无活进程 cwd、24 小时或实时远端恢复证明，扫描只覆盖 BB 项目源；不替换 linked |
+
 ## 2. 不可变快照与发布
 
-仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `13dbb0a0af8f01a3`），包含
+仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `38207e78f8527087`），包含
 `git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、
 `git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py`、
-`daily_git_cleanup_check.py` 八个脚本和 `manifest.json`。上一版七脚本性能快照为 `3c35f7ad513b5140`。
+`daily_git_cleanup_check.py`、`bb_storage_maintenance.py` 九个脚本和 `manifest.json`。上一版七脚本性能快照为 `3c35f7ad513b5140`。
 旧 `9217bf8ab4fc6204` 是六脚本历史快照，缺少 CLI binder；上一正式版为 `b70f81e79242476d`（clone预算150m）。线上切换以本轮验证与 `bb automation show` 回读为准。
 launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境，再运行linked登记路径和独立clone全盘路径；cwd=/，BB只负责120秒内启动。其他维护任务继续使用各自已有快照。
 
@@ -170,7 +183,9 @@ bb automation runs auto_hukidoavox0 --project proj_8d3wrcajxn --limit 3 --json
 每日用 `python3 -I <git-snap>/daily_git_cleanup_check.py` 只读核对新快照。
 三阶段最终报告和 JSONL finish 有保留原因排名：`by_bytes` 含已计量字节、数量、未测数量和
 最多五个路径，`by_count` 列出按数量排序的原因及计数。同原因内嵌套的已测目录不重复计量；
-不同原因/阶段的字节不可相加，也不能视为可释放空间。任一原因超过 20 GiB 告警。
+不同原因/阶段的字节不可相加，也不能视为可释放空间。证据缺口超过 20 GiB 告警；正常保护仅当同阶段、
+同原因最近三个完整定时样本严格递增且累计 ≥3 GiB 告警，进程类别跨日忽略 PID。
+缺桶、未测或不完整报告不作趋势样本。
 linked/clone 以 BB 定时 launcher 的 systemd invocation ID 对应报告；连续三个自然日的执行
 均完整且零删除、同日 07:00–07:30 的三个有效样本显示保留路径对应的最具体计量根持续增长，
 才告警。旧版、手动或不完整报告不计入；缺测不视为零。增长计量任务本身无需更换快照。
