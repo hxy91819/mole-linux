@@ -1,6 +1,7 @@
 name: DevCloud Python
 
 on:
+  workflow_dispatch:
   push:
     branches: [main, dev]
     paths:

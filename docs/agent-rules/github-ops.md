@@ -2,7 +2,9 @@
 
 ## Commit and push
 
-- **Commit and push without asking.** Owner standing instruction (2026-11-04): once a task's verification passes, commit it and push `main` straight to `origin`. Parallel sessions share this working tree: stage only the paths your task changed, and commit a file that also holds another session's edits only after that session has finished or handed over. This host has no GitHub SSH key, so `origin` uses the https URL through `gh`'s credential helper; if `git remote -v` shows `git@github.com:`, run `git remote set-url origin https://github.com/hxy91819/mole-linux.git`. A GitHub Actions bot pushes `chore: update contributors` commits to `main`, so before every push run `git fetch origin` and `git merge --ff-only --no-autostash origin/main`, which is safe when the incoming changes touch no dirty file. Push with `git push origin main` so `origin/main` keeps tracking what was pushed.
+- **Commit and push without asking.** Once verification passes, commit your changes and push `main` to `origin`. In a shared checkout, stage only your paths. If a file also contains edits from another session, wait for that session to finish or hand over before committing it.
+- **Check the destination.** `origin` is the public fork at `https://github.com/hxy91819/mole-linux.git`; use HTTPS with the GitHub CLI credential helper. A checkout that retains the private predecessor has a `private` remote for read-only reference. Push only the verified branch to `origin`; never use `--mirror`, `--all`, or `--tags` from a checkout that also keeps private history.
+- **Include upstream changes to the fork before pushing.** Run `git fetch origin` and `git merge --ff-only --no-autostash origin/main` to pick up any bot commits, then run `git push origin main`.
 - Do not add AI attribution trailers to commits.
 
 ## Issues, pull requests, and discussions
