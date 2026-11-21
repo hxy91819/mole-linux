@@ -499,8 +499,9 @@ class CleanupTests(unittest.TestCase):
         for args in ([], ['--execute']):
             code, output = self.run_cli(args, validate_root=lambda _: self.root,
                                         trusted=lambda _: None,
-                                        build_plan=lambda *args: (plan, {}), execute_item=sink)
-            self.assertEqual(code, 0)
+                                        build_plan=lambda *args: (plan, {}), execute_item=sink,
+                                        process_snapshot=lambda *args: self.live)
+            self.assertEqual(code, 0, output)
             self.assertEqual(output['candidates'], 75)
             self.assertEqual(output['deferred'], 0)
             self.assertEqual(output['candidate_bytes'], sum(row['bytes'] for row in plan))
@@ -518,8 +519,9 @@ class CleanupTests(unittest.TestCase):
                 mock.patch.object(m, 'RUN_SECONDS', 250):
             code, output = self.run_cli(['--execute'], validate_root=lambda _: self.root,
                                         trusted=lambda _: None,
-                                        build_plan=lambda *args: (plan, {}), execute_item=execute)
-        self.assertEqual(code, 0)
+                                        build_plan=lambda *args: (plan, {}), execute_item=execute,
+                                        process_snapshot=lambda *args: self.live)
+        self.assertEqual(code, 0, output)
         self.assertEqual(output['deleted'], 3)
         self.assertEqual(output['failed'], 0)
         self.assertEqual(output['deferred'], 72)

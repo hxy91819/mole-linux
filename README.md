@@ -427,6 +427,18 @@ Real feedback from users who shared Mole on X.
 <a href="https://cats.tw93.fun?name=Mole"><img src="https://cdn.jsdelivr.net/gh/tw93/sponsors@main/assets/sponsors.svg" alt="Mole supporters" width="1000" loading="lazy" /></a>
 </details>
 
+## DevCloud development
+
+On Linux, install pytest in your Python environment and enable the repository hooks from the checkout root.
+
+```bash
+python3 -m pip install pytest
+git config core.hooksPath .githooks
+```
+
+Staged DevCloud scripts, skills, docs, and Python tests trigger a smoke suite with a 55-second timeout.
+The DevCloud Python workflow runs the full suite on Ubuntu.
+
 ## License
 
 Mole is open source under GPL-3.0; see [LICENSE](LICENSE). A version you modify and share stays under the same license. If you fork Mole into another product, please give it a different name and credit Mole as the source.

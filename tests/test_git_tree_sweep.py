@@ -32,6 +32,15 @@ def case(tmp_path, monkeypatch):
     spec.loader.exec_module(m)
     temporary = tempfile.TemporaryDirectory(prefix='tmp-git-tree-', dir=SCRIPT.parents[4] / 'tests')
     tmp_path = Path(temporary.name)
+    process_ids = []
+    real_listdir = os.listdir
+
+    def listdir(path):
+        # Scan only children started by the test. On CI other users' processes
+        # are unreadable and on DevCloud their live references vary by run.
+        return process_ids if path == '/proc' else real_listdir(path)
+
+    monkeypatch.setattr(m.os, 'listdir', listdir)
     repo = tmp_path / 'deep' / '.hidden' / 'a' / 'b' / 'repo'
     bare = tmp_path / 'remote.git'
     shell('git', 'init', '-q', '--bare', '-b', 'main', str(bare))
@@ -52,7 +61,8 @@ def case(tmp_path, monkeypatch):
     monkeypatch.setattr(m, '_run', transport)
     shell('git', 'push', '-q', str(bare), 'main', cwd=repo)
     age(repo)
-    yield SimpleNamespace(m=m, repo=repo, bare=bare, root=tmp_path, calls=calls)
+    yield SimpleNamespace(m=m, repo=repo, bare=bare, root=tmp_path, calls=calls,
+                          process_ids=process_ids)
     temporary.cleanup()
 
 
@@ -3142,6 +3152,7 @@ def test_clone_sink_checks_live_evidence_after_preparation(case,monkeypatch,chan
             code+= 'os.chdir(p)\n' if change=='cwd' else 'held=open(p+"/a")\n' if change=='fd' else ''
             code+='print("ready",flush=True)\nsys.stdin.read()\n'
             child=subprocess.Popen([os.sys.executable,'-c',code,*([str(c.repo)] if change=='argv' else [])],cwd=c.root,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+            c.process_ids.append(str(child.pid))
             child.stdin.write(str(c.repo)+'\n');child.stdin.flush();assert child.stdout.readline().strip()=='ready'
         return original(item,*args,**kw)
     monkeypatch.setattr(c.m,'remove',remove)

@@ -16,6 +16,18 @@ SPEC.loader.exec_module(m)
 
 
 class CapacityTests(unittest.TestCase):
+    def setUp(self):
+        real_stat = Path.stat
+
+        def stat_path(path, **kwargs):
+            if path == m.DATA_ROOT:
+                return SimpleNamespace(st_dev=2)
+            if path == Path("/"):
+                return SimpleNamespace(st_dev=1)
+            return real_stat(path, **kwargs)
+
+        self.enterContext(patch.object(Path, "stat", stat_path))
+
     def stat(self, **values):
         data = dict(f_blocks=100, f_frsize=1024, f_bfree=30, f_bavail=20)
         data.update(values)
@@ -51,7 +63,7 @@ class CapacityTests(unittest.TestCase):
             with self.subTest(fields=fields), patch.object(
                 m.os, "statvfs", return_value=self.stat(**fields)
             ):
-                with self.assertRaises(Exception):
+                with self.assertRaisesRegex(m.Refused, "inconsistent filesystem capacity"):
                     m.capacity()
 
     def test_text_output_names_physical_and_unavailable(self):
