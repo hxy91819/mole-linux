@@ -1,0 +1,7 @@
+# Dev tool versions, kept in sync with CI (.github/workflows/check.yml).
+# golangci-lint: CI installs v2.12.2 via `go install ...@v2.12.2`.
+# go: CI uses actions/setup-go with go-version-file: go.mod (go 1.25.0),
+# so "1.25" resolves to the newest 1.25.x patch, matching CI.
+[tools]
+go = "1.25"
+golangci-lint = "2.12.2"
