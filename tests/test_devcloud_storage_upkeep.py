@@ -41,6 +41,15 @@ class WorktreeSweepTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='wt-sweep-test-', dir='/var/tmp')
         self.addCleanup(self.temp.cleanup)
+        self.process_ids = []
+        real_listdir = os.listdir
+
+        def listdir(path):
+            # A non-root runner cannot inspect unrelated system processes.
+            # Only scan children started by this test.
+            return self.process_ids if path == '/proc' else real_listdir(path)
+
+        self.enterContext(mock.patch.object(m.os, 'listdir', side_effect=listdir))
         root = Path(self.temp.name)
         self.code, self.bare, self.state = root / 'code', root / 'remote.git', root / 'state'
         self.main = self.code / 'proj'
@@ -62,6 +71,12 @@ class WorktreeSweepTests(unittest.TestCase):
         patch = mock.patch.object(m.Repo, '_archive_destination', lambda _self, _logins: 'origin')
         patch.start()
         self.addCleanup(patch.stop)
+
+    def add_process(self, cwd):
+        proc = subprocess.Popen(['sleep', '60'], cwd=cwd)
+        self.process_ids.append(str(proc.pid))
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
 
     def add_worktree(self, name, *, commit=None, ignored=True):
         path = self.code / 'proj-worktrees' / name
@@ -155,9 +170,7 @@ class WorktreeSweepTests(unittest.TestCase):
     def test_worktree_used_by_a_process_is_kept(self):
         busy = self.add_worktree('busy')
         self.age(busy)
-        proc = subprocess.Popen(['sleep', '60'], cwd=busy)
-        self.addCleanup(proc.wait)
-        self.addCleanup(proc.kill)
+        self.add_process(busy)
         rc, out = self.sweep('--idle-hours', '1', '--execute')
         self.assertEqual(rc, 0, out)
         self.assertTrue(busy.exists())
@@ -398,6 +411,7 @@ class WorktreeSweepTests(unittest.TestCase):
     def test_process_scan_permission_error_keeps_all_candidates(self):
         path = self.add_worktree('scan')
         self.age(path)
+        self.add_process(self.temp.name)
         real = os.readlink
 
         def readlink(target):
@@ -414,6 +428,7 @@ class WorktreeSweepTests(unittest.TestCase):
     def test_process_maps_permission_error_keeps_all_candidates(self):
         path = self.add_worktree('maps')
         self.age(path)
+        self.add_process(self.temp.name)
         real_open = open
 
         def fake_open(file, *args, **kwargs):
@@ -430,6 +445,7 @@ class WorktreeSweepTests(unittest.TestCase):
     def test_process_fd_permission_error_keeps_all_candidates(self):
         path = self.add_worktree('fds')
         self.age(path)
+        self.add_process(self.temp.name)
         real = os.listdir
 
         def listdir(target):
@@ -446,6 +462,7 @@ class WorktreeSweepTests(unittest.TestCase):
     def test_missing_proc_entry_still_removes_an_idle_worktree(self):
         path = self.add_worktree('goneproc')
         self.age(path)
+        self.add_process(self.temp.name)
         real = os.readlink
 
         def readlink(target):
@@ -760,6 +777,8 @@ class DockerLeftoversTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
         self.lock = root / 'run.lock'
+        free_bytes = leftovers.free_bytes
+        self.enterContext(mock.patch.object(leftovers, 'free_bytes', lambda: free_bytes(root)))
         self.lock.touch()
         self.retained = root / 'modes.json'
         self.retained.write_text('{"retained_volumes": []}\n')
@@ -1422,6 +1441,7 @@ def test_tmp_clone_mono2_never_archives_to_github(clone_case):
 @pytest.fixture
 def pnpm_case(tmp_path, monkeypatch):
     p = load_upkeep('pnpm_store_prune')
+    monkeypatch.setattr(p.local, 'mounts', lambda: {str(tmp_path): 'ext4'})
     store = tmp_path / 'store' / 'v11'; store.mkdir(parents=True); (store / 'cached').write_bytes(b'x' * 8192)
     (store / 'files').mkdir(); (store / 'index.db').touch()
     bindir = tmp_path / 'bin'; bindir.mkdir()
@@ -1893,6 +1913,7 @@ def test_pnpm_only_store_writers_block(args, busy):
 @pytest.fixture
 def multi_store_case(tmp_path, monkeypatch):
     p = load_upkeep('pnpm_store_prune')
+    monkeypatch.setattr(p.local, 'mounts', lambda: {str(tmp_path): 'ext4'})
     root = tmp_path / 'store'
     for version in ('v3','v10','v11'):
         (root/version).mkdir(parents=True)

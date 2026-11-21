@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -32,6 +33,16 @@ class GongfengCredentialTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         os.environ.pop('GONGFENG_PRIVATE_TOKEN', None)
+        real_stat = os.stat
+
+        def credential_stat(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if path == str(self.env_file):
+                # Simulate root ownership while checking the real fixture mode.
+                return SimpleNamespace(st_uid=0, st_mode=result.st_mode)
+            return result
+
+        self.enterContext(mock.patch.object(m.os, 'stat', credential_stat))
 
     def write_env(self, token, mode=0o600):
         self.env_file.write_text(f'OTHER=irrelevant\nGONGFENG_PRIVATE_TOKEN={token}\n')

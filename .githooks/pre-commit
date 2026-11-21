@@ -22,10 +22,14 @@ echo ""
 _info "Running pre-commit checks (mirrors GitHub CI)..."
 echo ""
 
-# Only check staged shell/Go files to keep commits fast.
+# Select the checks from staged paths. Include deletions and both sides of renames
+# when deciding whether to run the DevCloud tests.
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
-HAS_SHELL=$(echo "$STAGED" | grep -E '\.sh$|^mole$|^bin/' || true)
-HAS_GO=$(echo "$STAGED" | grep -E '\.go$' || true)
+HAS_SHELL=$(grep -E '\.sh$|^mole$' <<< "$STAGED" || true)
+HAS_GO=$(grep -E '\.go$' <<< "$STAGED" || true)
+DEVCLOUD_STAGED=$(git diff --cached --name-only --no-renames -- \
+    ':(glob)tests/test_*.py' ':(glob)bin/devcloud*' \
+    ':(glob).claude/skills/devcloud-*/**' ':(glob)docs/DEVCLOUD_*')
 
 FAILED=0
 
@@ -81,6 +85,25 @@ if [[ -n "$HAS_GO" ]] && command -v go > /dev/null 2>&1; then
     else
         _fail "go vet failed"
         FAILED=1
+    fi
+fi
+
+# --- 5. DevCloud Python smoke tests (Linux) ---
+if [[ -n "$DEVCLOUD_STAGED" ]]; then
+    if [[ $(uname -s) != Linux ]]; then
+        _info "Skipping DevCloud pytest on this platform (Linux suite runs in CI)."
+    elif ! command -v python3 > /dev/null 2>&1 || ! python3 -c 'import pytest' 2> /dev/null; then
+        _fail "DevCloud pytest requires pytest. Install with: python3 -m pip install pytest"
+        FAILED=1
+    else
+        _info "DevCloud pytest smoke tests..."
+        if timeout --kill-after=2s 55s python3 -m pytest -q \
+            tests/test_devcloud_capacity.py tests/test_devcloud_cleanup.py tests/test_patrol*.py; then
+            _ok "DevCloud pytest smoke tests passed"
+        else
+            _fail "DevCloud pytest smoke tests failed or timed out"
+            FAILED=1
+        fi
     fi
 fi
 
