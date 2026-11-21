@@ -1,9 +1,10 @@
-<!-- Generated from storage-rules.md; update with its growth-fingerprints table when publishing. -->
 <!-- growth-fingerprints -->
 | 路径指纹 | 归属 |
 |---|---|
 | `/data/itfs` | itfs |
-| `/data/.pnpm-store` | pnpm store |
+| `/data/.pnpm-store` | pnpm store (pnpm_store_prune.py) |
+| `/data/root-storage-20260912/root/.local/share/pnpm/store` | pnpm store (pnpm_store_prune.py) |
+| `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` | agent-cli-updates 更新器 |
 | `/data/codex` | Codex sessions |
 | `/data/bb-data/thread-storage/.shared-cache/go-build` | shared Go build cache |
 | `/data/bb-data/thread-storage/.shared-cache/golangci-lint` | shared golangci-lint cache |

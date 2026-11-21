@@ -25,7 +25,14 @@ BB_STORAGE = BB_DATA + '/thread-storage'
 GO_CACHE = BB_STORAGE + '/.shared-cache/go-build'
 LINT_CACHE = BB_STORAGE + '/.shared-cache/golangci-lint'
 BB_ROOTS = (BB_DATA, BB_STORAGE, GO_CACHE, LINT_CACHE, 'bb:threads', 'bb:non-thread')
-CHILD_ROOTS = ('/data/code', '/root/.cache')
+ROOT_STORAGE = '/data/root-storage-20260912'
+ROOT_STORAGE_BRANCHES = frozenset(ROOT_STORAGE + suffix for suffix in (
+    '', '/root', '/root/.acpx', '/root/.cursor', '/root/.local',
+    '/root/.local/share', '/root/.local/share/cursor-agent',
+    '/root/.local/share/pnpm', '/root/.local/share/zed'))
+ROOT_STORAGE_WATCH = frozenset(ROOT_STORAGE + '/root/.local/share/' + leaf
+                               for leaf in ('cursor-agent/versions', 'pnpm/store'))
+CHILD_ROOTS = ('/data/code', '/root/.cache', ROOT_STORAGE)
 DOCKER_TYPES = {'Images': 'docker:images', 'Containers': 'docker:containers',
                 'Local Volumes': 'docker:volumes', 'Build Cache': 'docker:build-cache'}
 
@@ -35,7 +42,7 @@ def unknown(root, error):
 
 
 def alert_exclusion(root):
-    if root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage', '/data/system-tmp', *CHILD_ROOTS):
+    if root in ROOT_STORAGE_BRANCHES or root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage', '/data/system-tmp', *CHILD_ROOTS):
         return 'parent aggregate; alert on components'
     if root in (GO_CACHE, LINT_CACHE):
         return 'shared Go cache; daily check 2 owns size and age limits'
@@ -46,7 +53,7 @@ def discover():
     roots, errors = [], []
     try:
         data = [str(p) for p in sorted(Path('/data').iterdir()) if str(p) != '/data/docker']
-        first = ('/data/code', '/data/system-tmp', BB_DATA)
+        first = ('/data/code', '/data/system-tmp', BB_DATA, ROOT_STORAGE)
         roots.extend([root for root in first if root in data])
         roots.extend(root for root in data if root not in first)
     except OSError as error:
@@ -159,7 +166,9 @@ def du_sizes(output):
 
 def measure_children(root, deadline):
     # Reporting depth only: du still walks descendants once and deduplicates inodes.
-    row = probe(root, ['du', '-ax', '-B1', '--max-depth=1', '--null', '--', root], deadline)
+    depth = 5 if root == ROOT_STORAGE else 1
+    branches = ROOT_STORAGE_BRANCHES if root == ROOT_STORAGE else {root}
+    row = probe(root, ['du', '-ax', '-B1', f'--max-depth={depth}', '--null', '--', root], deadline)
     if row['status'] != 'ok':
         return [unknown(root, row['error'])]
     try:
@@ -170,7 +179,7 @@ def measure_children(root, deadline):
                  'parent': root if path != root else None,
                  'elapsed_seconds': row['elapsed_seconds'],
                  **(du_notes(row) if path == root else {})}
-                for path, size in sizes.items() if path == root or str(Path(path).parent) == root]
+                for path, size in sizes.items() if path == root or str(Path(path).parent) in branches]
     except (ValueError, KeyError) as error:
         return [unknown(root, error)]
 
@@ -295,7 +304,7 @@ def assess_growth(rows, history):
             result = 'excluded'
         elif not values:
             result = 'unmeasured'
-        elif row['owner'] != 'unknown':
+        elif row['owner'] != 'unknown' and row['root'] not in ROOT_STORAGE_WATCH:
             result = 'daily_checked' if len(values) >= 2 else 'insufficient_samples'
         elif len(values) < 3:
             result = 'insufficient_samples'
@@ -341,6 +350,8 @@ def is_alert(row):
         return False
     if row['owner'] == 'unknown':
         return row['growth_status'] == 'continuous_threshold_met'
+    if row['root'] in ROOT_STORAGE_WATCH and row['growth_status'] == 'continuous_threshold_met':
+        return True
     return row['daily_bytes'] is not None and row['daily_bytes'] > 20 * GIB
 
 

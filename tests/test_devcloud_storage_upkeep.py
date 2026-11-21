@@ -1423,6 +1423,7 @@ def test_tmp_clone_mono2_never_archives_to_github(clone_case):
 def pnpm_case(tmp_path, monkeypatch):
     p = load_upkeep('pnpm_store_prune')
     store = tmp_path / 'store' / 'v11'; store.mkdir(parents=True); (store / 'cached').write_bytes(b'x' * 8192)
+    (store / 'files').mkdir(); (store / 'index.db').touch()
     bindir = tmp_path / 'bin'; bindir.mkdir()
     fake = bindir / 'pnpm'
     fake.write_text(r"""#!/usr/bin/env python3
@@ -1441,6 +1442,10 @@ else: sys.exit(2)
     fake.chmod(0o755)
     monkeypatch.setattr(p.ws, 'ENV', dict(p.ws.ENV, PATH=str(bindir) + ':' + os.environ['PATH'], PNPM_STORE=str(store), PNPM_CALLS=str(tmp_path / 'calls')))
     monkeypatch.setattr(p, 'package_process_state', lambda: (1, 'idle'))
+    monkeypatch.setattr(p, 'installed_pnpm', lambda: [str(fake)] if p.ws.ENV['PATH'] != '/nonexistent' else [])
+    monkeypatch.setattr(p, 'discovery_paths', lambda: [])
+    monkeypatch.setattr(p.Path, 'home', classmethod(lambda cls: tmp_path / 'home'))
+    (tmp_path / 'home').mkdir()
     return p, store, tmp_path
 
 
@@ -1842,7 +1847,7 @@ def test_tmp_clone_final_local_guards_run_after_reference_io(clone_case, monkeyp
 def test_storage_snapshot_help_does_not_write_bytecode(tmp_path, name):
     source = Path(__file__).resolve().parents[1] / '.claude/skills/devcloud-storage-upkeep/scripts'
     # Both retired CLI names now delegate to the one full-disk entrypoint.
-    for f in dict.fromkeys((name, 'worktree_sweep.py', 'tmp_clone_sweep.py', 'git_tree_sweep.py')):
+    for f in dict.fromkeys((name, 'worktree_sweep.py', 'tmp_clone_sweep.py', 'git_tree_sweep.py', 'local_storage_inventory.py')):
         shutil.copy2(source / f, tmp_path / f)
     before = sorted(p.name for p in tmp_path.iterdir())
     subprocess.run(['python3', '-I', str(tmp_path / name), '--help'], check=True, capture_output=True, text=True)
@@ -1892,6 +1897,11 @@ def multi_store_case(tmp_path, monkeypatch):
     for version in ('v3','v10','v11'):
         (root/version).mkdir(parents=True)
         (root/version/'cached').write_bytes(b'x'*8192)
+        (root/version/'files').mkdir()
+        if version == 'v10':
+            (root/version/'index').mkdir()
+        if version == 'v11':
+            (root/version/'index.db').touch()
     bindir=tmp_path/'bin';bindir.mkdir();state=tmp_path/'state.json';state.write_text('{}')
     body=r'''#!/usr/bin/env python3
 import json,os,sys
@@ -1918,6 +1928,10 @@ else:sys.exit(2)
         f=bindir/name;f.write_text(body);f.chmod(0o755)
     monkeypatch.setattr(p.ws,'ENV',dict(p.ws.ENV,PATH=str(bindir)+':'+os.environ['PATH'],MULTI_ROOT=str(root),MULTI_STATE=str(state)))
     monkeypatch.setattr(p,'package_process_state',lambda:(1,'idle'))
+    monkeypatch.setattr(p, 'installed_pnpm', lambda: [str(bindir / 'pnpm')])
+    monkeypatch.setattr(p, 'discovery_paths', lambda: [])
+    monkeypatch.setattr(p.Path, 'home', classmethod(lambda cls: tmp_path / 'home'))
+    (tmp_path / 'home').mkdir()
     return p,root,state,tmp_path/'logs'
 
 
@@ -2878,3 +2892,71 @@ def test_growth_v5_null_child_only_output_is_not_a_complete_scan(monkeypatch):
     monkeypatch.setattr(g.subprocess, 'run', lambda *a, **kw: subprocess.CompletedProcess([], 1, '50\t/data/code/child\0', error))
     rows = g.measure_job('/data/code', time.monotonic() + 1)
     assert len(rows) == 1 and rows[0]['status'] == 'unknown' and 'bytes' not in rows[0]
+
+
+def test_pnpm_discovery_dedupes_aliases_and_prunes_configured_root(pnpm_case, monkeypatch):
+    p, store, root = pnpm_case
+    default = p.Path.home() / '.local/share/pnpm/store'
+    default.parent.mkdir(parents=True)
+    default.symlink_to(store.parent)
+    other = root / 'second store'
+    other.mkdir()
+    config = root / '.npmrc'
+    config.write_text('store-dir="second store"\n')
+    monkeypatch.setattr(p, 'discovery_paths', lambda: [config])
+    assert p.discover_roots() == ([str(other), str(store.parent)], [])
+    assert p.main(['--execute', '--root', str(default), '--state-dir', str(root / 'log')]) == 0
+    assert not (store / 'cached').exists()
+
+
+def test_pnpm_rejects_symlinked_content_root(pnpm_case):
+    p, store, root = pnpm_case
+    (store / 'files').rmdir()
+    (store / 'files').symlink_to(root)
+    assert p.main(['--execute', '--state-dir', str(root / 'log')]) == 0
+    assert (store / 'cached').exists()
+
+
+def test_growth_migrated_components_alert_without_parent(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    root = g.ROOT_STORAGE
+    leaf = root + '/root/.local/share/cursor-agent/versions'
+    omitted = leaf + '/old'
+    output = f'1\t{omitted}\0{5*g.GIB}\t{leaf}\0{8*g.GIB}\t{root}\0'
+    monkeypatch.setattr(g, 'probe', lambda *args: {'status': 'ok', 'output': output, 'elapsed_seconds': 1})
+    rows = g.measure_job(root, 10)
+    assert {r['root'] for r in rows} == {root, leaf}
+    for row in rows:
+        row['owner'] = g.owner(row['root'], g.fingerprints())
+        row['alert_excluded'] = g.alert_exclusion(row['root'])
+    assert rows[0]['owner'] == 'agent-cli-updates 更新器'
+    def sample(i):
+        return {'ts': i * 86400, 'rows': [{'root': r['root'], 'status': 'ok', 'bytes': i * g.GIB}
+                                         for r in rows]}
+    g.assess_growth(rows, [sample(2), sample(1)])
+    comparisons, _ = g.compare(rows, sample(2), 3 * 86400)
+    assert [r['root'] for r in comparisons if g.is_alert(r)] == [leaf]
+
+
+def test_pnpm_physical_inventory_discovers_cli_only_store_but_not_nested_format(pnpm_case, monkeypatch):
+    p, store, root = pnpm_case
+    standalone = root / 'cli-only' / 'v3'
+    nested = store / 'v3'
+    incomplete = root / 'unrelated' / 'v3'
+    for path in (standalone, nested):
+        for bucket in p.CAS_BUCKETS:
+            (path / 'files' / bucket).mkdir(parents=True)
+        (path / 'files' / '00' / ('a' * 126)).touch()
+    (incomplete / 'files' / '00').mkdir(parents=True)
+    (incomplete / 'files' / 'ff').mkdir()
+    monkeypatch.setattr(p, 'discovery_paths', lambda: [standalone, nested, incomplete])
+    assert p.discover_roots() == ([str(standalone.parent), str(store.parent)], [])
+
+
+def test_pnpm_inventory_only_tolerates_vanished_entries():
+    p = load_upkeep('pnpm_store_prune')
+    vanished = b"/usr/bin/find: '/data/disappeared': No such file or directory\n"
+    denied = b"/usr/bin/find: '/data/not-readable': Permission denied\n"
+    assert p.local.vanished_only(vanished)
+    assert not p.local.vanished_only(vanished + denied)
+    assert not p.local.vanished_only(b'')
