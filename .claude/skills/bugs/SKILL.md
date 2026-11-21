@@ -83,7 +83,7 @@ The method: enumerate every caller of each protection helper, then every deletio
 
 Every production `du -s` site should route through the timeout wrapper. `tests/core_timeout.bats` pins that with a source-invariant test; copy the shape for any new unbounded command.
 
-Installed-binary verification is the same class: every post-update `mo --version` or `"$mole_path" --version` probe must use `run_with_timeout` with `MOLE_TIMEOUT_QUICK_DETECT_SEC`, and standalone `install.sh` must use its bounded local wrapper for both `--version` and `--help`. A broken executable is exactly when a verification probe is most likely to hang. The update entrypoint also stays single-flight per install directory; otherwise one process can verify another process's metadata or binary generation. Standalone install and self-heal verification share the same target-adjacent `/usr/bin/lockf`; keep the kernel lock held by a parent-liveness-bound process instead of replacing it with a check-then-remove shell sequence.
+Installed-binary verification can also hang when the executable is broken. Check the [probe timeouts and single-flight contract](../../../docs/agent-rules/install-update.md#bootstrap-recovery-and-locking).
 
 Two subtler variants:
 
@@ -226,7 +226,7 @@ go test ./...
 MOLE_DRY_RUN=1 ./mole clean
 ```
 
-Per-area test targets are listed under "Hotspot Ownership" in `AGENTS.md`. Use those rather than guessing.
+Use the per-area test targets in [Hotspot Ownership](../../../docs/agent-rules/hotspots.md).
 
 ## Sibling sweep obligation
 

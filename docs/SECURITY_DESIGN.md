@@ -119,6 +119,18 @@ weaken the deny rules.
 
 ## Layer 2: `# SAFE: <reason>` contract for raw `rm`
 
+Route deletion through the safe helpers in `lib/core/file_ops.sh`. A raw
+`rm -rf` or `find -delete` outside those helpers requires a same-line
+`# SAFE: <one-sentence reason>` annotation.
+
+Count the right scope when auditing exceptions. The seven `rm -rf` call sites
+counted in `lib/`, `bin/`, `install.sh`, and `mole` use the annotation for
+paths the function itself created. The same annotation is prescribed for the
+roughly 100 `rm -f` removals of self-created `mktemp` files. The CI whitelist
+checks for the annotation and enforces no count. Remove a self-created
+`mktemp` scratch file directly with the annotation to avoid Trash routing and
+an operation-log entry through `mole_delete`.
+
 The validator is opt-in: a contributor could bypass it by writing `rm -rf`
 directly. To make that bypass loud and reviewable, the CI security job in
 `.github/workflows/test.yml` greps for `rm -rf` outside known safe

@@ -459,7 +459,7 @@ BB script 的 timeout 最大 900 秒，不能因为更新失败而继续运行�
 | `docs/DEVCLOUD_SPACE_RECOVERY_HISTORY.md` | 历史恢复记录 | 追溯旧轮次，不作当前授权 |
 | `docs/WORKTREE_CLEANUP_REVIEW.md`、`docs/WORKTREE_CLEANUP_REVIEW_PROMPT.md` | 已退役监督流程 | 只读历史，不照做 |
 | `storage-audit.log` | 本机逐轮账本（git-ignored） | 查某轮证据；不随仓库传承 |
-| `AGENTS.md` | Agent 合同与 Ledger 五问 | 提交前、晋升规则前 |
+| [AGENTS.md](../AGENTS.md) | Agent 合同与专题入口 | 开始工作前 |
 
 
 2026-11-14 返工教训：预演的零副作用必须由 BB 桩调用计数和状态原文不变证明；
@@ -604,3 +604,24 @@ Cursor Agent 每次更新留下一整份约 538 MiB 的下载载荷；pnpm 会�
 从 `agent` 的真实目标识别当前和上一版，保留 exe、cwd 或 maps 正使用的载荷。
 pnpm 按真实根去重，走各格式匹配的 owner prune，
 预演只报占用和可执行性，不能预测释放量；实际以分项 `du` 差值和文件系统可用量变化分别记录。
+
+## Linux DevCloud Audit Ledger
+
+After every storage investigation, append the run details to `storage-audit.log`, a
+git-ignored local ledger. It exists only on this machine and does not travel with the
+repository: any lesson that must hold across rounds belongs in this document
+(why/layout/lesson) or `storage-rules.md` (rule), not only in the ledger. Do not put
+one-off capacities, timestamps, deleted paths, or command transcripts in the agent guide.
+
+A new rule is promotable only when it answers:
+
+1. What exact path, mount, volume, container, or owner produced the bytes?
+2. Is it active, referenced, rebuildable, disposable, or persistent user data?
+3. What is the smallest owner-supported cleanup command, and does it have a dry-run?
+4. What must be excluded, and what evidence proves the exclusion?
+5. How much space was actually reclaimed, and how will recurrence be prevented?
+
+Promote only rules that hold across runs; land each in `storage-rules.md` with a
+regression check, or an explicit reason why only a live read-only probe is possible. The
+analyzer stays read-only by default; preserve the Mole workflow: inspect, classify,
+preview, then execute one owner-approved action.

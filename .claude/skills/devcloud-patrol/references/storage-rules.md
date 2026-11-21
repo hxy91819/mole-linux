@@ -4,9 +4,7 @@
 设计原因、布局、决策和踩坑记录见
 [DEVCLOUD_STORAGE_DESIGN](../../../../docs/DEVCLOUD_STORAGE_DESIGN.md)；
 现行任务和复现见 [DEVCLOUD_AUTOMATION](../../../../docs/DEVCLOUD_AUTOMATION.md)。
-新规则先写进当轮 `storage-audit.log`，跨运行成立并通过 AGENTS.md DevCloud
-Audit Ledger 的五问后晋升到这里；每条晋升规则要附回归检查，或写明为何只能
-做活体只读探针。
+新规则按 [本机账本与晋升条件](../../../../docs/DEVCLOUD_STORAGE_DESIGN.md#linux-devcloud-audit-ledger) 记账并晋升到这里。
 
 ## 本机可再生残留的长期授权
 

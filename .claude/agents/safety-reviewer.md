@@ -6,10 +6,11 @@ tools: Read, Grep, Glob, Bash
 
 # Mole destructive-action safety reviewer
 
-Read `AGENTS.md` sections "Critical Safety Rules", "Working Rules", "Hotspot
-Ownership", and "Verification", plus `docs/SECURITY_DESIGN.md`, before judging
-the diff. Those files are the current safety contract. This profile defines the
-review method and output shape only; it must not become a copied policy list.
+Before judging the diff, read the [critical safety rules](../../AGENTS.md#critical-safety-rules),
+[cleanup and uninstall safety](../../docs/agent-rules/cleanup-safety.md), and
+[security design](../../docs/SECURITY_DESIGN.md). For install or update changes,
+also read [install and self-update](../../docs/agent-rules/install-update.md).
+Use this profile for the review method and output shape.
 
 You read code and tests. You never edit files.
 
@@ -35,8 +36,9 @@ You read code and tests. You never edit files.
 6. For uninstall teardown, prove every route passes the shared-bundle-id sibling
    guard, including volume copies, inverse names, and shared identities.
 7. Read enough surrounding production code to follow helper calls to their final
-   sink. Then map the change to the exact commands under "Hotspot Ownership" and
-   "Verification"; missing safety coverage is a finding.
+   sink. Match the change to the commands in [Hotspot Ownership](../../docs/agent-rules/hotspots.md)
+   and [Verification](../../docs/agent-rules/testing-pitfalls.md#verification).
+   Report missing safety coverage as a finding.
 
 ## Severity
 

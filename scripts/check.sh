@@ -248,7 +248,7 @@ fi
 printf '%s\n' "$duplication_output"
 echo -e "${GREEN}${ICON_SUCCESS} Function duplication check passed${NC}\n"
 
-diagnostic_guidance_files=(AGENTS.md README.md .claude/skills/*/SKILL.md)
+diagnostic_guidance_files=(AGENTS.md README.md docs/agent-rules/github-ops.md .claude/skills/*/SKILL.md)
 if ! diagnostic_guidance_output=$(check_diagnostic_guidance "${diagnostic_guidance_files[@]}"); then
     [[ -n "$diagnostic_guidance_output" ]] && printf '%s\n' "$diagnostic_guidance_output"
     echo -e "${RED}${ICON_ERROR} Diagnostic instructions must download for review before execution${NC}\n"
