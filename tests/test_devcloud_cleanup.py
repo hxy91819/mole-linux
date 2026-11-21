@@ -149,7 +149,7 @@ class CleanupTests(unittest.TestCase):
         code, output = self.var_tmp_cli()
         self.assertEqual(code, 0, output)
         self.assertEqual(output['path'], str(self.root))
-        self.assertEqual(output['scan_skipped']['repository or persistent state'], 1)
+        self.assertEqual(output['scan_skipped']['Git state'], 1)
         self.assertTrue(path.exists())
 
     def test_var_tmp_recent_tree_is_retained(self):
@@ -369,10 +369,15 @@ class CleanupTests(unittest.TestCase):
         os.symlink(outside, self.root / 'link')
         with socket.socket(socket.AF_UNIX) as sock:
             sock.bind(str(self.root / 'worker.sock'))
-            plan, skipped = self.plan()
+            os.utime(self.root / 'worker.sock', (self.cutoff - 1, self.cutoff - 1))
+            with mock.patch.object(m, 'PROC_ROOT', self.proc):
+                plan, skipped = self.plan()
         self.assertFalse(plan)
         self.assertEqual(outside.read_text(), 'preserved')
-        self.assertIn('symlink, socket or special file', skipped)
+        self.assertEqual(skipped['entry symlink'], 1)
+        self.assertEqual(skipped['live Unix socket'], 1)
+        self.assertEqual(skipped['Git state'], 1)
+        self.assertEqual(skipped['credential or backup'], 1)
 
     def test_receipt_name_is_excluded_from_preview(self):
         self.old('receipt.json')

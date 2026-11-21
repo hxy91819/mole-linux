@@ -46,6 +46,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   Go 根取 `go env GOCACHE` 的 realpath；lint 根取 `readlink -f /root/.cache/golangci-lint`。
   README 第一行分别必须为 `This directory holds cached build artifacts from the Go build system.` 和
   `This directory holds cached build artifacts from golangci-lint.`，不符则该缓存不删并报错。
+  哈希桶和 README 共同确认缓存归属；非哈希控制文件、fuzz 数据和指向外部的软链不在删除计划内。
   两者复用同一 24h、哈希普通文件、桶和末端复查规则。pnpm 每周 owner prune 见下条；npm 既有策略不变。
   原 30/10/20 GiB 整体重置作废。回归：
   `test_old_go_cache_entries_are_deleted`、`test_recent_go_cache_entries_are_kept`、
@@ -60,7 +61,8 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   匿名测试 DB 卷的证据链见本节「匿名测试 DB 卷满 1 小时即清」。
 - **2026-11-14 owner 批准：带标签镜像**同时满足以下条件才删：没有任何容器（含 stopped、created）
   引用 image ID、Created 严格超过 30×24h、同一 repository 有 Created 严格更新的镜像。
-  每个 repository 的最新镜像（含并列最新）始终保留；`mole.protect=true` / `devcloud.protect=true`
+  30 天窗口保留回滚副本；每个 repository 的最新镜像（含并列最新）始终保留，避免移除仓库唯一的本地构建或恢复入口。
+  `mole.protect=true` / `devcloud.protect=true`
   一律保留，悬空镜像 prune 也排除这两个标签。删除前重新检查全部容器引用、标签指向、保护标签和更新镜像证据；
   更新镜像证据明确选仓库最新，不依赖 Docker 列表顺序；单标签复查失败保留并报错，继续报告其余标签。
   查询失败最终 exit 1。只用 `docker image rm <repo:tag>`，不加 force。报告的 image_size_bytes
@@ -157,12 +159,13 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   不进入 Git 元数据和 node_modules 查配置；解析失败单列，宿主文件清单不完整则不执行。
   逐个存在的版本目录执行对应 pnpm 的 `--store-dir <共同根> store prune`；禁止把 `vN` 目录再当 store 根。
   本机实测选用 pnpm 9 → v3、pnpm 10 → v10、pnpm 12 → v11；工具通过现有 pnpm 或 `npx --yes pnpm@<major>`
-  获取，先核版本及同一显式根下的 `store path` 精确匹配；工具不可得、格式未知或路径不符则跳过该版本并记原因。
+  获取，先核版本及同一显式根下的 `store path` 精确匹配；工具不可得、格式未知或路径不符则跳过该版本并记原因，
+  避免在另一版本或另一个根执行 prune。
   仅可能写 store 的 pnpm 子命令阻塞：install/i/ci/install-test、add/update/up/remove/fetch/import/dlx/rebuild、
   create/pipeline、store add/prune 等及其已核实别名（含 pnpx/pnx）；recursive/multi/m/pm 按内层命令判断。
   正确消费 pnpm/Node 前置取值选项与 `--`，不把选项值或脚本参数误当写命令；
   pnpm run/exec/start/脚本、npm、npx、yarn、vite 不阻塞，pnpm 子进程按自身命令判断。`/proc` 未知仍跳过，
-  每次 prune 前再查一次。只调用 owner 命令，不直接递归删 store。逐版本 JSONL 记录前后字节及结果；真实 prune
+  每次 prune 前再查一次，避免索引被并发改写或安装器刚写入的对象尚无引用。只调用 owner 命令，不直接递归删 store。逐版本 JSONL 记录前后字节及结果；真实 prune
   失败记账并继续其余版本，最终非零。默认预演、`--execute` 执行、`--quiet` 无动作静默。
   版本和内容根拒绝软链、布局不符和子挂载；命令边界复查身份。人工可用 `--root` 限定已发现根。
 - **Cursor Agent 版本由更新器收尾**：Personal 的 `auto_bgngb9bbyqk` 每天 04:22 调
@@ -187,6 +190,9 @@ node_modules/虚拟环境内凭据不阻塞、ls-remote 失败保留、/proc 非
 ## 盘点的计量与只读要求
 
 ### 水位刹车与增长归因（2026-11-14）
+
+冷却避免同一波写入反复触发重扫，升到危险水位则及时重试。跳过运行中、查询结果未知和锁忙的任务，
+防止 cron 与水位同时清理同一批对象。旧 tmp clone 入口已经退役，水位不再派发这个空操作。
 
 每 15 分钟读取 `/` 与 `/data` 的 `statvfs` 可用字节；低于 150 GiB 预警、低于 50 GiB 危险。首次越线、warning→danger 升级或两小时冷却结束后再次触发才通知；冷却期静默，恢复正常后重新越线视为首次。运行中或查询未知的任务跳过并在触发简报注明；clean-tmp 与 cron 共用 `clean_tmp_runner.py`，非阻塞锁由后台执行链持有到结束，两盘同时越线合并为同一 worker 顺序执行两根；新入口用 `-I`，旧执行器仍用 `-B`（同目录依赖）。路径、timeout、预算与 JSONL 记账只有一个入口。派发后先保存冷却再通知，通知失败仍非零退出。`--dry-run` 仅打印计划，不写状态、不调用 BB 或包装器。真实触发 stdout 输出一行摘要，正常/冷却完全静默。每日07:00按/data顶层优先、system-tmp逐项最后，以8并发、ionice空闲级计量；单根最多780秒、全轮840秒，BB超时900秒，须在07:30检查前结束。/data/docker不du，改Docker system df分类数值比较（镜像、容器、卷、构建缓存）；/data顶层未测根单列data_top_unknown。超时/失败/缺类不当0比较，历史保留30天。
 
@@ -371,8 +377,8 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   均 kill-after 10 秒，外层仍为 1790 秒。
   包装器加 `--dry-run` 即预览，不接受其他路径。
   `systemd-private-*`（及已有 `systemd-*`）始终跳过。普通项保留期 3 天。唯一执行器为固定部署版
-  `/data/tools/devcloud-maintenance/releases/64a16a707b7a1da1/bin/devcloud.py`；上一版
-  `cbb5caf329a61b57` 及旧版 `7ca528d7c5f3f004`、`df3e2b353d8e1c72`（仅 /tmp）、
+  `/data/tools/devcloud-maintenance/releases/71d282c3d6426609/bin/devcloud.py`；上一版
+  `64a16a707b7a1da1`、`cbb5caf329a61b57` 及旧版 `7ca528d7c5f3f004`、`df3e2b353d8e1c72`（仅 /tmp）、
   `f1e330c325c73fd0`、`1c2d71d3ab21cc79` 保留作回滚。后续升级先验收新快照，再同步 cron、
   水位入口与每日 DSH 检查，不执行共享工作区。
 - **systemd-tmpfiles 自 2026-11-04 起不再按年龄清理 `/tmp`**：`/etc/tmpfiles.d/tmp.conf` 为
@@ -386,7 +392,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   与 `::test_policy_shard_refusal_discards_the_whole_candidate_set`。
 - 2026-11-04 的分片吞吐验证、容量统计口径修正和旧快照升级过程只用于解读历史报告，
   已移到设计文档「决策记录」和「经验教训」；现行预算、分片和容量规则见本节和
-  `/data/tools/devcloud-maintenance/releases/64a16a707b7a1da1/` 的部署清单。
+  `/data/tools/devcloud-maintenance/releases/71d282c3d6426609/` 的部署清单。
 - 容量统计固定用 statvfs：总量 `f_blocks`、物理空闲 `f_bfree`、普通可用 `f_bavail`，
   保留差额为 `f_bfree - f_bavail`；同时输出物理已用与含保留块的占用百分比，不能混用分母。
   零、负或不一致容量拒绝；`used_percent` 兼容字段明确表示物理已用。
@@ -399,20 +405,39 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   所有候选仍须 root 所有且不对其他用户可写。隔离区分别为
   `/data/metrics/devcloud-maintenance/` 和 `/var/lib/devcloud-maintenance/`，均在源文件系统且祖先可信。
   完整扫描检查 cwd/exe/fd/maps、绝对 argv、各 mount namespace 和 inotify；
-  证据未知则拒绝。内部有新文件、仓库、凭据、备份、数据库、socket、symlink、
-  硬链接、挂载或外部可写文件的树保留。Mole 保护与用户 whitelist 同时约束
-  原路径、/tmp 别名和删除入口，不允许隔离路径绕开保护。
+  证据未知则拒绝。Mole 保护与用户 whitelist 同时约束原路径、/tmp 别名和删除入口。
+- **临时项目录和文件的证据**：
+  - 入口是软链时保留：该入口未绑定已批准物理子项。物理子树中的普通软链只解除链接、不访问目标；
+    `.git`、凭据名和近期 mtime 等仍按目录项本身检查。硬链接只 unlink 本目录项，不改其他名字或文件内容；
+    只有树内包含某 inode 的全部链接时才把它的块计一次，外部链接仍在时不申报它的块。
+  - 其他 UID 的对象保留，避免替其他账号删除数据；对组或其他用户可写的非软链保留，
+    避免在 root 扫描、隔离和删除期间被外部账号改写或替换。普通软链的 Linux mode 不是写权限。
+    挂载树保留，避免清理穿过文件系统或 bind 边界。
+  - FIFO、设备和 Unix socket 本身不证明有人使用。FIFO/设备用通常的进程引用及 inotify 检查；
+    socket 还以各可见活进程网络 namespace 的 Unix socket 内核表核 VFS 设备和 inode，
+    所以改名或临时路径别名不会漏掉仍绑定的地址。探针拒绝、截断或无法完成时保留该 socket 树；
+    隔离后及真实删除前重新检查。只 unlink 节点，不打开 FIFO 或设备、不跟随软链。
+  - `.git` 和 bare Git 标记继续保留，因为临时清理不能证明 refs 已恢复；由 06:30 的 linked/clone 路径判定。
+    凭据、备份、补丁和原始数据库或转储可能是唯一副本；`.db` / SQLite、journals 和 SQL 文件不因三天没开
+    就变成可重建内容。测试库如要自动清理，应由其生成器证明专用位置、可重建 schema/fixture 和运行状态，
+    不能用通用扩展名、目录名或 mtime 推断。pnpm v11 owner 索引仍用既有结构缓存契约。
+  - 普通树有近期写入时整树保留，避免删除仍跨多个文件工作的任务或破坏同一批产物；持续写入的生产者应自己
+    轮转自己的产物。系统私有运行目录、X11/ICE IPC 与 staging 收据也是独立生命周期，不交通用扫描。
+    Playwright 浏览器 profile 可能含 Cookie/会话库；DSH、CodeBuddy 的 daemon 以及 Node addon
+    运行目录仍由其生产者管理，不能因某次探针没看到打开文件就用通用清理替代。
 - **结构缓存按整目录闲置 24h**：仅两批准根的非符号链接直接物理子项可执行。普通项仍为 3 天；
   精确匹配的 Go build cache、pnpm store、Node compile cache 以树内最新普通文件 mtime 判 24h，不用根 mtime。
   Go 要求固定 README 首行、完整 00–ff 桶、对应哈希的 -a/-d 产物；pnpm 要求版本目录及 files、index/metadata
   布局（v3 内嵌 *-index.json，v11 可为 SQLite index.db），校验桶、文件、已知元数据；Node 要求官方
   版本–架构–V8 tag–uid 目录与 8 位十六进制文件。识别不出走原规则；混入仓库、凭据、未知内容或非空
-  pnpm 部分安装树则保留。符号链接、socket、硬链接、foreign owner、外部可写内容、挂载、inotify 继续保留。
+  pnpm 部分安装树则保留。软链、特殊文件不符合这些缓存的已知布局；普通文件硬链接可按上述规则解除。
+  foreign owner、外部可写内容、挂载、inotify 仍保留。
 - **批量 /proc 快照与吞吐**：每批最多 128 项共用一次完整 PID/starttime/引用快照，未知整批拒绝。
   owner 2026-11-14 明确授权：隔离后和 Mole 最终 sink 逐项只增量检查新增或 starttime 变化的 PID；
   既有 PID 的可变引用不重扫。所有新增探针 unknown 仍拒绝；每项删除前重核结构、年龄、物理身份与完整指纹，
   仍经 Mole dry-run 和最终 guard。最多 8 项并发；取消信号停止排队、终止 Mole 子进程组、恢复在途隔离项再退出，
-  遗留隔离项阻止下一轮。完整计划扫描上限 240 秒，单普通树 5 秒、结构缓存树 60 秒；不设数量上限，余项递延。
+  遗留隔离项阻止下一轮。完整计划扫描上限 240 秒，单普通树计划扫描 5 秒、隔离前复核 20 秒，
+  结构缓存树 60 秒。隔离前单项超时保留原路径并继续，整轮预算超时仍报错；不设数量上限，余项递延。
   读取 /proc 时进程退出窗口错误只在有界复核证实消失、僵尸或 PID 重用时视为退出，证据仍不全则拒绝。
 - Git 工作树统一由每日 06:30 的 `git_tree_sweep.py`（模式按本轮授权条件），旧 06:45 任务停用；
   不再补删 BB 环境，pnpm 每周日 05:30 逐版本 owner prune。
@@ -422,7 +447,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   部分失败，失败非零。复核发现活引用或候选变化时保留该项，已隔离项先恢复原名，再继续后续批次。
   逐项记跳过原因，按 `skipped`/`skipped_reasons` 汇总，扫描阶段的过滤另记 `scan_skipped`。
   Mole 拒绝、I/O 或恢复失败时逐项写错误，已发批次收尾后停止发下一批。summary 还记录 cache_roots（路径、类型、allocated bytes、
-  最新文件 mtime）及 deleted_bytes。logrotate 每日检查，保留 14 份/最长 30 天、
+  最新文件 mtime）、relaxed_candidates 及 deleted_bytes；删除事件用 relaxed_rules 标明放宽项，组合互斥汇总。logrotate 每日检查，保留 14 份/最长 30 天、
   5 MiB 检查阈值，不截断活跃日志。回归：`tests/test_devcloud_cleanup.py`；本机
   挂载与真实 Mole 路由另以专属测试文件验收，结果入 `storage-audit.log`。
 - 每日 DSH 检查只读两根 summary、比较容量并解释增长，必要时预览同一执行器；
