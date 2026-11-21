@@ -2813,7 +2813,10 @@ def bb_archived_thread(env='env-old'):
     ([],25,True),([True],25,True),([False],500,False),([True,False],500,False),
     ([True],23.99,False),([],24,True),([True],24,True)])
 def test_bb_environment_requires_archival_and_24h(case,threads,age_hours,abandoned):
-    c=case;now=time.time();env=bb_old_environment(c)
+    c = case
+    # Whole-second fixture time keeps the exact 24-hour threshold representable.
+    now = 1_800_000_000
+    env = bb_old_environment(c)
     env['updatedAt']=env['createdAt']=(now-age_hours*3600)*1000
     ts=[]
     for index,archived in enumerate(threads):
