@@ -9,9 +9,14 @@ plus per-target archive metadata in apply mode. Before a worktree is removed, a
 non-empty `.local` is copied to the primary checkout's
 `.local/worktree-archive/<worktree>-<UTC>/` unless the primary checkout does not
 gitignore `.local`, in which case the candidate is kept. Oversized `.local`
-content is listed but not archived. Exit 0 means every approved candidate
-completed, 1 means discovery, approval, archive, or removal had a rejected item,
-and 2 is an argparse usage error.
+content is listed but not archived. Local-test state is destroyed with
+`bin/lt destroy` when present, and Compose projects are stopped when their
+`com.docker.compose.project.working_dir` label resolves inside the worktree.
+Docker being unavailable is reported but does not block removal; a Compose
+shutdown failure keeps the worktree so its containers are not orphaned. Exit 0
+means every approved candidate completed, 1 means discovery, approval, archive,
+service shutdown, or removal had a rejected item, and 2 is an argparse usage
+error.
 
 With `--remote-evidence` the tool makes no GitHub call at all: the evidence file
 is the only durability witness, and every record it accepts must name the exact
@@ -44,8 +49,15 @@ PR_JSON_FIELDS = (
 IGNORED_SAMPLE_LIMIT = 50
 LOCAL_INVENTORY_LIST_LIMIT = 500
 PRESERVATION_TEXT_LIMIT = 20
+SERVICE_TEXT_LIMIT = 20
 DEFAULT_MAX_LOCAL_FILE_MB = 50.0
 DEFAULT_MAX_LOCAL_TOTAL_MB = 500.0
+DOCKER_PROBE_TIMEOUT_SECONDS = 30.0
+SERVICE_CLEANUP_TIMEOUT_SECONDS = 300.0
+DOCKER_PS_FORMAT = (
+    '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t'
+    '{{.Label "com.docker.compose.project.working_dir"}}'
+)
 # External evidence replaces the GitHub query path, so the caller cannot rely on
 # a host-side age gate. 168h is the standing owner rule for worktree retirement;
 # a lower --min-no-pr-age-hours is refused in evidence mode instead of silently
@@ -805,6 +817,297 @@ def path_is_relative_to(path: Path, parent: Path) -> bool:
         return False
 
 
+def append_warning(existing: str | None, warning: str) -> str:
+    return f"{existing}; {warning}" if existing else warning
+
+
+def list_compose_containers() -> tuple[list[dict[str, str]], str | None]:
+    """Return running Compose containers and the label paths that own them.
+
+    A single `docker ps` call is reused for every worktree. Only containers that
+    carry a non-empty Compose project label are returned. A missing
+    `working_dir` is kept as an empty value so the project is treated as
+    ambiguous instead of guessed.
+    """
+    if shutil.which("docker") is None:
+        return [], "docker CLI is not installed or not on PATH"
+    try:
+        result = run_command(
+            [
+                "docker",
+                "ps",
+                "--no-trunc",
+                "--filter",
+                "label=com.docker.compose.project",
+                "--format",
+                DOCKER_PS_FORMAT,
+            ],
+            check=False,
+            timeout=DOCKER_PROBE_TIMEOUT_SECONDS,
+        )
+    except OSError as exc:
+        return [], f"docker ps failed: {exc}"
+    if result.returncode != 0:
+        detail = (
+            result.stderr.strip()
+            or result.stdout.strip()
+            or f"docker exited {result.returncode}"
+        )
+        return [], f"docker ps failed: {detail}"
+
+    containers: list[dict[str, str]] = []
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        if len(fields) < 3:
+            continue
+        name, project, working_dir = (field.strip() for field in fields[:3])
+        if not name or not project:
+            continue
+        containers.append(
+            {"name": name, "project": project, "working_dir": working_dir}
+        )
+    return containers, None
+
+
+def local_test_registration(worktree_path: Path) -> dict[str, Any]:
+    state_dir = worktree_path / ".local-test"
+    lt_path = worktree_path / "bin" / "lt"
+    state_present = state_dir.is_dir()
+    lt_present = lt_path.exists()
+    return {
+        "registered": state_present or lt_present,
+        "state_dir_present": state_present,
+        "command": "bin/lt destroy" if lt_present else None,
+        "action": "not-registered",
+        "error": None,
+    }
+
+
+def plan_worktree_services(
+    *,
+    worktree_path: Path,
+    other_worktree_paths: list[Path],
+    containers: list[dict[str, str]],
+    docker_error: str | None,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Plan shutdown of local-test state and Compose projects for one worktree.
+
+    Ownership comes only from `com.docker.compose.project.working_dir`. A
+    project is selected only when every container carrying that project name
+    resolves inside this worktree and outside every other registered worktree.
+    A project that also has containers elsewhere is reported and left alone, so
+    a shared or mislabeled project cannot be stopped by accident.
+    """
+    worktree = worktree_path.resolve()
+    other_roots = [path.resolve() for path in other_worktree_paths]
+    local_test = local_test_registration(worktree_path)
+    warnings: list[str] = []
+    if local_test["registered"]:
+        if local_test["command"] is None:
+            local_test["action"] = "skipped"
+            local_test["error"] = (
+                "local-test state is present but bin/lt is missing; "
+                "nothing was destroyed"
+            )
+            warnings.append(local_test["error"])
+        else:
+            local_test["action"] = "would-destroy" if dry_run else "pending"
+
+    services: dict[str, Any] = {
+        "status": "none",
+        "docker": "available" if docker_error is None else "unavailable",
+        "error": docker_error,
+        "warning": None,
+        "local_test": local_test,
+        "compose_projects": [],
+        "ambiguous_projects": [],
+    }
+    if docker_error is not None:
+        services["status"] = "docker-unavailable"
+        services["warning"] = (
+            "docker is unavailable, so Compose projects were not stopped: "
+            f"{docker_error}"
+        )
+        return services
+
+    grouped: dict[str, list[dict[str, str]]] = {}
+    for container in containers:
+        grouped.setdefault(container["project"], []).append(container)
+
+    projects: list[dict[str, Any]] = []
+    ambiguous: list[dict[str, Any]] = []
+    # A registered worktree can be nested inside another one, but the usual
+    # layout puts every linked worktree under the primary checkout. Only
+    # descendants are competing owners; an ancestor such as the primary
+    # checkout must not make the target's own path look foreign.
+    nested_other_roots = [
+        other for other in other_roots if path_is_relative_to(other, worktree)
+    ]
+    for project_name in sorted(grouped):
+        rows = grouped[project_name]
+        target_dirs: set[str] = set()
+        foreign_dirs: set[str] = set()
+        for row in rows:
+            raw_working_dir = row["working_dir"]
+            if not os.path.isabs(raw_working_dir):
+                foreign_dirs.add(raw_working_dir)
+                continue
+            try:
+                resolved = Path(raw_working_dir).expanduser().resolve()
+            except (OSError, RuntimeError):
+                foreign_dirs.add(raw_working_dir)
+                continue
+            if path_is_relative_to(resolved, worktree):
+                if any(
+                    path_is_relative_to(resolved, other)
+                    for other in nested_other_roots
+                ):
+                    foreign_dirs.add(str(resolved))
+                else:
+                    target_dirs.add(str(resolved))
+            else:
+                foreign_dirs.add(str(resolved))
+        container_names = sorted({row["name"] for row in rows})
+        if not target_dirs:
+            continue
+        if foreign_dirs:
+            ambiguous.append(
+                {
+                    "project": project_name,
+                    "working_dirs": sorted(target_dirs | foreign_dirs),
+                    "containers": container_names,
+                    "reason": (
+                        "Compose project also has containers outside this "
+                        "worktree; not stopping it"
+                    ),
+                }
+            )
+            continue
+        projects.append(
+            {
+                "project": project_name,
+                "working_dirs": sorted(target_dirs),
+                "containers": container_names,
+                "action": "would-stop" if dry_run else "pending",
+                "error": None,
+            }
+        )
+
+    services["compose_projects"] = projects
+    services["ambiguous_projects"] = ambiguous
+    if projects:
+        services["status"] = "would-stop" if dry_run else "pending"
+    elif ambiguous:
+        services["status"] = "ambiguous"
+        warnings.append(
+            "some Compose projects also touch other directories and were not "
+            "selected for shutdown"
+        )
+    services["warning"] = "; ".join(warnings) or None
+    return services
+
+
+def cleanup_worktree_services(
+    worktree_path: Path, services: dict[str, Any]
+) -> str | None:
+    """Stop local-test state and worktree-owned Compose projects.
+
+    Returns a fatal error only when a known Compose project could not be
+    stopped. Docker being unavailable, a missing `bin/lt`, or a local-test
+    failure is reported in `services` but does not block removal.
+    """
+    local_test = services["local_test"]
+    if local_test["registered"]:
+        if local_test["command"] is None:
+            local_test["action"] = "skipped"
+            local_test["error"] = (
+                "local-test state is present but bin/lt is missing; "
+                "nothing was destroyed"
+            )
+        else:
+            lt_path = worktree_path / "bin" / "lt"
+            try:
+                result = run_command(
+                    [str(lt_path), "destroy"],
+                    cwd=worktree_path,
+                    check=False,
+                    timeout=SERVICE_CLEANUP_TIMEOUT_SECONDS,
+                )
+            except OSError as exc:
+                local_test["action"] = "failed"
+                local_test["error"] = f"bin/lt destroy could not run: {exc}"
+            else:
+                if result.returncode != 0:
+                    detail = (
+                        result.stderr.strip()
+                        or result.stdout.strip()
+                        or f"bin/lt exited {result.returncode}"
+                    )
+                    local_test["action"] = "failed"
+                    local_test["error"] = f"bin/lt destroy failed: {detail}"
+                else:
+                    local_test["action"] = "destroyed"
+    else:
+        local_test["action"] = "not-registered"
+    if local_test.get("error"):
+        services["warning"] = append_warning(
+            services.get("warning"), local_test["error"]
+        )
+
+    if services["docker"] == "unavailable":
+        services["status"] = "docker-unavailable"
+        return None
+    if shutil.which("docker") is None:
+        services["docker"] = "unavailable"
+        services["status"] = "docker-unavailable"
+        services["error"] = "docker CLI disappeared before service cleanup"
+        services["warning"] = append_warning(
+            services.get("warning"),
+            "docker became unavailable before service cleanup; "
+            "Compose projects were not stopped",
+        )
+        return None
+
+    errors: list[str] = []
+    for project in services["compose_projects"]:
+        working_dirs = project.get("working_dirs") or []
+        cwd = Path(working_dirs[0]) if working_dirs else worktree_path
+        if not cwd.is_dir():
+            cwd = worktree_path
+        try:
+            result = run_command(
+                ["docker", "compose", "-p", project["project"], "down"],
+                cwd=cwd,
+                check=False,
+                timeout=SERVICE_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except OSError as exc:
+            project["action"] = "failed"
+            project["error"] = f"docker compose down could not run: {exc}"
+            errors.append(f"{project['project']}: {project['error']}")
+            continue
+        if result.returncode != 0:
+            detail = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or f"docker compose exited {result.returncode}"
+            )
+            project["action"] = "failed"
+            project["error"] = detail
+            errors.append(f"{project['project']}: {detail}")
+        else:
+            project["action"] = "stopped"
+
+    if errors:
+        services["status"] = "failed"
+        message = "Compose shutdown failed; worktree kept: " + "; ".join(errors)
+        services["warning"] = append_warning(services.get("warning"), message)
+        return message
+    services["status"] = "stopped" if services["compose_projects"] else "none"
+    return None
+
+
 def read_worktree_dirty(path: Path) -> tuple[bool | None, str | None]:
     result = run_command(
         ["git", "-C", str(path), "status", "--porcelain", "--untracked-files=all"],
@@ -1438,6 +1741,7 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
 
     primary_repo_root = worktrees[0].path
     managed_worktrees_root = primary_repo_root / ".worktrees"
+    docker_containers, docker_error = list_compose_containers()
     evidence_path = getattr(args, "remote_evidence", None)
     evidence = load_remote_evidence(evidence_path) if evidence_path else None
     repository = (
@@ -1520,6 +1824,15 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
                 f"local evidence inventory failed: {ignored_error}"
             )
         age_hours = worktree_age_hours(worktree.path)
+        services = plan_worktree_services(
+            worktree_path=worktree.path,
+            other_worktree_paths=[
+                other.path for other in worktrees if other.path != worktree.path
+            ],
+            containers=docker_containers,
+            docker_error=docker_error,
+            dry_run=not args.apply,
+        )
         entry: dict[str, Any] = {
             "name": worktree.path.name,
             "path": str(worktree.path),
@@ -1534,6 +1847,7 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
             "dirty": dirty,
             "ignored": ignored,
             "preservation": preservation,
+            "services": services,
             "local_fingerprint": local_fingerprint(worktree, dirty, ignored),
             "pr": None,
             "expiration_reason": None,
@@ -1714,6 +2028,17 @@ def discover(args: argparse.Namespace) -> dict[str, Any]:
         "worktree_count_after": len(worktrees),
         "scanned": len(entries),
         "eligible": sum(entry["skip_reason"] is None for entry in entries),
+        "services_would_stop": sum(
+            len(entry["services"]["compose_projects"])
+            for entry in entries
+            if entry["skip_reason"] is None
+        ),
+        "services_stopped": 0,
+        "services_docker_unavailable": sum(
+            1
+            for entry in entries
+            if entry["services"]["docker"] == "unavailable"
+        ),
         "approved": 0,
         "removed": 0,
         "failed": 0,
@@ -1790,6 +2115,9 @@ def apply_candidates(
         if entry["approval_token"] is not None:
             entry["action"] = "approved" if entry in candidates else "not-approved"
     summary["approved"] = len(candidates)
+    summary["services_would_stop"] = sum(
+        len(entry["services"]["compose_projects"]) for entry in candidates
+    )
     if not candidates:
         sweep_orphan_branches(summary, keep_branches)
         summary["branches_removed"] = len(
@@ -1880,6 +2208,13 @@ def apply_candidates(
             fail_candidate(state_error)
             continue
 
+        service_error = cleanup_worktree_services(
+            worktree_path, candidate["services"]
+        )
+        if service_error is not None:
+            fail_candidate(service_error)
+            continue
+
         remove_args = ["git", "worktree", "remove", str(worktree_path)]
         result = run_command(
             remove_args,
@@ -1922,6 +2257,12 @@ def apply_candidates(
             )
         )
     )
+    summary["services_stopped"] = sum(
+        1
+        for entry in summary["entries"]
+        for project in entry["services"]["compose_projects"]
+        if project["action"] == "stopped"
+    )
 
 
 def print_text(summary: dict[str, Any]) -> None:
@@ -1938,6 +2279,12 @@ def print_text(summary: dict[str, Any]) -> None:
     print(f"approved: {summary['approved']}")
     print(f"removed: {summary['removed']}")
     print(f"failed: {summary['failed']}")
+    print(f"services_would_stop: {summary.get('services_would_stop', 0)}")
+    print(f"services_stopped: {summary.get('services_stopped', 0)}")
+    print(
+        "services_docker_unavailable: "
+        f"{summary.get('services_docker_unavailable', 0)}"
+    )
     print(f"rejected_approvals: {len(summary['rejected_approvals'])}")
     sweep = summary.get("branch_sweep")
     if sweep is not None:
@@ -2035,6 +2382,46 @@ def print_text(summary: dict[str, Any]) -> None:
                 )
         else:
             print("  local_preserved_files: 0")
+        services = entry.get("services")
+        if services:
+            print(f"  services: {services['status']}")
+            print(f"  docker: {services['docker']}")
+            local_test = services["local_test"]
+            print(f"  local_test: {local_test['action']}")
+            if local_test.get("error"):
+                print(f"  local_test_error: {local_test['error']}")
+            for project in services.get("compose_projects") or []:
+                print(
+                    f"  compose_project: {project['project']} "
+                    f"({project['action']})"
+                )
+                print(
+                    "    working_dirs: "
+                    + ", ".join(project.get("working_dirs") or [])
+                )
+                names = project.get("containers") or []
+                print(
+                    "    containers: "
+                    + ", ".join(names[:SERVICE_TEXT_LIMIT])
+                )
+                if len(names) > SERVICE_TEXT_LIMIT:
+                    print(
+                        "    containers_truncated: "
+                        f"{len(names) - SERVICE_TEXT_LIMIT} more"
+                    )
+                if project.get("error"):
+                    print(f"    error: {project['error']}")
+            for project in services.get("ambiguous_projects") or []:
+                print(
+                    f"  compose_project_skipped: {project['project']} "
+                    f"({project['reason']})"
+                )
+                print(
+                    "    working_dirs: "
+                    + ", ".join(project.get("working_dirs") or [])
+                )
+            if services.get("warning"):
+                print(f"  services_warning: {services['warning']}")
         print(f"  action: {entry['action']}")
         if entry["approval_token"]:
             print(f"  approval_token: {entry['approval_token']}")

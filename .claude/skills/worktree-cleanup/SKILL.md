@@ -1,6 +1,6 @@
 ---
 name: worktree-cleanup
-description: Explicitly audit and retire clean Git worktrees whose HEAD is durably stored on a remote host (GitHub, or a verifier-supplied evidence file for another host), using review-bound approval tokens and .local evidence archives.
+description: Explicitly audit and retire clean Git worktrees whose HEAD is durably stored on a remote host (GitHub, or a verifier-supplied evidence file for another host), using review-bound approval tokens, .local evidence archives, and worktree-owned local service shutdown.
 disable-model-invocation: true
 triggers:
   - user
@@ -12,7 +12,7 @@ Run this workflow only when the user explicitly invokes `$worktree-cleanup`. It 
 
 ## Requirements
 
-Require Git, Python 3.10+, GitHub CLI, and an authenticated `gh` session with read access to the repository's pull requests. Run from a repository checkout or pass `--repo <path>`.
+Require Git, Python 3.10+, GitHub CLI, and an authenticated `gh` session with read access to the repository's pull requests. Run from a repository checkout or pass `--repo <path>`. Docker is optional: when the Docker CLI or daemon is unavailable, Compose shutdown is reported and worktree removal continues.
 
 For a host without a `gh` API (for example `git.example.invalid`), pass
 `--remote-evidence <json>` instead: a verifier-produced file supplies the
@@ -40,9 +40,10 @@ evidence" below.
      With `--remote-evidence`, this bullet is replaced by an exact merged
      merge-request head from the evidence file (see "External remote evidence").
 4. Review `ignored.discarded_sample` and `ignored.discarded_count` for every candidate. These count ignored path roots, not files or bytes; one listed directory may contain substantial data. A non-empty `.local` is archived to the primary checkout before removal; every other ignored file is deliberately discarded if that candidate is approved. Review `preservation.status`, `preservation.destination`, the listed files, and `preservation.oversized_files`. If the primary checkout does not gitignore its archive path, the candidate is kept with a `blocked` warning instead of being archived.
-5. Tell the user the exact paths, whether each path is managed or external, remote durability proof, ignored data impact, the archive root and per-candidate destination, which `.local` files would be preserved or left behind, and all retained paths with their reasons. Ask once whether to remove all listed candidates or a named subset; do not make the user copy or re-approve token strings. Worktrees outside `.worktrees/` follow the same eligibility rules.
+5. Review `services` for every candidate. `services.compose_projects` lists each Compose project whose `com.docker.compose.project.working_dir` container label resolves inside that worktree, with the container names and the exact working directories. `services.local_test` shows whether `bin/lt destroy` will run. `services.ambiguous_projects` lists projects that also have containers elsewhere; those are never stopped. When Docker is unavailable, `services.status` is `docker-unavailable` and removal is still allowed.
+6. Tell the user the exact paths, whether each path is managed or external, remote durability proof, ignored data impact, the archive root and per-candidate destination, which `.local` files would be preserved or left behind, which local-test environment and Compose projects would be stopped, and all retained paths with their reasons. Ask once whether to remove all listed candidates or a named subset; do not make the user copy or re-approve token strings. Worktrees outside `.worktrees/` follow the same eligibility rules.
 
-Completion criterion: every listed worktree has a resolved action or a conservative skip reason, and no state has changed.
+Completion criterion: every listed worktree has a resolved action or a conservative skip reason, and no state has changed. Dry-run probes but never runs `bin/lt destroy` or `docker compose ... down`.
 
 ## Apply
 
@@ -59,7 +60,7 @@ For a subset, pass the selected candidates' `--approve <token>` values internall
 
 Changed or no-longer-eligible approvals are rejected individually while other approved candidates continue. Archive, authorization, or removal failure also affects only that candidate. Report every rejected or failed candidate; rerun dry-run only if the user wants to retry those candidates or include newly eligible ones.
 
-For each approved target, the helper revalidates local state, copies a non-empty `.local` into the primary checkout, writes `metadata.json` beside the copy, and only then removes the clean worktree without `--force`. The primary checkout is the parent of `git rev-parse --git-common-dir`, not the checkout selected by `--repo`. Other ignored files are not archived. The default layout is:
+For each approved target, the helper revalidates local state, copies a non-empty `.local` into the primary checkout, writes `metadata.json` beside the copy, stops worktree-owned local services, and only then removes the clean worktree without `--force`. Service shutdown runs `bin/lt destroy` first when `.local-test/` or `bin/lt` is present, then `docker compose -p <project> down` for every selected project; it never passes `-v`, so named volumes and their data are kept. The primary checkout is the parent of `git rev-parse --git-common-dir`, not the checkout selected by `--repo`. Other ignored files are not archived. The default layout is:
 
 ```text
 <primary-checkout>/.local/worktree-archive/
@@ -89,17 +90,27 @@ Size limits are configurable with `--max-local-file-mb` (default 50) and `--max-
 - Worktrees without a matching record are kept with `no external remote evidence`.
 - Pass the same file to both the dry-run and the apply invocation.
 
+## Local services
+
+Compose ownership is taken only from the container label `com.docker.compose.project.working_dir`; names, ports, and project-name prefixes are never used to guess. The helper runs `docker ps` once, resolves each label path, and selects a project only when every container carrying that project name resolves inside the candidate worktree and outside every other registered worktree. A project with any container elsewhere is listed under `ambiguous_projects` and is not stopped, so the primary checkout and sibling worktrees are untouched.
+
+Before stopping Compose projects, a candidate with `.local-test/` or `bin/lt` runs `bin/lt destroy` inside the worktree. A missing or failing `bin/lt` is reported as a warning and does not block removal. Then each selected project is stopped with `docker compose -p <project> down` from its recorded working directory. No `-v` is passed and volumes are not deleted.
+
+Docker unavailability (missing CLI, unreachable daemon, or a `docker ps` failure) is reported as `docker-unavailable`; Compose shutdown is skipped and worktree removal continues. If Docker was available and a `docker compose ... down` command fails, that candidate is kept as `failed` so its containers are not orphaned; other candidates continue. Apply rediscovers services, so a project started under the worktree after the audit is also stopped.
+
 ## Guardrails
 
 - Never remove a dirty worktree. This skill has no force-removal mode.
 - Never remove a worktree whose non-empty `.local` was not archived. A failed copy keeps the worktree; only the reviewed oversized case proceeds with a manifest and no content.
 - Never archive into a primary-checkout path that Git does not ignore. Keep the candidate and report the path.
+- Never stop a Compose project whose `com.docker.compose.project.working_dir` labels are missing, relative, outside the candidate, or shared with another worktree; report it instead.
+- Never pass `-v` to `docker compose down` or delete volumes as part of worktree cleanup.
 - Keep targets whose pull request or remote durability lookup is ambiguous or failed.
 - Keep worktrees for open pull requests.
 - Keep locked and prunable worktrees for explicit operator handling.
 - Never remove the primary checkout or the checkout selected by `--repo`.
 - Keep the archive root outside every cleanup target; the helper rejects unsafe paths before writing.
-- Continue independent candidates after a stale approval, archive failure, state-validation failure, authorization denial, or removal failure.
+- Continue independent candidates after a stale approval, archive failure, state-validation failure, authorization denial, service shutdown failure, or removal failure.
 - Treat branch deletion as part of this skill (owner policy 2026-09-19): after a successful removal the worktree's local branch is deleted by default, using the same remote durability proof as the removal; `--keep-branches` opts out. In apply mode the helper also sweeps unclaimed local branches whose tip is contained in the default branch lineage or equals the current remote branch tip; everything else is kept with a reason. Branch failures never retroactively fail a removal.
 - Remote proof is point-in-time evidence, not a promise that a remote ref will exist forever. Branch deletion removes the last local ref to the worktree's commits; durability on the remote is what makes that acceptable, and `--keep-branches` restores the previous behavior.
 
@@ -109,4 +120,4 @@ BB can bind a child thread to a worktree directory. Once that directory is remov
 
 ## Output
 
-Use `--json` for machine-readable reporting. On completion, report removed paths, retained paths and reasons, the archive root and each per-candidate archive destination, preserved file counts and bytes, any oversized files that were listed but not moved, failures, and the final worktree count.
+Use `--json` for machine-readable reporting. On completion, report removed paths, retained paths and reasons, the archive root and each per-candidate archive destination, preserved file counts and bytes, any oversized files that were listed but not moved, the local-test and Compose projects stopped or skipped (including `docker-unavailable`), failures, and the final worktree count.
