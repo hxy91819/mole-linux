@@ -54,7 +54,7 @@ DEADLINE = float('inf')
 LIVE = {}
 LIVE_LOCK = threading.Lock()
 EXECUTION = threading.local()
-CLONE_RECHECK_SECONDS = 10
+CLONE_RECHECK_SECONDS = 120
 
 
 @contextlib.contextmanager
@@ -2245,6 +2245,68 @@ def ignored_dependency_file(rel):
     return False
 
 
+class DirtyClone(ws.Keep):
+    def __init__(self, evidence):
+        super().__init__('dirty working tree (including untracked)')
+        self.evidence = evidence
+
+
+def untracked_build_output(root, rel):
+    """Loose output directory names need file evidence; never exempt tracked work."""
+    parts = rel.split('/')
+    if len(parts) < 2 or any(part in ('', '.', '..', '.git') for part in parts):
+        return False
+    if ws.SECRET_NAME.search(rel):
+        return False
+    dirs, name = parts[:-1], parts[-1]
+    suffix = Path(name).suffix
+    generated = (
+        any(part in {'node_modules', '.venv', '.next'} for part in dirs)
+        or '__pycache__' in dirs and suffix in {'.pyc', '.pyo'}
+        or any(part.endswith('.egg-info') for part in dirs)
+        and name in {'PKG-INFO', 'SOURCES.txt', 'requires.txt', 'top_level.txt',
+                     'dependency_links.txt', 'entry_points.txt', 'not-zip-safe'}
+        or 'coverage' in dirs and name in {'lcov.info', 'coverage.xml', 'coverage-final.json'}
+        or any(part in {'dist', 'build', 'target'} for part in dirs)
+        and (suffix in {'.o', '.obj', '.a', '.so', '.dylib', '.dll', '.class', '.pyc',
+                        '.whl', '.rlib', '.rmeta'}
+             or name == 'CACHEDIR.TAG' and 'target' in dirs)
+    )
+    if not generated:
+        return False
+    # An untracked symlink can be a link to working source, not a package install.
+    info = os.lstat(os.path.join(root, rel))
+    return stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+
+
+def clone_worktree_status(path):
+    output = git(path, 'status', '--porcelain=v1', '-z', '--untracked-files=all',
+                 '--ignore-submodules=none', timeout=600).stdout
+    if output and not output.endswith('\0'):
+        raise ws.ScanIncomplete('truncated Git status')
+    entries = iter(output[:-1].split('\0') if output else ())
+    evidence = dict(artifact_count=0, work_count=0, artifact_examples=[], work_examples=[])
+    for record in entries:
+        checkpoint()
+        code, rel = record[:2], record[3:]
+        if len(record) < 4 or record[2] != ' ' or any(mark not in ' MTADRCU?!' for mark in code):
+            raise ws.ScanIncomplete('unrecognized Git status record')
+        if 'R' in code or 'C' in code:
+            # In porcelain -z the destination comes first: the next token is
+            # the old name, never a separate untracked status record.
+            if not next(entries, None):
+                raise ws.ScanIncomplete('truncated Git rename/copy record')
+        group = 'artifact' if code == '??' and untracked_build_output(path, rel) else 'work'
+        evidence[group + '_count'] += 1
+        examples = evidence[group + '_examples']
+        if len(examples) < 5:
+            examples.append(rel)
+    evidence['class'] = ('mixed' if evidence['work_count'] and evidence['artifact_count'] else
+                         'work-only' if evidence['work_count'] else
+                         'artifacts-only' if evidence['artifact_count'] else 'clean')
+    return evidence
+
+
 def local_state(path, kind, inventory, anchors, refs, live_parents=False):
     checkpoint()
     if path != canonical(path) or not stat.S_ISDIR(os.lstat(path).st_mode):
@@ -2321,7 +2383,12 @@ def local_state(path, kind, inventory, anchors, refs, live_parents=False):
                 latest = max(latest, os.lstat(target).st_mtime)
     if time.time() - latest < IDLE:
         raise ws.Keep('active within 7d (168h)')
-    if git(path, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none', timeout=600).stdout:
+    status = None
+    if kind == 'clone':
+        status = clone_worktree_status(path)
+        if status['work_count']:
+            raise DirtyClone(status)
+    elif git(path, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none', timeout=600).stdout:
         raise ws.Keep('dirty working tree (including untracked)')
     if git(path, 'stash', 'list').stdout:
         raise ws.Keep('stash exists')
@@ -2339,7 +2406,8 @@ def local_state(path, kind, inventory, anchors, refs, live_parents=False):
     objects['HEAD'] = head
     info = os.lstat(path)
     return {'head': head, 'objects': objects, 'main': primary, 'gitdir': gitdir,
-            'identity': [info.st_dev, info.st_ino], 'idle_hours': (time.time() - latest) / 3600}
+            'identity': [info.st_dev, info.st_ino], 'idle_hours': (time.time() - latest) / 3600,
+            **({'worktree_status': status} if status and status['class'] != 'clean' else {})}
 
 
 def recovery_state(path, objects):
@@ -2408,6 +2476,8 @@ def plan(path, kind, inventory, anchors, refs, error=None, *, live_parents=False
         item['action'] = 'archive+remove' if item['archive_objects'] else 'remove'
     except Exception as exc:
         item['reason'] = str(exc) if isinstance(exc, ws.Keep) else 'check unknown: ' + ws.failure_text(exc)
+        if isinstance(exc, DirtyClone):
+            item['worktree_status'] = exc.evidence
     return item
 
 
@@ -2539,6 +2609,8 @@ def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
             LIVE.clear()
             fresh = plan(row['path'], row['type'], inventory, anchors, refs, live_parents=True)
             if fresh['action'] == 'keep':
+                if 'worktree_status' in fresh:
+                    row['worktree_status'] = fresh['worktree_status']
                 raise ws.Keep(fresh['reason'])
             if fresh['objects'] != row['objects'] or fresh['identity'] != row['identity']:
                 raise ws.Keep('local evidence changed')
@@ -2570,8 +2642,16 @@ def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
             persist(log, dict(row, event='remove_intent'))
             remove(row, inventory, anchors, refs, live=True)
         except Exception as exc:
-            timed_out = time.monotonic() >= DEADLINE and DEADLINE < round_deadline
-            row.update(result='kept', reason=('clone live-check exceeded 10s; retry next round: ' if timed_out else '') + ws.failure_text(exc))
+            if isinstance(exc, DirtyClone):
+                row['worktree_status'] = exc.evidence
+            detail = ws.failure_text(exc)
+            if time.monotonic() >= DEADLINE:
+                limit = 'candidate' if DEADLINE < round_deadline else 'round'
+                row['recheck_timeout'] = limit
+                prefix = (f'clone recheck exceeded {CLONE_RECHECK_SECONDS}s' if limit == 'candidate'
+                          else 'clone round budget exhausted')
+                detail = f'{prefix}; retry next round: {detail}'
+            row.update(result='kept', reason=detail)
         finally:
             row.setdefault('execution_timings', {})['total'] = round(time.monotonic() - started, 6)
             DEADLINE = round_deadline
@@ -2591,6 +2671,22 @@ def summarize(rows):
         else:
             result['bytes'][key] = result['bytes'].get(key, 0) + row['bytes']
     result['retention'] = retention_ranking(rows)
+    timeouts = [{'path': row['path'], 'bytes': row.get('bytes'), 'limit': row['recheck_timeout'],
+                 'reason': row['reason']} for row in rows if row.get('recheck_timeout')]
+    if timeouts:
+        result['recheck_timeouts'] = timeouts
+    classes = {}
+    for row in rows:
+        if 'worktree_status' not in row:
+            continue
+        bucket = classes.setdefault(row['worktree_status']['class'], dict(count=0, bytes=0, unmeasured=0))
+        bucket['count'] += 1
+        if row.get('bytes') is None:
+            bucket['unmeasured'] += 1
+        else:
+            bucket['bytes'] += row['bytes']
+    if classes:
+        result['worktree_status'] = classes
     # Nested rows and shared blocks can overlap: inventory size is not freed space.
     return result
 

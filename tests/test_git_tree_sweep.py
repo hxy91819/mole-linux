@@ -3209,7 +3209,7 @@ def test_clone_live_commands_are_bounded_without_leaking_budget_to_next_phase(ca
     def run(argv,**kw):seen.append((list(argv),kw['timeout']));return raw(argv,**kw)
     monkeypatch.setattr(c.m,'_run',run);c.m.DEADLINE=time.monotonic()+120
     c.m.execute([row],inventory,{},{},[str(c.root)],set(),'bounded',c.root/'events')
-    assert row['result']=='removed' and seen and all(timeout<=10 for _,timeout in seen)
+    assert row['result']=='removed' and seen and all(timeout<=120 for _,timeout in seen)
     c.m.command(['/bin/true'],timeout=60)
     assert seen[-1][1]==60
     assert row['execution_timings']['total']>0 and row['execution_subprocess_seconds']['ls_remote']>0
@@ -3496,3 +3496,74 @@ def test_relative_local_remotes_cannot_share_cached_refs_between_checkouts(case,
     assert c.m.live_query(second, './remote.git') == second
     assert c.m.live_query(first, './remote.git') == first
     assert calls == [first, second]
+
+
+@pytest.mark.parametrize('source', [None, 'new_feature.py', 'build/release.py'])
+def test_clone_cleanup_distinguishes_installed_dependencies_from_source(case, monkeypatch, source):
+    c = case
+    # Remove the fixture's node_modules ignore rule, commit it and publish it.
+    (c.repo / '.gitignore').write_text('.worktrees/\n.env\n*.pem\n')
+    shell('git', 'commit', '-qam', 'fixture ignore rules', cwd=c.repo)
+    shell('git', 'push', '-q', str(c.bare), 'main', cwd=c.repo)
+    dependency = c.repo / 'node_modules/pkg/index.js'
+    dependency.parent.mkdir(parents=True)
+    dependency.write_text('dependency fixture')
+    if source:
+        authored = c.repo / source
+        authored.parent.mkdir(parents=True, exist_ok=True)
+        authored.write_text('print("local source")\n')
+    age(c.repo)
+    row, _ = execute_case(c, monkeypatch)
+    category = 'mixed' if source else 'artifacts-only'
+    assert row['worktree_status']['class'] == category
+    assert c.m.summarize([row])['worktree_status'][category] == {
+        'count': 1, 'bytes': 4096, 'unmeasured': 0}
+    if source:
+        assert row['action'] == 'keep' and authored.is_file()
+        assert row['worktree_status']['work_examples'] == [source]
+    else:
+        assert row['result'] == 'removed' and not c.repo.exists()
+
+
+@pytest.mark.parametrize('kind', ['tracked', 'linked-source', 'credential'])
+def test_dependency_directory_name_does_not_hide_authored_state(case, kind):
+    c = case
+    (c.repo / '.gitignore').write_text('.worktrees/\n')
+    shell('git', 'commit', '-qam', 'fixture ignore rules', cwd=c.repo)
+    dependency = c.repo / 'node_modules/module'
+    dependency.parent.mkdir()
+    if kind == 'linked-source':
+        dependency.symlink_to('..')
+    elif kind == 'credential':
+        (dependency.parent / '.npmrc').write_text('private fixture')
+    else:
+        dependency.write_text('tracked')
+        shell('git', 'add', '--', str(dependency), cwd=c.repo)
+        shell('git', 'commit', '-qm', 'tracked dependency', cwd=c.repo)
+        dependency.write_text('authored modification')
+    age(c.repo)
+    row = plan(c)
+    assert row['action'] == 'keep' and row['worktree_status']['class'] == 'work-only', row
+
+
+@pytest.mark.parametrize('round_seconds, limit', [(180, 'candidate'), (30, 'round')])
+def test_clone_recheck_timeout_is_kept_and_reported_separately(case, monkeypatch, round_seconds, limit):
+    c = case
+    inventory = inv(c)
+    row = plan(c)
+    assert row['action'] == 'remove'
+    row['bytes'] = 4096
+    clock = {'now': 0}
+    monkeypatch.setattr(c.m.time, 'monotonic', lambda: clock['now'])
+    monkeypatch.setattr(c.m, 'DEADLINE', round_seconds)
+    monkeypatch.setattr(c.m, 'plan', lambda *a, **kw: dict(row))
+    def expire(*args, **kwargs):
+        assert c.m.DEADLINE == min(120, round_seconds)
+        clock['now'] = c.m.DEADLINE
+        c.m.checkpoint()
+    monkeypatch.setattr(c.m, 'remove', expire)
+    c.m.execute([row], inventory, {}, {}, [str(c.root)], set(), 'expiry', c.root / 'events')
+    assert c.repo.exists() and row['result'] == 'kept'
+    assert c.m.DEADLINE == round_seconds
+    assert c.m.summarize([row])['recheck_timeouts'] == [
+        {'path': str(c.repo), 'bytes': 4096, 'limit': limit, 'reason': row['reason']}]

@@ -583,7 +583,7 @@ linked首次实测：完整预演128.080秒、执行278.043秒，27候选中10�
 
 owner明确接受本轮全局引用快照：轮内新建的静态consumer下轮发现，活跃reader必须当轮拦截。原因是候选7天闲置，30分钟内新borrower概率低；普通clone已有自身对象，新增alternates borrower可用候选已证实的远端/原SHA归档恢复。不声称保留“任意新增全局消费者在同轮立即发现”的旧语义；旧回归改为下轮发现与当轮活进程保护。新argv读数覆盖clone --shared/--reference及等号参数、file URL、相对源、shell -c和空格路径，不执行shell。
 
-每个sink仍重读本树状态/所有untracked、stash、操作锁、元数据/7天、ignored凭据、refs/HEAD与物理身份；实时远端证明在每树重新查询（归档也逐ref核原SHA），BB环境重新分类，最后完整/proc扫描保留cwd/fd/argv以及原exe/maps/环境范围。所有push/远端IO后核本地，进程检查后再核父fd绑定的目录身份才删；未知或10秒复核预算到期保留。只复用全局发现及配置/引用，不复用上一树的实时证据。
+每个sink仍重读本树状态/所有untracked、stash、操作锁、元数据/7天、ignored凭据、refs/HEAD与物理身份；实时远端证明在每树重新查询（归档也逐ref核原SHA），BB环境重新分类，最后完整/proc扫描保留cwd/fd/argv以及原exe/maps/环境范围。所有push/远端IO后核本地，进程检查后再核父fd绑定的目录身份才删；未知或复核预算到期保留；当时单树试用 10 秒，现行上限见 storage-rules。只复用全局发现及配置/引用，不复用上一树的实时证据。
 
 删除准备不再单独重跑usage，归档按同目的地批量push，避免多个相同SHA/refs重复网络启动。du在引用/配置/计划的独立阶段并发，执行前全部汇合；不改变所有本地磁盘的发现范围。报告记录global_inventory时间和每树execution_timings、子命令耗时；阶段与子命令为上下层指标，不重复求和。每日clone预算统一30分钟，worker 5/15/30分钟、硬限53分钟。实测、审查与最终快照见本轮交付报告。
 

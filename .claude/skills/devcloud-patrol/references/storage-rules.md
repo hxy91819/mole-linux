@@ -125,7 +125,13 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     有新候选先整批不执行；自然到期可自主重做完整预演后继续，意外规则扩大才恢复预演并回报。此比较是本批授权核验，不成为日后按路径白名单清理；后续06:30按同一全盘证据规则运行。
     owner核验的 account-limits/v0.3.2、devcloudtool/vim、bats-core-1.13.0 及 lighthouse-bak 不加路径例外；名称碰撞按上述同源归属规则处理；没有其他保留副本时才保留并说明。
   - **本地全条件**：所有非 `.git` 条目及 Git 元数据（含 FETCH_HEAD、ORIG_HEAD、refs 与 reflog）最新 mtime 满 7 天（168h），所有位置统一；
-    status 含全部 untracked 为空、无 stash、无进行中的 Git 操作/锁、无已填充子模块，
+    用 Git porcelain 的 NUL 格式看全部 status。clone 仅当变动全部是未跟踪的可重建产物时，
+    才按 clean 继续判其余条件：`node_modules`、`.venv`、`.next` 安装或生成目录的普通文件，
+    以及 `dist`、`build`、`target` 内的已知编译制品、`__pycache__` 的字节码、
+    `coverage` 的已知报告、`*.egg-info` 的生成元数据。仅有宽目录名不能证明任意文件可重建。
+    Git 跟踪的变动、未跟踪源码/独有文件、凭据、软硬链接及类型未知项仍阻止删除；例如
+    `node_modules` 内的本地 workspace 链接可能指向源码，不能当作安装包。linked 仍用原判据和 Git 最终判断。
+    clone 还须无 stash、无进行中的 Git 操作/锁、无已填充子模块，
     ignored 中无凭据；`node_modules`、`vendor`、`.venv`、`site-packages` 和 pnpm
     `vN/{files,index}` 格式布局内的安装产物不参加 ignored 凭据探测，避免依赖自带测试证书锁住整树。
     仓库自身的 `.env`、`id_*`、`*.key` 等仍保护；没有主 checkout 同内容豁免。
@@ -147,7 +153,8 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     mono2 不推 GitHub，无目的地/归档失败均保留。预演只查询，不推送。
   - **2026-11-19 owner 性能边界**：全盘发现、remote/alternates、配置/名称/容器/自动化引用库存在本轮完整建立一次并复用；报告global_inventory记开始、发现完成和引用完成的UTC时间。轮内新增但未活跃读取的全局消费者下轮发现；不做每树全盘重扫。owner确认候选已闲置7天，新增borrower仍可从已经证明/归档的远端恢复，接受此快照边界。
     每棵clone删除前实时重查：该树的进程cwd/fd/argv（含git clone --shared/--reference的源操作数；同时保留exe/maps/环境保护）、git status含untracked、stash及锁、该树每个refs/HEAD的实时远端或原SHA归档证明、是否已成为受保护BB环境。每树重新查询远端，不能复用上一树的远端证明。所有网络操作后再次核本地状态，再扫进程，实时mountinfo还须证明候选根及其后代无挂载（包含同设备bind mount），最后核物理身份并再次检查截止时间才fd-based删除。
-    目标每树执行≤10秒；删前复核超时/未知保留，记录原因供下轮重试。递归删除开始后不因时限中途取消，delete耗时单列，不把已删除报为保留。全局进程快照在启动本轮du前取得，避免计量进程污染占用保护；du随后与无依赖的全局引用/配置工作并发，全部结果在执行前汇合；原始SHA同目的地批量push并逐ref核验，不能压缩/force。execution_timings与execution_subprocess_seconds分列阶段/子命令成本，total不重复相加。clone整轮预算30分钟；此修订替代之前每sink重扫全机的规定。
+    10 秒仍是性能目标；单棵删前复核用 120 秒上限，且不能超过剩余阶段预算。
+    超时或证据未知仍保留；超时另外列出路径、实占及单棵/整轮超时类型。递归删除开始后不因时限中途取消，delete耗时单列，不把已删除报为保留。全局进程快照在启动本轮du前取得，避免计量进程污染占用保护；du随后与无依赖的全局引用/配置工作并发，全部结果在执行前汇合；原始SHA同目的地批量push并逐ref核验，不能压缩/force。execution_timings与execution_subprocess_seconds分列阶段/子命令成本，total不重复相加。clone整轮预算30分钟；此修订替代之前每sink重扫全机的规定。
   - **删除与复核**：按上述本轮快照和逐树实时证据执行；
     unknown 或预算不足即保留。linked 必须从主 checkout 调 `git worktree remove -- <path>`，不加 `--force`；
     文件系统根和挂载点只列出保留；clone 仅 fd-based 删除该目录，逐级打开 ancestor 时 O_NOFOLLOW，不跟随任何软链。预演与执行共用判定。

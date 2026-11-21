@@ -134,7 +134,7 @@ Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
 
 ## 2. 不可变快照与发布
 
-仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `948f718f89baba0e`），包含
+仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `13dbb0a0af8f01a3`），包含
 `git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、
 `git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py`、
 `daily_git_cleanup_check.py` 八个脚本和 `manifest.json`。上一版七脚本性能快照为 `3c35f7ad513b5140`。
@@ -178,6 +178,10 @@ linked/clone 以 BB 定时 launcher 的 systemd invocation ID 对应报告；连
 clone 报告的 `discovery.invalid_parent_markers` 单列 Git 不承认的父标记；报告只建议另行核查，
 标记不进入 Git 树计量或候选，清理器不删除标记。复现用 `git -C <parent> rev-parse --show-toplevel`。依赖包生成内容不参与
 ignored 凭据探测；已证实缺失的本地远端不提供 refs 证明，其他远端的网络或认证失败仍保留。
+独立 clone 的 status 分类单列在 `summary.worktree_status`（棵数、目录实占、未测数）。
+只有已识别的未跟踪可重建产物可继续判定；跟踪改动、未知文件或本地链接仍保留，
+具体目录和证据见 storage-rules。120 秒是单棵复核上限，外层 30 分钟不变；
+`summary.recheck_timeouts` 单列因单棵期限或整轮期限保留的路径及字节。
 
 JSON 报告在 `~/.local/state/devcloud-storage-upkeep/git-tree-sweep-<UTC>.json`；
 JSONL 同前缀，含阶段时点与每对象证据。schema_version=2 的 `unresolved` 每条含 source、expression、scope、
