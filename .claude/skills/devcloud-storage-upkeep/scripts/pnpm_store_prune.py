@@ -248,7 +248,8 @@ def discover_roots(selected=None):
             configs.append(path)
         elif path.name in STORE_MAJORS:
             try:
-                if physical_store(path) and has_cas_objects(path / 'files'):
+                if (not re.fullmatch(r'v[0-9]+', path.parent.name)
+                        and physical_store(path) and has_cas_objects(path / 'files')):
                     layout_roots.add(str(path.parent))
             except FileNotFoundError:
                 continue
@@ -266,7 +267,16 @@ def discover_roots(selected=None):
     for root in sorted(layout_roots, key=lambda path: (path.count('/'), path)):
         if not any(other in map(str, Path(root).parents) for other in roots):
             add(root)
-    return sorted(roots), errors
+    # realpath resolves symlinks but cannot collapse bind mounts such as
+    # /tmp and /data/system-tmp. Keep one stable path per physical store.
+    physical = {}
+    for root in sorted(roots):
+        try:
+            st = os.stat(root)
+        except FileNotFoundError:
+            continue
+        physical.setdefault((st.st_dev, st.st_ino), root)
+    return list(physical.values()), errors
 
 
 def version_identity(path):
@@ -336,9 +346,9 @@ def main(argv=None):
                     handle.write(json.dumps({'result': 'discovery-error', 'reason': reason}) + '\n')
             failed |= bool(errors)
             if selected:
-                if selected not in roots:
+                roots = [root for root in roots if os.path.samefile(root, selected)]
+                if not roots:
                     raise RuntimeError('requested root is not a discovered pnpm store')
-                roots = [selected]
             versions = [p for root in roots for p in sorted(Path(root).iterdir())
                         if re.fullmatch(r'v[0-9]+', p.name)]
             try:

@@ -137,7 +137,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     决定/原因、refs/SHA、归档证据和耗时；嵌套占用不相加冒充可回收量。完整发现或引用扫描失败整轮保留。
 - **pnpm store 每周日 05:30 owner prune**：2026-11-21 扩至本机发现的所有根。枚举 PATH、
   NVM、pnpm 自管理工具目录和 Corepack 已下载的 pnpm，分别在任务目录、HOME 和中立目录运行 `store path`；
-  加入 HOME/XDG 默认 store、本地 npmrc 的 `store-dir` 和具有 CAS 桶与格式标记的物理 store，按真实路径去重。
+  加入 HOME/XDG 默认 store、本地 npmrc 的 `store-dir` 和具有 CAS 桶与格式标记的物理 store，按真实路径及设备/inode 去重。
   不进入 Git 元数据和 node_modules 查配置；解析失败单列，宿主文件清单不完整则不执行。
   逐个存在的版本目录执行对应 pnpm 的 `--store-dir <共同根> store prune`；禁止把 `vN` 目录再当 store 根。
   本机实测选用 pnpm 9 → v3、pnpm 10 → v10、pnpm 12 → v11；工具通过现有 pnpm 或 `npx --yes pnpm@<major>`

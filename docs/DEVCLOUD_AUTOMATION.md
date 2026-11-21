@@ -76,7 +76,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 维护脚本任务都属于 project `proj_8d3wrcajxn`，时区 `Asia/Shanghai`。
 它们跑的是 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 下的不可变副本，
 不是仓库工作区。`<sha16>` 是 `manifest.json` 规范化内容 sha256 的前 16 位；
-Docker/Go 沿用原快照；pnpm 使用 `e6b1df5c51c125aa`。
+Docker/Go 沿用原快照；pnpm 使用 `8c2d819edb14ca13`。
 
 | 任务 | ID | 时间 | 工作目录 | 命令 | 无动作时 |
 |---|---|---|---|---|---|
