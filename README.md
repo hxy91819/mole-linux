@@ -1,22 +1,14 @@
-<div align="center">
-  <h1>Mole</h1>
-  <p><em>🐹 Clean, uninstall, analyze, optimize, and monitor your Mac. Free open-source CLI, plus a native Mac app.</em></p>
-</div>
+# mole-linux
 
-<p align="center">
-  <a href="https://github.com/tw93/mole/stargazers"><img src="https://img.shields.io/github/stars/tw93/mole?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/tw93/mole/releases"><img src="https://img.shields.io/github/v/tag/tw93/mole?label=version&style=flat-square" alt="Version"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL_v3-blue.svg?style=flat-square" alt="License"></a>
-  <a href="https://github.com/tw93/mole/commits"><img src="https://img.shields.io/github/commit-activity/m/tw93/mole?style=flat-square" alt="Commits"></a>
-  <a href="https://twitter.com/HiTw93"><img src="https://img.shields.io/badge/follow-Tw93-red?style=flat-square&logo=Twitter" alt="Twitter"></a>
-  <a href="https://t.me/+9f9gf4ZrFSQ2OWVl"><img src="https://img.shields.io/badge/chat-Telegram-blueviolet?style=flat-square&logo=Telegram" alt="Telegram"></a>
-</p>
+An independent source fork of [Mole by tw93 and contributors](https://github.com/tw93/mole).
+It carries changes through November 21, 2026, including CLI safety and test
+changes and a separate set of Linux DevCloud storage tools. The `mo` CLI below
+targets macOS; the DevCloud tools do not make it a Linux port.
 
-<p align="center">
-  <img src="https://gw.alipayobjects.com/zos/k/ro/ZzF8e8.png" alt="Mole - 95.50GB freed" width="1000" />
-</p>
-
-> Prefer a native app? [Mole for Mac](https://mole.fit) brings cleanup, app management, maintenance, disk maps, and live status into one lightweight, VoiceOver-ready app. It is $19 once and covers 2 Macs, with lifetime updates and a 14-day refund. The license moves with you when you replace a Mac. [Download and try it](https://mole.fit/download). The CLI stays free and open source.
+For official macOS packages, releases and nightly updates, use the upstream
+installation instructions below. To inspect or test this fork, clone this
+repository and follow [CONTRIBUTING.md](CONTRIBUTING.md). Start with
+`./mole --help` from the source tree on macOS.
 
 ## Features
 
@@ -419,7 +411,6 @@ Real feedback from users who shared Mole on X.
 
 - Getting [Mole for Mac](https://mole.fit) is the most direct way to support Mole's development.
 - If Mole helped you, give it a star, [share it](https://twitter.com/intent/tweet?url=https://github.com/tw93/Mole&text=Mole%20-%20Deep%20clean%20and%20optimize%20your%20Mac.), or open an issue or PR.
-- I have two cats, TangYuan and Coke. If you think Mole delights your life, you can feed them <a href="https://cats.tw93.fun?name=Mole" target="_blank">canned food 🥩</a>.
 
 <details>
 <summary>These lovely people already did 🐱</summary>
@@ -441,6 +432,6 @@ The DevCloud Python workflow runs the full suite on Ubuntu.
 
 ## License
 
-Mole is open source under GPL-3.0; see [LICENSE](LICENSE). A version you modify and share stays under the same license. If you fork Mole into another product, please give it a different name and credit Mole as the source.
+Mole is open source under GPL-3.0; see [LICENSE](LICENSE). This fork retains the original [MIT notice](LICENSES/MIT-upstream.txt) for earlier upstream material. See also the upstream [trademark policy](TRADEMARK.md). If you fork Mole into another product, please give it a different name and credit Mole as the source.
 
 [Mole for Mac](https://mole.fit) is a separate proprietary app. Mole is here for the long run.

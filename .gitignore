@@ -44,8 +44,8 @@ tests/tmp-*
 # Local AI Assistant Instructions
 # CLAUDE.md is a symlink to AGENTS.md (shared source of truth, tracked).
 # Personal overrides go in *.local.md, which stay gitignored.
-CLAUDE.local.md
-AGENTS.local.md
+*.local.md
+/.local/
 AGENTS.override.md
 .claude/*
 !.claude/agents/
@@ -92,3 +92,13 @@ mole_guidelines.md
 ai-storage-maintenance/
 __pycache__/
 disk-usage-*.html
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx

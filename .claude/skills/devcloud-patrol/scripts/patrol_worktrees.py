@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 from datetime import datetime, timezone
@@ -39,6 +40,7 @@ MIN_AGE_HOURS = 168.0
 # du --time-style 的时间列形状；不匹配就当「不可得」，绝不把别的字段当时间。
 LAST_ACTIVE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{4}$")
 # owner 维护的工蜂凭据（root 600）。只读 token 值本身，绝不复制、不回显。
+INTERNAL_GIT_HOST = "git.example.invalid"
 GONGFENG_ENV_FILE = "/data/code/lighthouse/developer/.env"
 
 # Mole 的 MOLE_PURGE_TARGETS 白名单（与 lib/clean/purge_shared.sh 对齐）。
@@ -377,7 +379,7 @@ def gongfeng_lookup(project, branch, token, timeout=60, head=None):
                 "source_commit": mr.get("source_commit"),
                 "merge_commit_sha": mr.get("merge_commit_sha"),
                 "updated_at": mr.get("updated_at"),
-                "url": (f"https://git.example.invalid/{project}/-/merge_requests/{mr.get('iid')}"
+                "url": (f"https://{INTERNAL_GIT_HOST}/{project}/-/merge_requests/{mr.get('iid')}"
                         if project and mr.get("iid") else None),
                 "project": project,
             }
@@ -512,7 +514,7 @@ def classify_retained(o, bb_query_ok=True, execute=False):
     state = gf.get("state")
     skip = str(o.get("skip_reason") or "")
     remote_status = "远端不可证"
-    if host == "git.example.invalid":
+    if host == INTERNAL_GIT_HOST:
         if state == "merged":
             if exact_head(gf.get("source_commit"), o.get("head")):
                 remote_status = "MR merged(工蜂核验·精确 head)"
@@ -629,7 +631,7 @@ def build_gongfeng_evidence(items):
         if local_blockers(o):
             continue
         project, host = remote_slug(o["repo"])
-        if host != "git.example.invalid":
+        if host != INTERNAL_GIT_HOST:
             continue
         record = {
             "path": o["path"], "branch": o.get("branch") or "", "head": head,
@@ -740,8 +742,24 @@ def save_state(path: str, state: dict):
 
 # ---------------------------------------------------------------- 主流程
 
+def site_setting(key):
+    """Read the optional private configuration for this installation."""
+    config = Path(os.environ.get("MOLE_DEVCLOUD_SITE",
+                                Path(__file__).resolve().parents[4] / ".local/devcloud.gitconfig"))
+    if not config.is_file():
+        return ""
+    result = subprocess.run(["git", "config", "--file", str(config), "--get", key],
+                            text=True, capture_output=True, check=False)
+    if result.returncode not in (0, 1):
+        raise ValueError(f"cannot read private site configuration: {config}")
+    value = result.stdout.strip()
+    if value and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]*", value):
+        raise ValueError(f"invalid value for {key} in private site configuration")
+    return value.lower()
+
+
 def main() -> int:
-    global WORKTREE_TOOL, DEVCLOUD, LEDGER
+    global WORKTREE_TOOL, DEVCLOUD, LEDGER, INTERNAL_GIT_HOST
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--roots", default=",".join(DEFAULT_ROOTS))
@@ -765,6 +783,13 @@ def main() -> int:
                     help="仓库镜像根（默认按 AGENTS.md 约定）")
     ap.add_argument("--no-mirror", action="store_true", help="不写仓库镜像（隔离测试时用）")
     args = ap.parse_args()
+    try:
+        host = site_setting("devcloud.internalGitHost")
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.execute and not host:
+        ap.error("missing devcloud.internalGitHost; see devcloud.example.gitconfig")
+    INTERNAL_GIT_HOST = host or "git.example.invalid"
     if args.min_age_hours < MIN_AGE_HOURS or args.jobs < 1:
         ap.error("min-age-hours 必须至少 168，jobs 必须为正数")
     WORKTREE_TOOL, DEVCLOUD = args.worktree_tool, args.devcloud
@@ -1000,7 +1025,7 @@ def main() -> int:
     host_by_repo = {r: remote_slug(r)[1] for r in repos_with_linked}
     gf_targets = [o for o in objects
                   if not o["primary"] and o["exists_now"]
-                  and host_by_repo.get(o["repo"]) == "git.example.invalid"
+                  and host_by_repo.get(o["repo"]) == INTERNAL_GIT_HOST
                   and (o["age_hours"] or 0) >= args.min_age_hours]
     gf_token, gf_source = gongfeng_token()
     gf_meta = {"credential_source": gf_source if gf_token else None,
@@ -1057,7 +1082,7 @@ def main() -> int:
         if (o.get("age_hours") or 0) >= args.min_age_hours:
             gf = o.get("gongfeng") or {}
             remote_ok = (o.get("owner_eligible") and not o.get("owner_error")) or (
-                o.get("remote_host") == "git.example.invalid" and gf.get("state") == "merged"
+                o.get("remote_host") == INTERNAL_GIT_HOST and gf.get("state") == "merged"
                 and exact_head(gf.get("source_commit"), o.get("head")))
             if remote_ok and not local_blockers(o, bb_query_ok):
                 o["submodule_blocked"] = worktree_has_submodules(o["path"])
@@ -1692,7 +1717,7 @@ def render_report(evidence):
                 gf = o.get("gongfeng") or {}
                 pr = o.get("pr") or {}
                 number = gf.get("iid") or (pr.get("number") if isinstance(pr, dict) else pr)
-                name = (f"MR!{number}" if gf or urlsplit(url).hostname == "git.example.invalid"
+                name = (f"MR!{number}" if gf or urlsplit(url).hostname == INTERNAL_GIT_HOST
                         else f"PR#{number}" if number else "远端证据")
                 facts.append(f"[{name}]({url})")
             if o.get("needs_decision") or o.get("execution_error"):
@@ -1841,7 +1866,7 @@ def render_audit(summary, executed, unreclaimed, by_reason, verify, failed) -> s
             L.append(f"| {x['path']} | {x['head'][:12]} | {x['age_days']}d | "
                      f"#{x['pr']} | {x['size_bytes'] if x['size_bytes'] is not None else '不可得'} |")
         if summary.get("gongfeng_executed_count"):
-            L.append(f"- 其中工蜂（git.example.invalid）{summary['gongfeng_executed_count']} 项经 "
+            L.append(f"- 其中工蜂（{INTERNAL_GIT_HOST}）{summary['gongfeng_executed_count']} 项经 "
                      f"`--remote-evidence` 走同一 owner 执行器（非 --force、分支按远端证明删除）。")
         for v in verify:
             L.append(f"- 复核 {v['path']}：commit={v['commit_type']}，"

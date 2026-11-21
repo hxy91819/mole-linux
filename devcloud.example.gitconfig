@@ -1,0 +1,3 @@
+[devcloud]
+	internalGitHost = git.example.invalid
+	internalLogin = example-logon

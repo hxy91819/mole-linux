@@ -625,3 +625,19 @@ Promote only rules that hold across runs; land each in `storage-rules.md` with a
 regression check, or an explicit reason why only a live read-only probe is possible. The
 analyzer stays read-only by default; preserve the Mole workflow: inspect, classify,
 preview, then execute one owner-approved action.
+
+## 本机资料的保存与恢复
+
+`.local/devcloud/publication-backup/` 保存已有主机和服务盘点、截图、旧的
+存储规则及主机特定的运维记录。这个目录被 Git 忽略；它不跟随 clone，也不
+进入发布包。把需要保留的记录备份到主机的受限存储。更换主机时，能从私有备份
+恢复的记录原位恢复；缺失的记录从实际挂载、已启用的自动化及其不可变快照和
+新的只读盘点重新建立。不要从 Git 历史恢复本机敏感值。
+
+需要内部仓库核验时，从 `devcloud.example.gitconfig` 复制一份到
+`.local/devcloud.gitconfig`，再从实际 Git 远端和授权记录重建 host 与登录名；
+这里不存放 token 或密码。执行模式缺少 host 时会直接报错；预演不会猜测内部地址。
+生产快照如果采用这一配置，可以用 `MOLE_DEVCLOUD_SITE` 指定私有配置的绝对路径。
+
+自动化快照继续由 `/data/tools` 上的部署合约管理。更新每日检查的
+prompt 或任何直接读取 checkout 的任务时，先比对它们引用的路径。

@@ -1,4 +1,8 @@
-# Contributing to Mole
+# Contributing to mole-linux
+
+Report fork-specific changes here. For changes common to the upstream CLI,
+see [upstream Mole](https://github.com/tw93/mole). Keep local configuration and
+ledger data in `.local/`; use synthetic examples when documenting or testing.
 
 ## Setup
 

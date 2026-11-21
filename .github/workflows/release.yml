@@ -10,6 +10,7 @@ permissions:
 
 jobs:
   build:
+    if: github.repository == 'tw93/mole'
     name: Build
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30

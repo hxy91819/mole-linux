@@ -6,8 +6,8 @@ Mole is a local system maintenance tool. It includes high-risk operations such a
 
 Please report suspected security issues privately.
 
-- Email: `hitw93@gmail.com`
-- Subject line: `Mole security report`
+- Fork changes: use [private vulnerability reporting](https://github.com/hxy91819/mole-linux/security/advisories/new) when enabled.
+- Upstream Mole: follow the [upstream security policy](https://github.com/tw93/mole/security/policy).
 
 Do not open a public GitHub issue for an unpatched vulnerability.
 
@@ -21,6 +21,8 @@ Include as much of the following as possible:
 - Reproduction steps or proof of concept
 - Whether the issue involves deletion boundaries, symlinks, sudo, path validation, or release/install integrity
 
+Do not include tokens, keys, log archives, or machine-specific configuration in a public report.
+
 ## Response Expectations
 
 - We aim to acknowledge new reports within 7 calendar days.
@@ -33,7 +35,7 @@ Response times are best-effort for a maintainer-led open source project, but sec
 
 Security fixes are only guaranteed for:
 
-- The latest published release
+- The latest published release, if any
 - The current `main` branch
 
 Older releases may not receive security fixes. Users running high-risk commands should stay current.

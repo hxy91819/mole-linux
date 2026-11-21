@@ -36,7 +36,7 @@ from pathlib import Path
 
 ENV = dict(os.environ, GIT_OPTIONAL_LOCKS="0", GIT_TERMINAL_PROMPT="0", LC_ALL="C")
 INTERNAL_HOSTS = {"git.example.invalid"}
-DEFAULT_LOGINS = ("hxy91819", "hxy91819", "opencraft-app")
+DEFAULT_LOGINS = ("hxy91819", "opencraft-app")
 TMP_ALIASES = (("/tmp/", "/data/system-tmp/"),)
 # Credential *files* by name. Source files that merely mention "credential" or "secret",
 # and sops-encrypted manifests, are ordinary code and get archived like anything else.
@@ -811,13 +811,30 @@ def repo_summary(repo, items, measured):
     return f"{os.path.basename(repo.main)}{sized}: {detail}"
 
 
+def site_setting(key):
+    """Read the optional private configuration for this installation."""
+    config = Path(os.environ.get("MOLE_DEVCLOUD_SITE",
+                                Path(__file__).resolve().parents[4] / ".local/devcloud.gitconfig"))
+    if not config.is_file():
+        return ""
+    result = subprocess.run(["git", "config", "--file", str(config), "--get", key],
+                            text=True, capture_output=True, check=False)
+    if result.returncode not in (0, 1):
+        raise ValueError(f"cannot read private site configuration: {config}")
+    value = result.stdout.strip()
+    if value and not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]*", value):
+        raise ValueError(f"invalid value for {key} in private site configuration")
+    return value.lower()
+
+
 def main(argv=None):
+    global INTERNAL_HOSTS
     ap = argparse.ArgumentParser(description="Archive and remove idle linked Git worktrees.")
     ap.add_argument("--root", action="append", help="directory holding main checkouts (default /data/code)")
     ap.add_argument("--repo", action="append", help="only these main checkouts")
     ap.add_argument("--idle-hours", type=float, default=24)
     ap.add_argument("--login", action="append",
-                    help="remote namespaces that are yours (default: hxy91819, hxy91819, opencraft-app)")
+                    help="remote namespaces that are yours (default: configured login and public defaults)")
     ap.add_argument("--state-dir", default=os.path.expanduser("~/.local/state/devcloud-storage-upkeep"))
     ap.add_argument("--no-bb", action="store_true", help="skip the BB thread check (isolated tests only)")
     ap.add_argument("--measure", action="store_true", help="du every linked worktree before acting")
@@ -829,8 +846,16 @@ def main(argv=None):
     ap.add_argument("--json", action="store_true", help="print every item as JSON")
     args = ap.parse_args(argv)
 
+    try:
+        host = site_setting("devcloud.internalGitHost")
+        login = site_setting("devcloud.internalLogin")
+    except ValueError as exc:
+        ap.error(str(exc))
+    if args.execute and not host and not args.no_bb:
+        ap.error("missing devcloud.internalGitHost; see devcloud.example.gitconfig")
+    INTERNAL_HOSTS = {host} if host else set()
     started = time.time()
-    logins = {x.lower() for x in (args.login or DEFAULT_LOGINS)}
+    logins = {x.lower() for x in (args.login or (*DEFAULT_LOGINS, *([login] if login else [])))}
     now, idle_seconds, use_bb = started, args.idle_hours * 3600, not args.no_bb
     deadline = started + args.budget_minutes * 60 if args.budget_minutes > 0 else None
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
