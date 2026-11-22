@@ -39,6 +39,8 @@ def sh(*args, cwd=None):
 
 class WorktreeSweepTests(unittest.TestCase):
     def setUp(self):
+        example_site = Path(__file__).resolve().parents[1] / 'devcloud.example.gitconfig'
+        self.enterContext(mock.patch.dict(os.environ, {'MOLE_DEVCLOUD_SITE': str(example_site)}))
         self.temp = tempfile.TemporaryDirectory(prefix='wt-sweep-test-', dir='/var/tmp')
         self.addCleanup(self.temp.cleanup)
         self.process_ids = []

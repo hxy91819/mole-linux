@@ -4,6 +4,7 @@ import copy
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -122,6 +123,10 @@ class ClassificationTests(unittest.TestCase):
 
 
 class CollectorTests(unittest.TestCase):
+    def setUp(self):
+        example_site = Path(__file__).resolve().parents[1] / 'devcloud.example.gitconfig'
+        self.enterContext(mock.patch.dict(os.environ, {'MOLE_DEVCLOUD_SITE': str(example_site)}))
+
     def collect(self, *, execute=False, host='git.example.invalid', bb_ok=True,
                 usage=0, refresh=None, submodule=False, dirty=False, owner_error=False,
                 age=200, apply_error=False, alias=False, bb_alias=False):
