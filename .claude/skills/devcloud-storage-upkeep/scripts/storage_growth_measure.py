@@ -26,13 +26,16 @@ GO_CACHE = BB_STORAGE + '/.shared-cache/go-build'
 LINT_CACHE = BB_STORAGE + '/.shared-cache/golangci-lint'
 BB_ROOTS = (BB_DATA, BB_STORAGE, GO_CACHE, LINT_CACHE, 'bb:threads', 'bb:non-thread')
 ROOT_STORAGE = '/data/root-storage-20260912'
+ROOT_MIGRATED = '/data/root-migrated'
+ROOT_MIGRATED_SESSIONS = ROOT_MIGRATED + '/agent-state/cursor/projects'
+ROOT_MIGRATED_CHECKPOINTS = ROOT_MIGRATED + '/deployment-checkpoints'
 ROOT_STORAGE_BRANCHES = frozenset(ROOT_STORAGE + suffix for suffix in (
     '', '/root', '/root/.acpx', '/root/.cursor', '/root/.local',
     '/root/.local/share', '/root/.local/share/cursor-agent',
     '/root/.local/share/pnpm', '/root/.local/share/zed'))
 ROOT_STORAGE_WATCH = frozenset(ROOT_STORAGE + '/root/.local/share/' + leaf
                                for leaf in ('cursor-agent/versions', 'pnpm/store'))
-CHILD_ROOTS = ('/data/code', '/root/.cache', ROOT_STORAGE)
+CHILD_ROOTS = ('/data/code', '/root/.cache', ROOT_STORAGE, ROOT_MIGRATED)
 DOCKER_TYPES = {'Images': 'docker:images', 'Containers': 'docker:containers',
                 'Local Volumes': 'docker:volumes', 'Build Cache': 'docker:build-cache'}
 
@@ -42,7 +45,7 @@ def unknown(root, error):
 
 
 def alert_exclusion(root):
-    if root in ROOT_STORAGE_BRANCHES or root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage', '/data/system-tmp', *CHILD_ROOTS):
+    if root in ROOT_STORAGE_BRANCHES or root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage', '/data/system-tmp', '/data/code', '/root/.cache', ROOT_MIGRATED):
         return 'parent aggregate; alert on components'
     if root in (GO_CACHE, LINT_CACHE):
         return 'shared Go cache; daily check 2 owns size and age limits'
@@ -53,7 +56,7 @@ def discover():
     roots, errors = [], []
     try:
         data = [str(p) for p in sorted(Path('/data').iterdir()) if str(p) != '/data/docker']
-        first = ('/data/code', '/data/system-tmp', BB_DATA, ROOT_STORAGE)
+        first = ('/data/code', '/data/system-tmp', BB_DATA, ROOT_STORAGE, ROOT_MIGRATED)
         roots.extend([root for root in first if root in data])
         roots.extend(root for root in data if root not in first)
     except OSError as error:
@@ -184,6 +187,28 @@ def measure_children(root, deadline):
         return [unknown(root, error)]
 
 
+def measure_root_migrated(deadline):
+    """Measure Cursor sessions and deployment checkpoints from one bounded walk."""
+    row = probe(ROOT_MIGRATED, ['du', '-ax', '-B1', '--max-depth=8', '--null', '--', ROOT_MIGRATED], deadline)
+    if row['status'] != 'ok':
+        return [unknown(ROOT_MIGRATED, row['error'])]
+    try:
+        sizes = du_sizes(row['output'])
+        session_prefix = ROOT_MIGRATED_SESSIONS + '/'
+        session_bytes = sum(size for path, size in sizes.items()
+                            if re.fullmatch(session_prefix + r'[^/]+/sdk-agent-store/[^/]+/agents', path))
+        values = {
+            ROOT_MIGRATED_SESSIONS: session_bytes,
+            ROOT_MIGRATED_CHECKPOINTS: sizes.get(ROOT_MIGRATED_CHECKPOINTS),
+        }
+        if any(value is None for value in values.values()):
+            raise ValueError('root-migrated child summary missing')
+        return [{'root': path, 'status': 'ok', 'bytes': size, 'parent': ROOT_MIGRATED,
+                 'elapsed_seconds': row['elapsed_seconds']} for path, size in values.items()]
+    except (ValueError, KeyError) as error:
+        return [unknown(ROOT_MIGRATED, error)]
+
+
 def split_bb_output(output, thread_dirs):
     sizes = du_sizes(output)
     total = sizes[BB_STORAGE]
@@ -262,6 +287,8 @@ def split_docker_output(row):
 
 
 def measure_job(root, deadline):
+    if root == ROOT_MIGRATED:
+        return measure_root_migrated(deadline)
     if root in CHILD_ROOTS:
         return measure_children(root, deadline)
     if root == BB_DATA:

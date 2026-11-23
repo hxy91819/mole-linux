@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位刹车使用快照 `50d05aa5be8479af`，增长计量使用快照 `7d9f2b6b43819ccd`：
+水位刹车使用快照 `50d05aa5be8479af`，增长计量使用快照 `9879ae636223e0d1`：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -220,7 +220,7 @@ linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` �
 恢复原始 SHA 的证据必须在删除前落账，不能仅记录成功的 installer/命令输出。
 
 水位/计量快照包含 `storage_watermark_brake.py`、`storage_growth_measure.py`、`clean_tmp_runner.py`
-及 `storage_growth_fingerprints.md` 四个文件与 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
+及 `storage_growth_fingerprints.md` 两个文件与 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
 文件 `0444`、目录 `0555`；三个入口都以 `python3 -I` 跑 `--help`，复算哈希并确认无 pycache，
 发布前从 storage-rules 的 `growth-fingerprints` 标记段生成同目录指纹副本，测试核对两份表一致；
 计量入口仅按自身目录读取副本，工作区规则改变不会影响已发布任务。确认目录只有四个文件与 manifest。

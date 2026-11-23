@@ -2340,6 +2340,30 @@ def test_growth_failed_measurement_is_unknown_without_bytes(monkeypatch, failure
     assert 'error' in row
 
 
+def test_growth_root_migrated_splits_cursor_sessions_and_checkpoints(monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    root = g.ROOT_MIGRATED
+    output = '\0'.join([
+        '100\t' + root,
+        '70\t' + root + '/agent-state/cursor/projects/mono2/sdk-agent-store/a/agents',
+        '30\t' + root + '/deployment-checkpoints',
+        '999\t' + root + '/agent-state/cursor/projects/mono2/sdk-agent-store/a/agents/session.json',
+        '',
+    ])
+    monkeypatch.setattr(g, 'probe', lambda *args, **kwargs: {'status': 'ok', 'output': output, 'elapsed_seconds': 1})
+    rows = g.measure_root_migrated(999)
+    assert {row['root']: row['bytes'] for row in rows} == {
+        g.ROOT_MIGRATED_SESSIONS: 70, g.ROOT_MIGRATED_CHECKPOINTS: 30}
+
+
+def test_growth_fingerprints_assign_mono2_and_root_migrated_owners():
+    g = load_upkeep('storage_growth_measure')
+    rules = g.fingerprints()
+    assert g.owner('/data/code/mono2/.worktrees/agent-1', rules).startswith('mono2 agent worktrees')
+    assert g.owner('/data/root-migrated/agent-state/cursor/projects', rules).startswith('BB Cursor provider sessions')
+    assert g.owner('/data/root-migrated/deployment-checkpoints', rules).startswith('BB deployment checkpoints')
+
+
 def test_growth_discovery_measures_children_not_data_aggregate(tmp_path, monkeypatch):
     g = load_upkeep('storage_growth_measure')
     listings = {'/data': ['code', 'system-tmp', 'bb-data', 'docker'], '/data/system-tmp': ['clone', 'cache'], '/root/.bb': ['logs', 'plugins']}
