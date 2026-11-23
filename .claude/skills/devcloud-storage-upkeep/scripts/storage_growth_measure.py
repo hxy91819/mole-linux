@@ -28,7 +28,7 @@ BB_ROOTS = (BB_DATA, BB_STORAGE, GO_CACHE, LINT_CACHE, 'bb:threads', 'bb:non-thr
 ROOT_STORAGE = '/data/root-storage-20260912'
 ROOT_MIGRATED = '/data/root-migrated'
 ROOT_MIGRATED_SESSIONS = ROOT_MIGRATED + '/agent-state/cursor/projects'
-ROOT_MIGRATED_CHECKPOINTS = ROOT_MIGRATED + '/deployment-checkpoints'
+ROOT_MIGRATED_CHECKPOINTS = ROOT_MIGRATED + '/agent-state/bb-deployment-checkpoints'
 ROOT_STORAGE_BRANCHES = frozenset(ROOT_STORAGE + suffix for suffix in (
     '', '/root', '/root/.acpx', '/root/.cursor', '/root/.local',
     '/root/.local/share', '/root/.local/share/cursor-agent',

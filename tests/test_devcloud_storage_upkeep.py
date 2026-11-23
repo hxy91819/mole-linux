@@ -2346,7 +2346,7 @@ def test_growth_root_migrated_splits_cursor_sessions_and_checkpoints(monkeypatch
     output = '\0'.join([
         '100\t' + root,
         '70\t' + root + '/agent-state/cursor/projects/mono2/sdk-agent-store/a/agents',
-        '30\t' + root + '/deployment-checkpoints',
+        '30\t' + root + '/agent-state/bb-deployment-checkpoints',
         '999\t' + root + '/agent-state/cursor/projects/mono2/sdk-agent-store/a/agents/session.json',
         '',
     ])
@@ -2361,7 +2361,7 @@ def test_growth_fingerprints_assign_mono2_and_root_migrated_owners():
     rules = g.fingerprints()
     assert g.owner('/data/code/mono2/.worktrees/agent-1', rules).startswith('mono2 agent worktrees')
     assert g.owner('/data/root-migrated/agent-state/cursor/projects', rules).startswith('BB Cursor provider sessions')
-    assert g.owner('/data/root-migrated/deployment-checkpoints', rules).startswith('BB deployment checkpoints')
+    assert g.owner('/data/root-migrated/agent-state/bb-deployment-checkpoints', rules).startswith('BB deployment checkpoints')
 
 
 def test_growth_discovery_measures_children_not_data_aggregate(tmp_path, monkeypatch):
