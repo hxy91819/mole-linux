@@ -118,6 +118,11 @@ def still_eligible(path, cutoff):
 def trim_cache(cache, label, expected, args):
     try:
         if not readme_ok(cache, expected):
+            with os.scandir(cache) as entries:
+                if next(entries, None) is None:
+                    if not args.quiet:
+                        print(f"{label}: empty")
+                    return 0
             raise RuntimeError("README missing or unexpected")
         now = time.time()
         paths = eligible(cache, now)

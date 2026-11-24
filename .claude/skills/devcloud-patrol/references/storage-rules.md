@@ -47,7 +47,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   最老条目阈值 1520 分钟），保留日内与隔夜复用，同时清掉超过 24 小时未用的冷条目。
   只删名字匹配 `^[0-9a-f]{64}-[ad]$` 的普通文件；目录、README、trim.txt、
   testexpire.txt、fuzz 和符号链接不动。脚本 `scripts/go_cache_trim.py`，默认预演、`--execute` 才删。
-  Go 根取 `go env GOCACHE` 的 realpath；lint 根取 `readlink -f /root/.cache/golangci-lint`。
+  本机缓存位于 `/root/.cache/go-build` 与 `/root/.cache/golangci-lint`。Go 根取 `go env GOCACHE` 的 realpath，lint 根取标准路径的 realpath。新建空目录等工具初始化。
   README 第一行分别必须为 `This directory holds cached build artifacts from the Go build system.` 和
   `This directory holds cached build artifacts from golangci-lint.`，不符则该缓存不删并报错。
   哈希桶和 README 共同确认缓存归属；非哈希控制文件、fuzz 数据和指向外部的软链不在删除计划内。
@@ -183,9 +183,6 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   `~/.local/share/agent-cli-updates/update.py --tool cursor`。版本校验成功后，保留 `agent`
   软链实际指向的当前版本、紧邻的上一版及有活进程 exe、cwd 或 maps 引用的版本；仅处理
   `~/.local/share/cursor-agent/versions` 内的物理版本目录，其他数据不动。
-- **共享缓存不是线程遗留**：`/data/bb-data/thread-storage/.shared-cache/` 是 lightspace 建立的共享 Go 和
-  golangci-lint 缓存，`/root/.cache/go-build` 与 `/root/.cache/golangci-lint` 的 realpath 指向其中。
-  只能由 `go_cache_trim.py` 按上述 24h 规则修剪；不得当作线程遗留删除或误报为待清线程目录。
 - **数据类不自动删**：会话（codex、bb-data）、凭据、在用数据库、命名卷、备份与迁移副本只列给 owner 决定。
 
 执行入口：`$devcloud-storage-upkeep` 的 `scripts/git_tree_sweep.py`、`scripts/docker_leftovers.py`、
@@ -348,8 +345,8 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（待 owner 决定；不自动删） |
 | `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（待 owner 决定；不自动删） |
 | `/data/codex` | Codex sessions |
-| `/data/bb-data/thread-storage/.shared-cache/go-build` | shared Go build cache |
-| `/data/bb-data/thread-storage/.shared-cache/golangci-lint` | shared golangci-lint cache |
+| `/root/.cache/go-build` | shared Go build cache |
+| `/root/.cache/golangci-lint` | shared golangci-lint cache |
 | `bb:threads` | BB thread directories |
 | `bb:non-thread` | BB root non-thread entries |
 | `docker:images` | Docker images |
@@ -455,7 +452,6 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
   读取 /proc 时进程退出窗口错误只在有界复核证实消失、僵尸或 PID 重用时视为退出，证据仍不全则拒绝。
 - Git 工作树统一由每日 06:30 的 `git_tree_sweep.py`（模式按本轮授权条件），旧 06:45 任务停用；
   不再补删 BB 环境，pnpm 每周日 05:30 逐版本 owner prune。
-  `/data/bb-data/thread-storage/.shared-cache/` 是共享缓存，不在本段普通临时项或线程遗留范围。
 - 每日账本 `/data/metrics/devcloud-clean-tmp.log`：intent/deleted/skipped/failed 事件与每根各一条
   summary 分开，`path` 区分两个根；错误日志为同名 `.stderr.log`。summary 记录两盘前后容量和
   部分失败，失败非零。复核发现活引用或候选变化时保留该项，已隔离项先恢复原名，再继续后续批次。

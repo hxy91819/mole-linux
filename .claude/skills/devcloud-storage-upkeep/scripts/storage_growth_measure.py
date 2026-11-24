@@ -22,9 +22,9 @@ GIB = 1024 ** 3
 
 BB_DATA = '/data/bb-data'
 BB_STORAGE = BB_DATA + '/thread-storage'
-GO_CACHE = BB_STORAGE + '/.shared-cache/go-build'
-LINT_CACHE = BB_STORAGE + '/.shared-cache/golangci-lint'
-BB_ROOTS = (BB_DATA, BB_STORAGE, GO_CACHE, LINT_CACHE, 'bb:threads', 'bb:non-thread')
+GO_CACHE = '/root/.cache/go-build'
+LINT_CACHE = '/root/.cache/golangci-lint'
+BB_ROOTS = (BB_DATA, BB_STORAGE, 'bb:threads', 'bb:non-thread')
 MONO2 = '/data/code/mono2'
 MONO2_WORKTREES = MONO2 + '/.worktrees'
 ROOT_STORAGE = '/data/root-storage-20260912'
@@ -226,17 +226,10 @@ def split_bb_output(output, thread_dirs):
     sizes = du_sizes(output)
     total = sizes[BB_STORAGE]
     direct = {path: size for path, size in sizes.items() if str(Path(path).parent) == BB_STORAGE}
-    shared = BB_STORAGE + '/.shared-cache'
-    shared_children = {path: size for path, size in sizes.items() if str(Path(path).parent) == shared}
     threads = {path: size for path, size in direct.items() if Path(path).name in thread_dirs}
-    other = sum(size for path, size in direct.items() if path not in threads and path != shared)
-    other += sum(size for path, size in shared_children.items() if path not in (GO_CACHE, LINT_CACHE))
-    # Include directory metadata so the four components account for the entire root.
-    other += total - sum(direct.values())
-    other += sizes.get(shared, 0) - sum(shared_children.values())
+    thread_bytes = sum(threads.values())
     values = {BB_DATA: sizes[BB_DATA], BB_STORAGE: total,
-              GO_CACHE: sizes.get(GO_CACHE, 0), LINT_CACHE: sizes.get(LINT_CACHE, 0),
-              'bb:threads': sum(threads.values()), 'bb:non-thread': other}
+              'bb:threads': thread_bytes, 'bb:non-thread': total - thread_bytes}
     if any(value < 0 for value in values.values()):
         raise ValueError('inconsistent thread-storage totals')
     rows = [{'root': root, 'status': 'ok', 'bytes': size} for root, size in values.items()]
@@ -244,13 +237,13 @@ def split_bb_output(output, thread_dirs):
         if row['root'] == 'bb:threads':
             row.update(path=BB_STORAGE, entries=len(threads))
         elif row['root'] == 'bb:non-thread':
-            row.update(path=BB_STORAGE, entries=sum(path not in threads and path != shared for path in direct))
+            row.update(path=BB_STORAGE, entries=len(direct) - len(threads))
     return rows
 
 
 def measure_bb_data(deadline):
-    # One physical walk supplies both parents and all four components.
-    row = probe(BB_DATA, ['du', '-ax', '-B1', '--max-depth=3', '--null', '--', BB_DATA], deadline)
+    # One physical walk supplies both parents and the two thread-storage components.
+    row = probe(BB_DATA, ['du', '-ax', '-B1', '--max-depth=2', '--null', '--', BB_DATA], deadline)
     if row['status'] != 'ok':
         return [unknown(root, row['error']) for root in BB_ROOTS]
     try:

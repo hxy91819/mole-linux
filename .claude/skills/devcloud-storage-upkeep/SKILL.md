@@ -82,7 +82,7 @@ python3 -I <本技能根>/scripts/pnpm_store_prune.py             # 发现的各
 - 归档分支名带路径哈希：BB 托管的 worktree 和 `/data/ops/*` 里常有同名目录（`weekly-report`、`mono2`），只用目录名会互相覆盖，推送被 non-fast-forward 拒绝。
 - 停进程用 PID。`pkill -f <模式>` 会匹配到执行它的 shell 自己的命令行，把自己也杀掉。
 - 清理器按恢复契约分工。`clean-tmp` 普通项 3 天、结构精确匹配的 Go/pnpm/Node 缓存按最新普通文件 mtime 满 24h，不限数量，但仍然不处理含 `.git`、凭据、数据库等内容的树：所有 Git 工作树改由 `git_tree_sweep.py` 每天按统一规则处理；一直有新运行写入的容器目录（opencraft 本地 smoke）仍由创建任务自己收尾。
-- lightspace 已把 `/root/.cache/go-build` 与 `/root/.cache/golangci-lint` 指向 `/data/bb-data/thread-storage/.shared-cache/` 的两个共享缓存。取 realpath 后分别核固定 README 首行（Go build system / golangci-lint），共用 24h 哈希普通文件修剪；`.shared-cache` 不得当线程遗留删除或误报，只有 go_cache_trim 可修剪。
+- Go/lint 缓存恢复到 `/root/.cache/go-build` 和 `/root/.cache/golangci-lint`。新机器的 Codex 配置与验证见自动化手册第 6 节。
 - clean-tmp 每批 128 项完整 `/proc` 快照、8 项并发；隔离及最终 sink 只探新增/starttime 变化 PID（owner 明确授权），unknown 拒绝；每项仍校结构、年龄、物理身份、完整指纹，过 Mole dry-run/final guard。普通树 5 秒、缓存树 60 秒；两根预算 300/1400 秒，外层 timeout 1790 秒，实际 cron 见规则源。
 - systemd-tmpfiles 已不再清理 /tmp（`/etc/tmpfiles.d/tmp.conf` 不再按年龄删），破坏闲置 worktree 的原因见 storage-rules「临时目录与 worktree」一节。
 - 定时任务以 `bb automation list/show` 为准。Git快照包含两条判定路径、systemd launcher/worker、旧 helper 和每日成效检查（清单见自动化手册），文件 `0444`、目录 `0555`，manifest 字节哈希前 16 位为目录名；`python3 -I --help` 后复算哈希且无 pycache。仅更新相关任务，不改其他维护任务的快照。短文件名 `--script-file` 更新后 check=True，再读回核对命令模式符合本轮已满足的授权条件、06:30、Asia/Shanghai 与 timeout。旧 06:45 tmp clone 任务停用且替换为空操作（避免旧水位任务手动触发）；每日检查同步验证其停用。完整部署与预算见自动化手册。

@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位刹车使用快照 `50d05aa5be8479af`，增长计量使用快照 `a6bfeb050692aac2`：
+水位刹车使用快照 `98fb64b672657560`，增长计量使用快照 `0334de342a53a11b`：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -17,7 +17,7 @@
 | 增长计量 | `auto_u4kos3to-di` | `0 7 * * *` | `/usr/bin/python3 -I <snap>/storage_growth_measure.py` | 900 秒 |
 
 均用 bash 启动脚本 exec 上述命令，工作目录 `/var/tmp`。水位只调用既有任务：/data 对应
-Docker、Go、全盘 Git 清理、pnpm 与 clean-tmp `/data/system-tmp`，/ 对应 clean-tmp `/var/tmp`；旧 tmp clone ID 已停用、保存为空操作，从现行水位派发移除。
+Docker、全盘 Git 清理、pnpm 与 clean-tmp `/data/system-tmp`，/ 对应 Go 缓存修剪与 clean-tmp `/var/tmp`；旧 tmp clone ID 已停用、保存为空操作，从现行水位派发移除。
 首次越线、级别升高或两小时冷却结束才触发并打印一行简报；正常/冷却完全静默（skipped）。
 运行查询 unknown 跳过并在简报注明。`--dry-run` 只打印计划，不查 BB、不写状态、不启动清理。
 状态在系统盘 `/var/lib/devcloud-storage-upkeep/watermark.json`，清理派发后、通知之前保存，
@@ -28,14 +28,14 @@ Docker、Go、全盘 Git 清理、pnpm 与 clean-tmp `/data/system-tmp`，/ 对�
 所有外部计量命令用 `ionice -c3`；8 并发，单根最多 780 秒，全轮最多 840 秒，BB 任务超时 900 秒。
 07:00 启动，最迟约 07:15 终止，早于 07:30 检查；不靠延后每日检查解决测量超时。
 
-`/data/bb-data` 一次 du 物理遍历（深度3输出，递归尺寸仍完整）同时产生父根及 thread-storage 四项：
+`/data/bb-data` 一次 du 物理遍历（深度 2 输出，递归尺寸仍完整）产生父根与 thread-storage 两项。Go/lint 缓存来自 `/root/.cache` 遍历的直接子项：
 
 | 指标根 | 归属 | 增长告警 |
 |---|---|---|
-| `.shared-cache/go-build`（完整路径） | shared Go build cache | 不参与；每日检查第2项核大小与年龄 |
-| `.shared-cache/golangci-lint`（完整路径） | shared golangci-lint cache | 不参与；每日检查第2项核大小与年龄 |
+| `/root/.cache/go-build` | shared Go build cache | 不参与；每日检查第2项核大小与年龄 |
+| `/root/.cache/golangci-lint` | shared golangci-lint cache | 不参与；每日检查第2项核大小与年龄 |
 | `bb:threads` | BB thread directories，`thr_*` 真实目录合计 | >20 GiB/天 |
-| `bb:non-thread` | BB根非线程条目；含共享缓存其余项与目录元数据 | >20 GiB/天 |
+| `bb:non-thread` | thread-storage 的其余空间，含目录元数据 | >20 GiB/天 |
 
 `/data/code`、`/root/.cache` 各用一次物理 du 遍历输出父根与直接子项；只增加输出深度，
 不对每个子目录重新遍历，硬链接仍由同一次du去重。它们与 `/data/system-tmp`、两个BB父根
@@ -79,7 +79,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 维护脚本任务都属于 project `proj_8d3wrcajxn`，时区 `Asia/Shanghai`。
 它们跑的是 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 下的不可变副本，
 不是仓库工作区。`<sha16>` 是 `manifest.json` 规范化内容 sha256 的前 16 位；
-Docker/Go 沿用原快照；pnpm 使用 `8c2d819edb14ca13`。
+Docker 沿用原快照，Go 缓存修剪使用快照 `6117b7833a6f3773`；pnpm 使用 `8c2d819edb14ca13`。
 
 | 任务 | ID | 时间 | 工作目录 | 命令 | 无动作时 |
 |---|---|---|---|---|---|
@@ -223,11 +223,12 @@ linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` �
 `git worktree add <path> <sha>`；独立 clone 用记录 URL clone 后恢复每个 branch/tag。
 恢复原始 SHA 的证据必须在删除前落账，不能仅记录成功的 installer/命令输出。
 
-水位/计量快照包含 `storage_watermark_brake.py`、`storage_growth_measure.py`、`clean_tmp_runner.py`
-及 `storage_growth_fingerprints.md` 两个文件与 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
-文件 `0444`、目录 `0555`；三个入口都以 `python3 -I` 跑 `--help`，复算哈希并确认无 pycache，
+水位快照包含 `storage_watermark_brake.py` 和 `clean_tmp_runner.py`，计量快照包含
+`storage_growth_measure.py` 与 `storage_growth_fingerprints.md`，Go 修剪快照包含 `go_cache_trim.py`。
+各快照附 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
+文件 `0444`、目录 `0555`；Python 入口都以 `python3 -I` 跑 `--help`，复算哈希并确认无 pycache，
 发布前从 storage-rules 的 `growth-fingerprints` 标记段生成同目录指纹副本，测试核对两份表一致；
-计量入口仅按自身目录读取副本，工作区规则改变不会影响已发布任务。确认目录只有四个文件与 manifest。
+计量入口仅按自身目录读取副本，工作区规则改变不会影响已发布任务。确认各快照只含相应文件与 manifest。
 只更新使用改动入口的任务，用短名称 bash `--script-file`，回读命令、时区、cron、enabled。已知坏目录
 `8f4acd16bb88facd` 不保留；`916428875da4edee` 保留作回滚；其他旧快照按引用情况维护。
 
@@ -295,44 +296,24 @@ systemctl show systemd-tmpfiles-clean.service -p Result --value
 
 `logrotate.timer` 是系统标准日志轮转，另行保留；它负责 clean-tmp 的日志。
 
-## 6. 共享缓存软链 setup
+## 6. Codex 沙箱与 Go 缓存
 
-物理目录：
-
-```text
-/data/bb-data/thread-storage/.shared-cache/{go-build,golangci-lint}
-/root/.bb/thread-storage -> /data/bb-data/thread-storage
-/root/.cache/go-build -> /root/.bb/thread-storage/.shared-cache/go-build
-/root/.cache/golangci-lint -> /root/.bb/thread-storage/.shared-cache/golangci-lint
-```
-
-新机器执行一次（比 lightspace 原块多保留一份旧缓存，确认后再删）：
+在支持原生 `writable_roots` 的 BB 上，先在标准路径创建真实缓存目录，再将其绝对路径
+加入实际 `CODEX_HOME/config.toml`。本机的目录和配置如下。
 
 ```bash
-set -e
-shared="${BB_DATA_DIR:-$HOME/.bb}/thread-storage/.shared-cache"
-mkdir -p "$shared/go-build" "$shared/golangci-lint" "$HOME/.cache"
-for name in go-build golangci-lint; do
-  if [ -d "$HOME/.cache/$name" ] && [ ! -L "$HOME/.cache/$name" ]; then
-    cp -a "$HOME/.cache/$name/." "$shared/$name/"
-    mv "$HOME/.cache/$name" "$HOME/.cache/$name.pre-shared-cache"
-  fi
-  ln -sfn "$shared/$name" "$HOME/.cache/$name"
-done
+mkdir -p /root/.cache/go-build /root/.cache/golangci-lint
 ```
 
-验证：
-
-```bash
-readlink -f "$HOME/.cache/go-build" "$HOME/.cache/golangci-lint"
-go env GOCACHE
-# 在 Codex 沙箱线程里不设任何缓存变量，跑一次项目构建/lint；缓存目录应出现新 mtime
+```toml
+[sandbox_workspace_write]
+writable_roots = ["/root/.cache/go-build", "/root/.cache/golangci-lint"]
 ```
 
-确认 `$shared` 内容完整、构建可写后，再删除 `.pre-shared-cache`。这个软链是全机共享的：
-所有项目、Agent、终端的 Go/lint 都写这里；它不是线程遗留，只有 `go_cache_trim.py` 可以修剪。
-为什么放在这里、长期修法是什么，见
-[设计文档 3.1](DEVCLOUD_STORAGE_DESIGN.md)。
+合并现有表和数组。配置后用 TOML 解析校验，在新 BB Codex `workspace-write` 线程内
+运行 `go env GOCACHE` 和小包构建，确认 Go 与 lint 缓存可写、未配置的 HOME 子目录仍拒绝写入。
+已有迁移软链时，等缓存写入者空闲后原子换成空目录。等沙箱验收通过并确认旧缓存没有进程引用，
+再删除旧的可重建内容。设计背景见 [设计文档 3.1](DEVCLOUD_STORAGE_DESIGN.md#31-共享-golint-缓存)。
 
 ## 7. 换机器复现顺序
 
@@ -343,7 +324,7 @@ go env GOCACHE
 3. **Docker**：`/etc/docker/daemon.json` 设 `"data-root": "/data/docker/lib"`，日志驱动
    `journald`；迁移已有 Docker 数据要在停写窗口做，不要热搬。
 4. **工具链**：Python 3.12.12、Node 24.22.1（pnpm 12）、Go；路径以本机实际安装为准。
-5. **共享缓存**：按第 6 节建目录和软链；旧缓存先复制、验证、再删。
+5. **共享缓存**：按第 6 节建标准目录、配置 Codex 可写根并验证。
 6. **快照**：按第 2 节分别部署全盘 Git、其他 storage-upkeep 与 clean-tmp 快照，复算 manifest、
    设 `0444/0555`、跑 `--help` 和预演。
 7. **crontab**：按第 3 节写 clean-tmp 行；`crontab -l` 回读。

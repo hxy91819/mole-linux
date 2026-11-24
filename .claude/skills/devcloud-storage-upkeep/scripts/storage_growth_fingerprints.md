@@ -9,8 +9,8 @@
 | `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（待 owner 决定；不自动删） |
 | `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（待 owner 决定；不自动删） |
 | `/data/codex` | Codex sessions |
-| `/data/bb-data/thread-storage/.shared-cache/go-build` | shared Go build cache |
-| `/data/bb-data/thread-storage/.shared-cache/golangci-lint` | shared golangci-lint cache |
+| `/root/.cache/go-build` | shared Go build cache |
+| `/root/.cache/golangci-lint` | shared golangci-lint cache |
 | `bb:threads` | BB thread directories |
 | `bb:non-thread` | BB root non-thread entries |
 | `docker:images` | Docker images |

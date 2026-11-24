@@ -63,14 +63,14 @@ BB 数据与自动化形态。它不覆盖 Mole 产品自身的清理逻辑，�
 | 位置 | 内容 | 为什么在这里 | 清理/恢复 |
 |---|---|---|---|
 | `/root/.cache`（除两个共享缓存） | 浏览器、Playwright、工具缓存 | 2026-11-14 从 `/data/cache-migrated` 迁回；系统盘已有空间 | 可重建；不自动整目录清 |
-| `/root/.cache/go-build`、`/root/.cache/golangci-lint` | 全机共享 Go/lint 缓存 | 软链到 `/data/bb-data/thread-storage/.shared-cache/`；见 3.1 | 只由 `go_cache_trim.py` 按 24h 修剪 |
+| `/root/.cache/go-build`、`/root/.cache/golangci-lint` | 全机共享 Go/lint 缓存 | 系统盘真实目录，见 3.1 | 只由 `go_cache_trim.py` 按 24h 修剪 |
 | `/root/.npm` | npm 的 `_cacache`、`_npx`、`_logs` | 2026-11-14 迁回系统盘；`_npx`/`_logs` 可能被在跑的 `npm exec` 持有 | `_cacache` 可重建但不自动清；不整目录删 |
 | `/root/go/pkg/mod` → `/data/root-dev-cache/go-pkg-mod` | Go module cache | 体积大、跨项目共享、重下载成本高 | 只有 owner 批准的 `go clean -modcache` |
 | `/data/.pnpm-store` | 共享 pnpm store，内含 v3/v10/v11 | 版本化 store 体积大、跨项目共享 | 每周日 05:30 逐版本 `pnpm store prune`；见 3.4 |
 | `/data/docker/lib` | Docker data-root（overlay2、volumes、buildkit） | 数据盘容量大；日志走 journald | 只用 Docker owner 命令；见 3.3 |
 | `/data/code` | 主 checkout、`*-worktrees` 附加 worktree | 这里是工作负载本身 | 全盘 Git 规则判定，受保护主树保留；见 3.5 |
 | `/data/codex` | Codex home、sessions、worktrees、backups | 会话数据，体积大，不能当缓存 | 不自动删；备份待 owner 决策 |
-| `/data/bb-data` | BB `thread-storage`、共享缓存 | BB 的线程产物和共享缓存；`/root/.bb/thread-storage` 软链到这里 | 只修剪 `.shared-cache`；线程目录按 BB/线程状态处理 |
+| `/data/bb-data` | BB `thread-storage` | BB 的线程产物，`/root/.bb/thread-storage` 软链到这里 | 线程目录按 BB/线程状态处理 |
 | `/root/.bb` | BB 主库 `bb.db`、artifacts、插件状态 | 系统盘上的 BB 自有数据 | 不自动删；升级备份按 3.6 处理 |
 | `/data/artifacts`、`/data/backups`、`/data/bb-backups`、`/data/bb-archives` | 产物与备份 | 数据类，可能含唯一副本 | 不自动删；owner 决策 |
 | `/data/root-storage-20260912` | 2026-09-12 迁到数据盘的 13 个目录的剩余部分 | 早期系统盘只有 100 GiB 时的迁移目标 | 现存 `.acpx/sessions`、`.cursor`、`.local` 等会话/状态；不按日期清 |
@@ -135,24 +135,13 @@ BB 数据与自动化形态。它不覆盖 Mole 产品自身的清理逻辑，�
 
 ### 3.1 共享 Go/lint 缓存
 
-**布局**
+本机 Go 构建与 golangci-lint 缓存分别位于系统盘的真实目录
+`/root/.cache/go-build` 和 `/root/.cache/golangci-lint`，供各项目共享。
 
-```text
-/root/.cache/go-build        -> /root/.bb/thread-storage/.shared-cache/go-build
-/root/.cache/golangci-lint   -> /root/.bb/thread-storage/.shared-cache/golangci-lint
-实际目标: /data/bb-data/thread-storage/.shared-cache/{go-build,golangci-lint}
-```
-
-**为什么放在这里**
-
-这是 lightspace 阶段 312–314 的产物，但作用域是全机：所有项目、所有 Agent、所有终端的
-Go 构建和 golangci-lint 都写这一份缓存。放 `/data/bb-data/thread-storage` 不是因为它属于
-某个线程，而是因为 BB 的 Codex 沙箱可写根只有工作区、`TMPDIR`、Git 目录和
-thread-storage，缓存目录不在其中（根因在 BB `apps/host-daemon/src/runtime-manager.ts` 的
-`runtimeWorkspaceWriteRoots`，再由
-`plugins/provider-codex/src/session-params.ts` 下发）。在沙箱里直接写
-`~/.cache/go-build` 会只读失败；软链到已经被放开的 thread-storage 是最小改动，不用改
-`sandbox_mode`、不用放开整个 `$HOME`、也不用改 BB 源码。
+早期 BB 只下发工作区、`TMPDIR`、Git 目录和 thread-storage 等可写根，lightspace 曾将两处缓存
+软链至 thread-storage 的 `.shared-cache`。从本机部署的 BB `fork-v0.49.0-20261122.1` 起，
+`provider-codex` 的 `readCodexWorkspaceWriteRoots` 读取实际 `CODEX_HOME/config.toml`，
+将 `sandbox_workspace_write.writable_roots` 合并到 BB 下发的沙箱根。两个标准目录可以直接写入。
 
 **维护**
 
@@ -166,15 +155,10 @@ thread-storage，缓存目录不在其中（根因在 BB `apps/host-daemon/src/r
 - Go 只会在条目被使用且 mtime 超过 1 小时时刷新 mtime（`cmd/go/internal/cache` 的
   `mtimeInterval`）。因此 24 小时门槛不会误删日内或隔夜还会复用的条目；2 小时会太激进，
   5 天则会让冷条目长期占盘。
-- 每日 DSH 检查解析同一个 realpath，检查总量不超过 100 GiB、且没有超过 1520 分钟的
-  `*-[ad]` 文件。`.shared-cache` 不是线程遗留，不得当普通 tmp 或线程目录删除。
+- 每日 DSH 检查标准路径及真实目录，核对各缓存不超过 100 GiB 且无超过 1520 分钟的 `*-[ad]` 文件。
+  增长计量从 `/root/.cache` 的同一遍历取得两项，水位刹车按系统盘水位派发 Go 缓存修剪。
 
-**长期修法**：BB 把 `$HOME/.cache/go-build`、`$HOME/.cache/golangci-lint` 加入
-`runtimeWorkspaceWriteRoots` 或 provider 的 `additionalWorkspaceWriteRoots` 后，软链和
-对 `/data` 的依赖都可以去掉。在此之前，软链是现行方案。
-
-**新机器 setup**：软链、验证和旧缓存处置的完整命令见
-[DEVCLOUD_AUTOMATION](DEVCLOUD_AUTOMATION.md)，本文只解释为什么放在这里。
+新机器配置见 [DEVCLOUD_AUTOMATION](DEVCLOUD_AUTOMATION.md) 第 6 节。
 
 ### 3.2 临时目录
 
@@ -311,7 +295,7 @@ BB script 的 timeout 最大 900 秒，不能因为更新失败而继续运行�
 
 - `/root/.bb` 在系统盘，放 `bb.db`（2026-11-14 约 12.7 GB）、artifacts、插件和部署检查点；
   `/root/.bb/thread-storage` 软链到 `/data/bb-data/thread-storage`，放线程产物和共享缓存。
-  BB 自有数据（主库、artifacts）不在自动清理范围；只有 `.shared-cache` 由本仓修剪。
+  BB 自有数据（主库、artifacts）不在自动清理范围。
 - 旧版会在删 worktree 后补删 BB 环境，2026-11-17 已停用此流程；当前任何未销毁环境都保护路径，
   查询失败保留，不调用环境删除。BB 本身的环境生命周期仍由 BB 管理，不由存储清理器代管。
 - 升级备份：`/data/bb-data/thread-storage/<thread>/upgrade-*` 只有在新版本稳定、owner 同意、
@@ -372,6 +356,7 @@ BB script 的 timeout 最大 900 秒，不能因为更新失败而继续运行�
 | 2026-11-14 | 11 个缓存/工具目录从 `/data` 迁回系统盘；保留会话、数据和大共享缓存 | 系统盘已扩容；`/data` 仍是工作负载盘，不能继续吞缓存 |
 | 2026-11-14 | pnpm 按 v3/v10/v11 逐版本 prune；共享 lint 缓存纳入同一 24h 规则 | 当前 pnpm 不会清旧版本 store；lint 和 Go 共用同一套缓存边界 |
 | 2026-11-14 | 本设计文档取代旧根目录设计文档 | 旧文按日期堆叠，过时小节多；设计、决策、教训需要单一入口 |
+| 2026-11-25 | BB 的 Codex `writable_roots` 已上线，Go/lint 缓存迁回标准路径 | provider 合并每个 Codex home 的两个可写根，缓存可在系统盘重建 |
 
 ## 6. 经验教训
 
@@ -398,7 +383,7 @@ BB script 的 timeout 最大 900 秒，不能因为更新失败而继续运行�
 | 删 worktree 后 BB 子线程无法继续对话 | BB 子线程绑定 worktree 目录；目录删除后 resume 请求全部失败 | 这是 BB 限制，不尝试重绑；清理前把 `.local` 诊断产物归档到主检出 `.local/worktree-archive/`，从归档开新线程 | `worktree-cleanup` SKILL.md「BB child threads bound to a worktree」；`cleanup_worktrees.py` |
 | 同名 worktree 归档 ref 互相覆盖 | 只用目录名做 ref | ref 带路径哈希 | `worktree_sweep.py`；`test_same_named_worktrees_get_distinct_archive_branches` |
 | `bb environment delete` 后以为分支没了 | 它只清环境记录，不删 Git ref | 每轮每个环境只试一次；409 保留；恢复命令写 JSONL | storage-rules「2026-11-14 owner 批准：worktree 删除及每轮补扫 BB 环境」；`test_matching_bb_environment_is_deleted_with_recovery_command_after_worktree_removal` |
-| Codex 沙箱写不了 `~/.cache/go-build` | 可写根不含缓存目录（只有工作区、TMPDIR、Git 目录和 thread-storage） | 软链到 `.shared-cache`；长期由 BB 加 writable root | 本文件 3.1；`go_cache_trim.py`；BB `runtimeWorkspaceWriteRoots` |
+| Codex 沙箱写不了 `~/.cache/go-build` | 可写根不含缓存目录（只有工作区、TMPDIR、Git 目录和 thread-storage） | 为当前 Codex home 配置标准缓存路径的 `writable_roots` | 本文件 3.1；`go_cache_trim.py`；BB `runtimeWorkspaceWriteRoots` |
 | 当前 pnpm 清不到旧版本 store | v3/v10/v11 是不同格式 | 按版本用 pnpm 9/10/12；显式共同根；版本不可得跳过 | storage-rules「pnpm store 每周日 05:30 owner prune」；`pnpm_store_prune.py` |
 | `npm exec vite` 被当成包安装阻塞 | 它不是 pnpm store 写入命令 | 只拦 pnpm 写 store 子命令；npm/npx/vite/pnpm run 不拦 | `pnpm_store_prune.py`；`test_pnpm_only_store_writers_block` |
 | 清理任务显示 `succeeded` 但从未跑过 | 只看单个状态字段，runCount 仍为 0 | 只认 schedule 触发的运行和真实 summary；`skipped` 也记录 | 每日检查 prompt；storage-rules「临时目录与 worktree」 |
@@ -485,7 +470,7 @@ cron 与刹车共用持锁包装入口，锁 fd 传给后台 timeout/执行器�
 
 
 2026-11-15计量分项修正：BB父根的日增混合共享缓存与会话，按父根报警会把正常夜间构建误判为数据泄漏。
-一次物理遍历拆出两共享Go缓存、thr_*目录合计和非线程条目；父根仍供Top5观察，缓存由每日大小/年龄检查兜底。
+当时一次物理遍历拆出两共享 Go 缓存、`thr_*` 目录合计和非线程条目。2026-11-25 起两缓存由 `/root/.cache` 遍历拆分，thread-storage 保留线程和非线程两项。
 60秒对/data大根不足，改顶层优先、单根780秒、全轮840秒、ionice空闲级，BB900秒上限内结束，保持07:30前可验收。
 Docker不直接du其物理树，以owner的system df四类数值比较；大根未测须单列，避免众多tmp条目掩盖覆盖缺口。
 

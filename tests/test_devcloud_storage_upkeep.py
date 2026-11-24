@@ -1244,6 +1244,14 @@ class GoCacheTrimTests(unittest.TestCase):
         self.assertTrue(link.is_symlink())
         self.assertEqual(target.read_bytes(), b'target-bytes')
 
+    def test_empty_lint_cache_waits_for_initialization(self):
+        lint = self.cache.parent / 'golangci-lint'
+        lint.mkdir()
+        with mock.patch.object(trim, 'lint_cache_directory', return_value=str(lint)):
+            rc, out, err = self.run_trim('--execute', '--quiet')
+        self.assertEqual((rc, out, err), (0, '', ''))
+        self.assertEqual(list(lint.iterdir()), [])
+
     def test_missing_go_cache_readme_deletes_nothing_and_exits_1(self):
         (self.cache / 'README').unlink()
         old = self.entry(4, 'a', 30, b'keep-me')
@@ -2141,8 +2149,11 @@ def test_watermark_thresholds(gib, expected):
     assert w.level(gib * w.GIB) == expected
 
 
-@pytest.mark.parametrize('disk,count', [('/', 1), ('/data', 5)])
-def test_watermark_selects_only_low_disk_and_prints_trigger_summary(watermark_case, monkeypatch, capsys, disk, count):
+@pytest.mark.parametrize('disk,expected', [
+    ('/', ['auto_vad6yvkpdeq', '/var/tmp']),
+    ('/data', ['auto_1ih1erjpbqo', 'auto_hukidoavox0', 'auto_yfr5p14dvnc', '/data/system-tmp']),
+])
+def test_watermark_selects_only_low_disk_and_prints_trigger_summary(watermark_case, monkeypatch, capsys, disk, expected):
     w, calls = watermark_case
     monkeypatch.setattr(w, 'available', lambda p: (100 if p == disk else 200) * w.GIB)
     invoked = []
@@ -2150,8 +2161,7 @@ def test_watermark_selects_only_low_disk_and_prints_trigger_summary(watermark_ca
     assert w.main([]) == 0
     output = capsys.readouterr().out
     assert len(output.splitlines()) == 1 and f'{disk} warning' in output
-    assert invoked == [aid for _, aid in w.TASKS[disk]] and len(invoked) == count
-    assert 'auto_3jiqtmzreq8' not in invoked  # Retired clone automation is a no-op.
+    assert invoked == expected
     assert len(calls) == 1 and calls[0][:3] == ('thread', 'tell', 'thr_tikzbd34dg')
 
 
@@ -2608,8 +2618,8 @@ def test_growth_copied_snapshot_uses_own_fingerprints_after_workspace_changes(tm
 def test_growth_v3_parent_and_shared_cache_growth_are_observe_only(tmp_path, monkeypatch):
     g = load_upkeep('storage_growth_measure')
     roots = ['/data/bb-data', '/data/bb-data/thread-storage',
-             '/data/bb-data/thread-storage/.shared-cache/go-build',
-             '/data/bb-data/thread-storage/.shared-cache/golangci-lint']
+             '/root/.cache/go-build',
+             '/root/.cache/golangci-lint']
     rows = [{'root': root, 'status': 'ok', 'bytes': 50 * g.GIB} for root in roots]
     monkeypatch.setattr(g, 'OUT', tmp_path)
     monkeypatch.setattr(g, 'discover', lambda: (roots, []))
@@ -2647,13 +2657,29 @@ def test_growth_v3_thread_storage_partition_is_complete():
                ts + '/.shared-cache/golangci-lint': 20, ts + '/.shared-cache/extra': 2}
     output = ''.join(f'{size}\t{root}\0' for root, size in records.items())
     rows = {row['root']: row for row in g.split_bb_output(output, {'thr_a', 'thr_b'})}
-    assert rows[ts + '/.shared-cache/go-build']['bytes'] == 80
-    assert rows[ts + '/.shared-cache/golangci-lint']['bytes'] == 20
     assert rows['bb:threads']['bytes'] == 80
     assert rows['bb:threads']['entries'] == 2
-    assert rows['bb:non-thread']['bytes'] == 40  # leftovers, direct files, shared extras and metadata
-    assert sum(rows[root]['bytes'] for root in ('bb:threads', 'bb:non-thread',
-        ts + '/.shared-cache/go-build', ts + '/.shared-cache/golangci-lint')) == rows[ts]['bytes']
+    assert rows['bb:non-thread']['bytes'] == 140
+    assert rows['bb:non-thread']['entries'] == 4
+    assert rows['bb:threads']['bytes'] + rows['bb:non-thread']['bytes'] == rows[ts]['bytes']
+    assert set(rows) == {base, ts, 'bb:threads', 'bb:non-thread'}
+
+
+def test_growth_reports_go_caches_from_their_standard_parent(monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    parent = '/root/.cache'
+    records = {parent: 120, parent + '/go-build': 80, parent + '/golangci-lint': 20}
+    output = ''.join(f'{size}\t{path}\0' for path, size in records.items())
+    run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, output, ''))
+    monkeypatch.setattr(g.subprocess, 'run', run)
+    rows = g.measure_job(parent, time.monotonic() + 1)
+    assert run.call_count == 1
+    assert {row['root']: row['bytes'] for row in rows} == records
+    for row in rows:
+        if row['root'] != parent:
+            assert row['parent'] == parent
+            assert g.alert_exclusion(row['root'])
+            assert g.owner(row['root'], g.fingerprints()) != 'unknown'
 
 
 def test_growth_v3_docker_categories_are_numeric_and_comparable():
@@ -2902,7 +2928,7 @@ def test_growth_v5_null_du_preserves_vanished_on_scan_parent(monkeypatch, root):
 def test_growth_v5_bb_partition_keeps_vanished_once(monkeypatch):
     g = load_upkeep('storage_growth_measure')
     records = {g.BB_DATA: 32, g.BB_STORAGE: 28, g.BB_STORAGE + '/.shared-cache': 16,
-               g.GO_CACHE: 8, g.LINT_CACHE: 4, g.BB_STORAGE + '/thr_a': 8,
+               g.BB_STORAGE + '/thr_a': 8,
                g.BB_STORAGE + '/leftover': 4}
     output = ''.join(f'{size}\t{path}\0' for path, size in records.items())
     error = f"du: cannot access '{g.BB_STORAGE}/gone': No such file or directory\n"
@@ -2912,7 +2938,7 @@ def test_growth_v5_bb_partition_keeps_vanished_once(monkeypatch):
     entries.__enter__.return_value = iter([entry])
     monkeypatch.setattr(g.os, 'scandir', lambda _: entries)
     rows = g.measure_job(g.BB_DATA, time.monotonic() + 1)
-    assert len(rows) == 6 and all(row['status'] == 'ok' for row in rows)
+    assert len(rows) == 4 and all(row['status'] == 'ok' for row in rows)
     assert next(row for row in rows if row['root'] == g.BB_DATA)['vanished'] == 1
     assert sum(row.get('vanished', 0) for row in rows) == 1
 
@@ -3031,8 +3057,8 @@ def test_growth_every_fingerprint_matches_an_owned_latest_metric(tmp_path, monke
         '/data/root-storage-20260912': ['root/.local/share/pnpm/store', 'root/.local/share/cursor-agent/versions'],
         '/data/root-migrated': ['agent-state/cursor/projects/mono2/sdk-agent-store/a/agents',
                                 'agent-state/bb-deployment-checkpoints'],
-        '/data/bb-data': ['thread-storage', 'thread-storage/.shared-cache',
-                         'thread-storage/.shared-cache/go-build', 'thread-storage/.shared-cache/golangci-lint'],
+        '/data/bb-data': ['thread-storage'],
+        '/root/.cache': ['go-build', 'golangci-lint'],
     }
 
     def probe(root, command, deadline):

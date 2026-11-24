@@ -1,6 +1,6 @@
 <!--
 本文件是 BB agent 任务 auto_5gacevqssoe（project proj_8d3wrcajxn）的唯一 prompt 来源。
-更新后在 /data/code/mole-linux 运行 python3 -I scripts/sync_daily_check_prompt.py --apply。
+更新后在 /data/code/mole-linux 运行 python3 -I scripts/sync_daily_check_prompt.py --apply，再运行 --check。
 -->
 # 每日存储检查（只读）
 
@@ -17,14 +17,14 @@
    - auto_idedelow-3g（水位刹车，每 15 分钟）：25 分钟。
    - auto_u4kos3to-di（增长计量，每天 07:00）：25 小时。
    有不正常的运行时，用同样的 `--output <runId>` 取那次运行的输出作为证据。
-2. 两个共享 Go 缓存确实在被修剪。分别解析真实目录：`readlink -f "$(go env GOCACHE)"` 与 `readlink -f /root/.cache/golangci-lint`。对每个真实根，`du -sx -B1 "<真实根>"` 都不超过 107374182400（100 GiB）；`find "<真实根>" -mindepth 2 -maxdepth 2 -type f -name '*-[ad]' -mmin +1520 -print -quit` 没有输出。每小时修剪24小时没用过的条目，两根均不该留下超过1520分钟的哈希条目；分别列出大小与最老条目检查结果。
+2. 核对 `go env GOCACHE` 返回 `/root/.cache/go-build`，且该路径与 `/root/.cache/golangci-lint` 都是真实目录（`test -d` 成功、`test -L` 失败）。分别核对 `du -sx -B1 "<缓存目录>"` 不超过 107374182400（100 GiB），且 `find "<缓存目录>" -mindepth 2 -maxdepth 2 -type f -name '*-[ad]' -mmin +1520 -print -quit` 无输出。每小时修剪 24 小时没用过的条目，分别列出实测路径、大小和最老条目检查结果。
 3. /tmp 与 /var/tmp 清理（cron 每天 03:30）。`/data/metrics/devcloud-clean-tmp.log` 每行一个 JSON。分别按 `path` 为 `/data/system-tmp` 和 `/var/tmp`，找 `ts` 晚于最近一次 03:30 的第一条 `"event": "summary"`；两根各自都必须存在，`status` 为 `ok`，`failed` 为 0，`scan` 为 `complete`。缺任一根的 summary 都算不符合。列出两根的 `skipped` 和 `skipped_reasons`。复核发现活引用或候选变化而保留的项计入 `skipped`，属于正常。`deferred_reason` 为 `execution budget` 的递延属于正常。若 `failed` 大于 0，摘录对应 `event=failed` 的路径和错误。再看 `/data/metrics/devcloud-clean-tmp.stderr.log` 的修改时间：晚于最近一次 03:30 就算不符合，并贴出它的末尾 20 行。
 4. systemd-tmpfiles 不再按年龄清 /tmp。`/etc/tmpfiles.d/tmp.conf` 里 `/tmp` 那一行的第 6 列（年龄）是 `-`；`systemctl show systemd-tmpfiles-clean.service -p Result --value` 输出 `success`。
 5. 两块盘的容量。`df -B1 --output=avail /data` 和 `df -B1 --output=avail /`（系统盘）的可用字节都不少于 161061273600（150 GiB）。
 6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`schema_version` 为3，`ts` 距 NOW 不超过25小时；07:00计量任务必须已经结束，单根预算780秒、全轮840秒、任务超时900秒，应在07:30前完成。
    - 列 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`。归属按当前计量任务指向快照内的 `storage_growth_fingerprints.md` 核对，unknown 不猜测项目；父子根不相加。
    - 核 `fingerprint_coverage`：`missing_exact` 非空须报告准确路径并算不符合；`unmatched_globs` 单列观察，临时生产者当天无目录可以正常不命中。
-   - 单列 thread-storage 四项的 bytes、归属与可用的日增：`.shared-cache/go-build`、`.shared-cache/golangci-lint`（两项为完整路径）、`bb:threads`（thr_*真实目录合计）、`bb:non-thread`（非线程条目，排除前两项，含共享缓存其余项与目录元数据）。父根 `/data/bb-data`、`/data/bb-data/thread-storage`、`/data/system-tmp`、`/data/code`、`/root/.cache` 只观察Top5，不重复报警；code/cache按直接子项展示，父子根不叠加；两共享Go缓存由第2项大小/年龄兜底，不参与20GiB/天告警。排除原因在 `alert_excluded`。
+   - 单列 `/root/.cache/go-build`、`/root/.cache/golangci-lint`、`bb:threads`（`thr_*` 真实目录合计）、`bb:non-thread`（thread-storage 的其余空间，含目录元数据）的 bytes、归属与可用的日增。Go/lint 来自 `/root/.cache` 的直接子项，由第 2 项检查大小和年龄，增长告警排除原因见 `alert_excluded`。父根 `/data/bb-data`、`/data/bb-data/thread-storage`、`/data/system-tmp`、`/data/code`、`/root/.cache` 只观察 Top5。code/cache 按直接子项展示，父子根不叠加。
    - Cursor 由 Personal 的 `auto_bgngb9bbyqk`（04:22）更新后清理；核对该任务的最新 schedule 记录及 `~/.local/state/agent-cli-updates/cursor.json`。版本校验失败或清理错误算不符合；有活进程引用的版本保留。
    - 单列 `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` 和 `/data/root-storage-20260912/root/.local/share/pnpm/store` 的 bytes、日增、owner 与清理任务；迁移父根和中间节点只观察。两个已登记子项也适用下述三次持续增长规则。
    - 单列 `/data/code/mono2/.worktrees`（owner=mono2 agent worktrees，清理方=linked/clone sweep；`/data/code/mono2` 总量只观察）、
