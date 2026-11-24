@@ -23,10 +23,11 @@
 5. 两块盘的容量。`df -B1 --output=avail /data` 和 `df -B1 --output=avail /`（系统盘）的可用字节都不少于 161061273600（150 GiB）。
 6. 读取 `/var/lib/devcloud-storage-upkeep/metrics/latest.json`：`schema_version` 为3，`ts` 距 NOW 不超过25小时；07:00计量任务必须已经结束，单根预算780秒、全轮840秒、任务超时900秒，应在07:30前完成。
    - 列 `top5` 的根、`daily_bytes`（按 `interval_seconds` 折算日增）、`owner`。归属按当前计量任务指向快照内的 `storage_growth_fingerprints.md` 核对，unknown 不猜测项目；父子根不相加。
+   - 核 `fingerprint_coverage`：`missing_exact` 非空须报告准确路径并算不符合；`unmatched_globs` 单列观察，临时生产者当天无目录可以正常不命中。
    - 单列 thread-storage 四项的 bytes、归属与可用的日增：`.shared-cache/go-build`、`.shared-cache/golangci-lint`（两项为完整路径）、`bb:threads`（thr_*真实目录合计）、`bb:non-thread`（非线程条目，排除前两项，含共享缓存其余项与目录元数据）。父根 `/data/bb-data`、`/data/bb-data/thread-storage`、`/data/system-tmp`、`/data/code`、`/root/.cache` 只观察Top5，不重复报警；code/cache按直接子项展示，父子根不叠加；两共享Go缓存由第2项大小/年龄兜底，不参与20GiB/天告警。排除原因在 `alert_excluded`。
    - Cursor 由 Personal 的 `auto_bgngb9bbyqk`（04:22）更新后清理；核对该任务的最新 schedule 记录及 `~/.local/state/agent-cli-updates/cursor.json`。版本校验失败或清理错误算不符合；有活进程引用的版本保留。
    - 单列 `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` 和 `/data/root-storage-20260912/root/.local/share/pnpm/store` 的 bytes、日增、owner 与清理任务；迁移父根和中间节点只观察。两个已登记子项也适用下述三次持续增长规则。
-   - 单列 `/data/code/mono2/.worktrees`（owner=mono2 agent worktrees，清理方=linked/clone sweep）、
+   - 单列 `/data/code/mono2/.worktrees`（owner=mono2 agent worktrees，清理方=linked/clone sweep；`/data/code/mono2` 总量只观察）、
      `/data/root-migrated/agent-state/cursor/projects`（owner=BB Cursor provider sessions）和
      `/data/root-migrated/agent-state/bb-deployment-checkpoints`（owner=BB deployment checkpoints）。后两项清理策略均为
      “待 owner 决定”，不自动删除；root-migrated 父根及中间目录只观察，子项按三次持续增长规则。

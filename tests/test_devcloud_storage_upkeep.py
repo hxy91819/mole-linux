@@ -2359,7 +2359,7 @@ def test_growth_root_migrated_splits_cursor_sessions_and_checkpoints(monkeypatch
 def test_growth_fingerprints_assign_mono2_and_root_migrated_owners():
     g = load_upkeep('storage_growth_measure')
     rules = g.fingerprints()
-    assert g.owner('/data/code/mono2/.worktrees/agent-1', rules).startswith('mono2 agent worktrees')
+    assert g.owner('/data/code/mono2/.worktrees', rules).startswith('mono2 agent worktrees')
     assert g.owner('/data/root-migrated/agent-state/cursor/projects', rules).startswith('BB Cursor provider sessions')
     assert g.owner('/data/root-migrated/agent-state/bb-deployment-checkpoints', rules).startswith('BB deployment checkpoints')
 
@@ -2838,7 +2838,7 @@ def test_growth_v4_child_measurements_share_one_physical_walk(monkeypatch, root)
     def run(cmd, **kw):
         calls.append(cmd)
         assert cmd[:2] == ['ionice', '-c3']
-        assert '--max-depth=1' in cmd and '--null' in cmd
+        assert ('--max-depth=2' if root == '/data/code' else '--max-depth=1') in cmd and '--null' in cmd
         return subprocess.CompletedProcess(cmd, 0, output, '')
     monkeypatch.setattr(g.subprocess, 'run', run)
     rows = g.measure_job(root, time.monotonic() + 1)
@@ -3010,3 +3010,54 @@ def test_pnpm_inventory_only_tolerates_vanished_entries():
     assert p.local.vanished_only(vanished)
     assert not p.local.vanished_only(vanished + denied)
     assert not p.local.vanished_only(b'')
+
+
+def test_growth_every_fingerprint_matches_an_owned_latest_metric(tmp_path, monkeypatch):
+    g = load_upkeep('storage_growth_measure')
+    # A fixture host with all optional producers present. Paths are independent
+    # of the fingerprint table, so a typo or an unmeasured layout fails here.
+    listings = {
+        '/data': ['code', 'bb-data', 'codex', 'itfs', '.pnpm-store', 'system-tmp',
+                  'root-migrated', 'root-storage-20260912'],
+        '/root/.bb': ['logs'],
+        '/data/system-tmp': ['oc-local-smoke-fixture', 'saiens_bundle-fixture',
+                             'saienscreditsystemrails_fixture', 'fast-feedback-rules-followup_fixture',
+                             'scan-preview-drag-experiment_fixture'],
+    }
+    monkeypatch.setattr(g.Path, 'iterdir', lambda p: [p / n for n in listings[str(p)]])
+    monkeypatch.setattr(g, 'OUT', tmp_path)
+    direct = {
+        '/data/code': ['mono2', 'mono2/.worktrees', 'mono2/unrelated'],
+        '/data/root-storage-20260912': ['root/.local/share/pnpm/store', 'root/.local/share/cursor-agent/versions'],
+        '/data/root-migrated': ['agent-state/cursor/projects/mono2/sdk-agent-store/a/agents',
+                                'agent-state/bb-deployment-checkpoints'],
+        '/data/bb-data': ['thread-storage', 'thread-storage/.shared-cache',
+                         'thread-storage/.shared-cache/go-build', 'thread-storage/.shared-cache/golangci-lint'],
+    }
+
+    def probe(root, command, deadline):
+        depth = next(int(arg.split('=')[1]) for arg in command if arg.startswith('--max-depth='))
+        sizes = [f'100\t{root}\0'] + [
+            f'10\t{root}/{suffix}\0' for suffix in direct.get(root, []) if len(suffix.split('/')) <= depth]
+        return {'status': 'ok', 'output': ''.join(sizes), 'elapsed_seconds': 1}
+
+    monkeypatch.setattr(g, 'probe', probe)
+    monkeypatch.setattr(g.os, 'scandir', lambda _: contextlib.nullcontext([]))
+    monkeypatch.setattr(g, 'measure', lambda root, deadline:
+                        {'root': root, 'status': 'ok', 'output': DOCKER_DF_STUB}
+                        if root == 'docker system df' else {'root': root, 'status': 'ok', 'bytes': 1})
+    assert g.main([]) == 0
+    latest = json.loads((tmp_path / 'latest.json').read_text())
+    assert latest['fingerprint_coverage'] == {'missing_exact': [], 'unmatched_globs': []}
+    rows = {row['root']: row for row in latest['rows']}
+    assert rows['/data/code/mono2/.worktrees']['bytes'] == 10
+    assert rows['/data/code/mono2/.worktrees']['owner'].startswith('mono2 agent worktrees')
+    assert rows['/data/code/mono2']['alert_excluded']
+    assert '/data/code/mono2/unrelated' not in rows
+
+
+def test_growth_fingerprint_coverage_distinguishes_missing_paths_and_globs():
+    g = load_upkeep('storage_growth_measure')
+    rules = [('/a/*', 'broad'), ('/a/child', 'shadowed'), ('/typo', 'missing'), ('/tmp/job-*', 'optional')]
+    assert g.fingerprint_coverage([{'root': '/a/child'}], rules) == {
+        'missing_exact': ['/a/child', '/typo'], 'unmatched_globs': ['/tmp/job-*']}

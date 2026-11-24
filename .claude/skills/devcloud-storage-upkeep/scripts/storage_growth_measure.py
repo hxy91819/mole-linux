@@ -25,6 +25,8 @@ BB_STORAGE = BB_DATA + '/thread-storage'
 GO_CACHE = BB_STORAGE + '/.shared-cache/go-build'
 LINT_CACHE = BB_STORAGE + '/.shared-cache/golangci-lint'
 BB_ROOTS = (BB_DATA, BB_STORAGE, GO_CACHE, LINT_CACHE, 'bb:threads', 'bb:non-thread')
+MONO2 = '/data/code/mono2'
+MONO2_WORKTREES = MONO2 + '/.worktrees'
 ROOT_STORAGE = '/data/root-storage-20260912'
 ROOT_MIGRATED = '/data/root-migrated'
 ROOT_MIGRATED_SESSIONS = ROOT_MIGRATED + '/agent-state/cursor/projects'
@@ -45,7 +47,7 @@ def unknown(root, error):
 
 
 def alert_exclusion(root):
-    if root in ROOT_STORAGE_BRANCHES or root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage', '/data/system-tmp', '/data/code', '/root/.cache', ROOT_MIGRATED):
+    if root in ROOT_STORAGE_BRANCHES or root in (BB_DATA, BB_STORAGE, '/root/.bb/thread-storage', '/data/system-tmp', '/data/code', '/root/.cache', ROOT_MIGRATED, MONO2):
         return 'parent aggregate; alert on components'
     if root in (GO_CACHE, LINT_CACHE):
         return 'shared Go cache; daily check 2 owns size and age limits'
@@ -88,6 +90,15 @@ def fingerprints(path=RULES):
 
 def owner(root, rules):
     return next((name for pattern, name in rules if fnmatch.fnmatchcase(root, pattern)), 'unknown')
+
+
+def fingerprint_coverage(rows, rules):
+    # Require the fingerprint to actually win the first-match attribution.
+    matched = {next((pattern for pattern, _ in rules if fnmatch.fnmatchcase(row['root'], pattern)), None)
+               for row in rows}
+    unmatched = [pattern for pattern, _ in rules if pattern not in matched]
+    return {'missing_exact': [pattern for pattern in unmatched if not any(c in pattern for c in '*?[')],
+            'unmatched_globs': [pattern for pattern in unmatched if any(c in pattern for c in '*?[')]}
 
 
 def vanished_du_notes(root, command, result):
@@ -169,7 +180,7 @@ def du_sizes(output):
 
 def measure_children(root, deadline):
     # Reporting depth only: du still walks descendants once and deduplicates inodes.
-    depth = 5 if root == ROOT_STORAGE else 1
+    depth = 5 if root == ROOT_STORAGE else 2 if root == '/data/code' else 1
     branches = ROOT_STORAGE_BRANCHES if root == ROOT_STORAGE else {root}
     row = probe(root, ['du', '-ax', '-B1', f'--max-depth={depth}', '--null', '--', root], deadline)
     if row['status'] != 'ok':
@@ -182,7 +193,9 @@ def measure_children(root, deadline):
                  'parent': root if path != root else None,
                  'elapsed_seconds': row['elapsed_seconds'],
                  **(du_notes(row) if path == root else {})}
-                for path, size in sizes.items() if path == root or str(Path(path).parent) in branches]
+                for path, size in sizes.items()
+                if path == root or str(Path(path).parent) in branches
+                or (root == '/data/code' and path == MONO2_WORKTREES)]
     except (ValueError, KeyError) as error:
         return [unknown(root, error)]
 
@@ -432,6 +445,7 @@ def main(argv=None):
            'interval_seconds': now - previous['ts'] if previous else None,
            'elapsed_seconds': round(time.monotonic() - started, 3),
            'rows': rows, 'comparisons': comparisons, 'top5': top5, 'alerts': alerts,
+           'fingerprint_coverage': fingerprint_coverage(rows, rules),
            'unknown_count': sum(row['status'] == 'unknown' for row in rows)}
     OUT.mkdir(parents=True, exist_ok=True)
     atomic_write(OUT / (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime(now)) + '.json'), out)

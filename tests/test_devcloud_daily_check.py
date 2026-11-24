@@ -2,7 +2,10 @@
 from datetime import date, datetime, time, timedelta
 import importlib.util
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
 import sys
 
 import pytest
@@ -20,6 +23,37 @@ def load(path):
 
 
 daily = load(SCRIPTS / 'daily_git_cleanup_check.py')
+
+
+@pytest.mark.parametrize('missing_cli', [False, True])
+def test_precommit_rejects_unsynced_staged_prompt_even_when_worktree_matches(tmp_path, missing_cli):
+    prompt = tmp_path / 'docs/DEVCLOUD_DAILY_CHECK_PROMPT.md'
+    prompt.parent.mkdir()
+    script = tmp_path / 'scripts/sync_daily_check_prompt.py'
+    script.parent.mkdir()
+    shutil.copyfile(ROOT / 'scripts/sync_daily_check_prompt.py', script)
+    subprocess.run(['git', 'init', '-q'], cwd=tmp_path, check=True)
+    prompt.write_text('staged prompt\n')
+    subprocess.run(['git', 'add', str(prompt)], cwd=tmp_path, check=True)
+    prompt.write_text('live prompt\n')
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    for name in ('git', 'grep', 'bash'):
+        (bin_dir / name).symlink_to(shutil.which(name))
+    (bin_dir / 'python3').symlink_to(sys.executable)
+    if not missing_cli:
+        bb = bin_dir / 'bb'
+        bb.write_text('#!/bin/sh\n'
+                      """printf '%s\\n' '{"id":"auto_5gacevqssoe","projectId":"proj_8d3wrcajxn","execution":{"mode":"agent","prompt":"live prompt\\n"}}'\n""")
+        bb.chmod(0o755)
+    out = subprocess.run([shutil.which('bash'), str(ROOT / '.githooks/pre-commit')],
+                         cwd=tmp_path, env=dict(os.environ, PATH=str(bin_dir)),
+                         capture_output=True, text=True)
+    assert out.returncode == 1
+    if missing_cli:
+        assert 'BB CLI (bb) is required' in out.stdout
+    else:
+        assert '+staged prompt' in out.stdout and '--apply' in out.stdout
 sweep = load(SCRIPTS / 'git_tree_sweep.py')
 GIB = 2**30
 DAYS = [date(2026, 11, 21) + timedelta(days=i) for i in range(3)]

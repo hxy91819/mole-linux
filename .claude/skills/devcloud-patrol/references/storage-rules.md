@@ -344,7 +344,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | `/data/.pnpm-store` | pnpm store (pnpm_store_prune.py) |
 | `/data/root-storage-20260912/root/.local/share/pnpm/store` | pnpm store (pnpm_store_prune.py) |
 | `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` | agent-cli-updates 更新器 |
-| `/data/code/mono2/.worktrees/*` | mono2 agent worktrees（linked/clone sweep） |
+| `/data/code/mono2/.worktrees` | mono2 agent worktrees（linked/clone sweep） |
 | `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（待 owner 决定；不自动删） |
 | `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（待 owner 决定；不自动删） |
 | `/data/codex` | Codex sessions |

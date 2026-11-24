@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位刹车使用快照 `50d05aa5be8479af`，增长计量使用快照 `31f659fdce311fe3`：
+水位刹车使用快照 `50d05aa5be8479af`，增长计量使用快照 `a6bfeb050692aac2`：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -40,6 +40,9 @@ Docker、Go、全盘 Git 清理、pnpm 与 clean-tmp `/data/system-tmp`，/ 对�
 `/data/code`、`/root/.cache` 各用一次物理 du 遍历输出父根与直接子项；只增加输出深度，
 不对每个子目录重新遍历，硬链接仍由同一次du去重。它们与 `/data/system-tmp`、两个BB父根
 只进Top5、不告警，`alert_excluded` 标明聚合原因。未登记子目录保持unknown，不凭名字猜归属。
+同一次 `/data/code` 扫描另外输出 `/data/code/mono2/.worktrees`，mono2 父根只观察。
+报告的 `fingerprint_coverage` 列出未命中的精确指纹和通配指纹；精确项缺失需要排查，
+临时目录通配规则当天无匹配不告警。
 不再 du `/data/docker`；`docker system df --format '{{json .}}'` 一次取得镜像、容器、卷、
 构建缓存四类 Size，转为数值 bytes，以 `docker:images`、`docker:containers`、
 `docker:volumes`、`docker:build-cache` 比较。缺类、失败或超时标unknown，不推成0。
@@ -125,6 +128,7 @@ Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md) 是唯一来源。改完运行
 `python3 -I scripts/sync_daily_check_prompt.py --apply`，脚本更新 BB 并回读比对完整内容（含末尾换行）。
 每日检查运行同一脚本的 `--check`；不同则输出 diff 并以非零退出。
+暂存 prompt 时，pre-commit 比对 Git 索引内的版本；缺少 BB CLI 或内容不一致都阻止提交。
 协调线程换了也要同步改 prompt 里的 `bb thread tell` 目标。每日检查只看 `trigger=schedule`
 的运行，`manual` 是人工测试，不算周期成功。
 

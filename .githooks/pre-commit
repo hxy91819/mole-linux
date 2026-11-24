@@ -33,6 +33,18 @@ DEVCLOUD_STAGED=$(git diff --cached --name-only --no-renames -- \
 
 FAILED=0
 
+# The staged prompt is the one being committed, even in a partial commit.
+if [[ -n "$(git diff --cached --name-only --no-renames -- docs/DEVCLOUD_DAILY_CHECK_PROMPT.md)" ]]; then
+    if ! command -v bb > /dev/null 2>&1; then
+        _fail "BB CLI (bb) is required on PATH to check the staged daily prompt."
+        exit 1
+    fi
+    if ! python3 -I scripts/sync_daily_check_prompt.py --check --staged; then
+        _fail "Daily prompt check failed. Run python3 -I scripts/sync_daily_check_prompt.py --apply and stage the matching prompt."
+        exit 1
+    fi
+fi
+
 # --- 1. Shell syntax check (fast, no tool required) ---
 if [[ -n "$HAS_SHELL" ]]; then
     _info "Shell syntax check..."
