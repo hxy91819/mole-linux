@@ -6,11 +6,15 @@ import { existsSync, lstatSync, readdirSync, readFileSync, readlinkSync,
 import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
 
 const DAY = 86_400_000;
 const AGENT_ID = /^agent-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const SESSION_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const ARCHIVE_ID = new RegExp(`^checkpoint:(${AGENT_ID.source.slice(1, -1)}):${SESSION_ID.source.slice(1, -1)}$`);
+const ARCHIVE_FILE = /^[0-9a-f]{64}\.db$/;
+const SIDECARS = ['-wal', '-shm', '-journal'];
 const TERMINAL_RUN = new Set(['FINISHED', 'ERROR', 'CANCELLED', 'EXPIRED']);
 const INACTIVE_THREAD = new Set(['idle', 'error']);
 const missing = (error) => ['ENOENT', 'ESRCH'].includes(error.code);
@@ -114,12 +118,15 @@ function sessionOwners(acp) {
       try {
         for (const line of readFileSync(path, 'utf8').split('\n').filter(Boolean)) {
           const row = JSON.parse(line);
-          if (row.sessionId !== session || !AGENT_ID.test(row.sdkSessionId) ||
+          if (row.sessionId !== session ||
             !['session_meta', 'session_checkpoint'].includes(row.type) || !isAbsolute(row.cwd ?? '')) continue;
+          const agentId = AGENT_ID.test(row.sdkSessionId) ? row.sdkSessionId :
+            row.type === 'session_checkpoint' ? ARCHIVE_ID.exec(row.sdkSessionId)?.[1] : undefined;
+          if (!agentId) continue;
           if (row.type === 'session_checkpoint' && row.checkpointId !== row.sdkSessionId) {
             throw new Error('checkpoint ID disagrees with SDK agent ID');
           }
-          records.add(JSON.stringify([row.cwd, row.sdkSessionId]));
+          records.add(JSON.stringify([row.cwd, agentId]));
         }
       } catch (error) {
         throw new Error('cannot validate ACP history ' + path, { cause: error });
@@ -283,6 +290,138 @@ function publicItem(plan) {
   return { agent_id: plan.agent_id, path: plan.path, thread_ids: plan.threads, bytes: plan.bytes };
 }
 
+function archiveFiles(path, archiveRoot, mountPaths) {
+  return ['', ...SIDECARS].flatMap((suffix) => {
+    const file = path + suffix;
+    if (mounted(file, archiveRoot, mountPaths)) throw new Keep('mount intersects checkpoint archive');
+    const stat = physical(file, Boolean(suffix));
+    if (!stat) return [];
+    if (!stat.isFile() || stat.nlink !== 1) throw new Keep('unexpected checkpoint archive file');
+    return [{ path: file, stat }];
+  });
+}
+
+function checkArchiveRefs(plan, refs) {
+  const token = hash(plan.agent_id);
+  if (refs.some((path) => path === plan.path || SIDECARS.some((suffix) => path === plan.path + suffix) ||
+    path.includes('/agents/agent-' + token + '/') || path.includes('/acp-run-owners/' + token + '/'))) {
+    throw new Keep('live checkpoint archive or SDK source reference');
+  }
+}
+
+function checkArchiveIdentity(db, plan) {
+  const snapshots = db.prepare('SELECT id, agent FROM snapshots').all();
+  if (!snapshots.length || snapshots.some((snapshot) => {
+    const agent = JSON.parse(snapshot.agent);
+    return ARCHIVE_ID.exec(snapshot.id)?.[1] !== plan.agent_id ||
+      agent.agentId !== plan.agent_id || agent.cwd !== plan.workspace;
+  })) throw new Keep('checkpoint archive identity disagrees with ACP');
+}
+
+function checkArchiveSource(plan, roots, projects, mountPaths) {
+  const workspaceHash = createHash('md5').update(plan.workspace).digest('hex');
+  const token = hash(plan.agent_id);
+  for (const state of roots.get(workspaceHash) ?? []) {
+    if (physical(join(state, 'agents', 'agent-' + token), true) ||
+      physical(join(state, 'acp-run-owners', token), true)) throw new Keep('checkpoint archive source files retained');
+    const path = join(state, 'index.db');
+    if (!physical(path, true)) continue;
+    checkCatalog(state, projects, mountPaths);
+    const db = ro(path);
+    try {
+      if (db.prepare('SELECT 1 FROM agents WHERE agent_id=? UNION SELECT 1 FROM runs WHERE agent_id=?')
+        .get(plan.agent_id, plan.agent_id)) throw new Keep('checkpoint archive source retained');
+    } finally {
+      db.close();
+    }
+  }
+}
+
+function eraseArchive(plan, { root, bb, cutoff, currentRefs, sdkRoots, projects }) {
+  const uri = pathToFileURL(plan.path);
+  uri.searchParams.set('mode', 'rw');
+  const db = new DatabaseSync(uri);
+  try {
+    // Exclusive locking also excludes WAL readers. Keep the lock across the
+    // journal switch so SQLite flushes its WAL before any paths are removed.
+    db.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE');
+    const [{ stat }] = archiveFiles(plan.path, root, mounts());
+    if (stat.dev !== plan.stat.dev || stat.ino !== plan.stat.ino ||
+      stat.mtimeMs !== plan.stat.mtimeMs || stat.ctimeMs !== plan.stat.ctimeMs) {
+      throw new Keep('checkpoint archive changed after preview');
+    }
+    checkArchiveIdentity(db, plan);
+    db.exec('COMMIT');
+    if (db.prepare('PRAGMA journal_mode=DELETE').get().journal_mode !== 'delete') {
+      throw new Keep('checkpoint archive journal still in use');
+    }
+    db.exec('BEGIN EXCLUSIVE');
+    const mountPaths = mounts();
+    const files = archiveFiles(plan.path, root, mountPaths);
+    if (files[0].stat.dev !== stat.dev || files[0].stat.ino !== stat.ino) {
+      throw new Keep('checkpoint archive changed after preview');
+    }
+    const threads = threadEvidence(bb, plan.claims, cutoff);
+    if (JSON.stringify(threads) !== JSON.stringify(plan.threads)) throw new Keep('archive owner changed');
+    checkArchiveSource(plan, sdkRoots, projects, mountPaths);
+    checkArchiveRefs(plan, currentRefs());
+    // SAFE: exact hash and SQLite owner proved, canonical unmounted regular
+    // files, exclusive DB lock held. Retire the database last for retryability.
+    for (const file of files.reverse()) unlinkSync(file.path);
+  } catch (error) {
+    if (error.errcode === 5 || error.errcode === 6) throw new Keep('checkpoint archive busy');
+    throw error;
+  } finally {
+    db.close();
+  }
+}
+
+function sweepArchives(context, output) {
+  const { root, refs, mountPaths, owners, bb, cutoff,
+    knownAgents, expiringAgents, reviewed, execute, sdkRoots, projects } = context;
+  const identities = new Map([...owners].map(([key, claims]) => [hash(key) + '.db', { key, claims }]));
+  for (const { name } of listing(root, true).filter((file) => ARCHIVE_FILE.test(file.name))) {
+    output.archive_examined++;
+    const path = join(root, name);
+    try {
+      const owner = identities.get(name);
+      if (!owner) throw new Keep('checkpoint archive ACP ownership unknown');
+      const [workspace, id] = JSON.parse(owner.key);
+      if (knownAgents.has(id) && !expiringAgents.has(id)) throw new Keep('checkpoint archive source retained');
+      const threads = threadEvidence(bb, owner.claims, cutoff);
+      const files = archiveFiles(path, root, mountPaths);
+      const dataFiles = files.filter(({ path: file, stat }) => file === path ||
+        (stat.size > 0 && !file.endsWith('-shm')));
+      if (dataFiles.some(({ stat }) => stat.mtimeMs > cutoff)) throw new Keep('recent checkpoint archive');
+      const [{ stat }] = files;
+      const bytes = files.reduce((sum, file) => sum + file.stat.blocks * 512, 0);
+      const plan = { path, stat, bytes, agent_id: id, workspace, threads, claims: owner.claims };
+      checkArchiveRefs(plan, refs);
+      if (!knownAgents.has(id)) checkArchiveSource(plan, sdkRoots, projects, mountPaths);
+      // With no rollback or WAL data, a read-only immutable open avoids
+      // creating WAL sidecars during preview. Execution still revalidates the
+      // live database under its exclusive lock.
+      const uri = pathToFileURL(path);
+      if (dataFiles.length === 1) uri.searchParams.set('immutable', '1');
+      const db = ro(uri);
+      try {
+        checkArchiveIdentity(db, plan);
+      } finally {
+        db.close();
+      }
+      if (reviewed && !reviewed.has(JSON.stringify([path, id]))) throw new Keep('archive outside reviewed preview');
+      output.archive_candidates.push(publicItem(plan));
+      if (execute) {
+        eraseArchive(plan, context);
+        output.archive_removed.push(publicItem(plan));
+      }
+    } catch (error) {
+      if (error instanceof Keep) output.kept[error.message] = (output.kept[error.message] ?? 0) + 1;
+      else output.errors.push({ path, error: error.message });
+    }
+  }
+}
+
 async function sweep(options, output) {
   const { root, acp, 'bb-db': bbPath } = options;
   const cursor = options.execute ? sdk(options.sdk) : null;
@@ -292,14 +431,19 @@ async function sweep(options, output) {
     if (preview.mode !== 'preview' || !preview.complete || preview.root !== root) {
       throw new Error('expected a complete preview of the same Cursor projects root');
     }
-    reviewed = new Set(preview.candidates.map(({ path, agent_id }) => JSON.stringify([path, agent_id])));
+    reviewed = new Set([...preview.candidates, ...(preview.archive_candidates ?? [])]
+      .map(({ path, agent_id }) => JSON.stringify([path, agent_id])));
   }
   const cutoff = Date.now() - 14 * DAY;
-  const currentRefs = () => processReferences([root, acp]);
+  const archiveRoot = join(dirname(acp), 'checkpoints');
+  const currentRefs = () => processReferences([root, acp, archiveRoot]);
   const refs = currentRefs();
   const mountPaths = mounts();
   const owners = sessionOwners(acp);
   const bb = ro(bbPath);
+  const sdkRoots = new Map();
+  const knownAgents = new Set();
+  const expiringAgents = new Set();
   output.sdk_version = cursor?.version ?? null;
   output.cutoff = new Date(cutoff).toISOString();
   try {
@@ -307,6 +451,9 @@ async function sweep(options, output) {
       const sdkRoot = join(root, project.name, 'sdk-agent-store');
       for (const entry of listing(sdkRoot, true).filter((item) => /^[0-9a-f]{32}$/.test(item.name) && item.isDirectory())) {
         const state = join(sdkRoot, entry.name);
+        const matchingRoots = sdkRoots.get(entry.name) ?? [];
+        matchingRoots.push(state);
+        sdkRoots.set(entry.name, matchingRoots);
         const path = join(state, 'index.db');
         if (!existsSync(path)) continue;
         let index;
@@ -314,6 +461,9 @@ async function sweep(options, output) {
           checkCatalog(state, root, mountPaths);
           index = ro(path);
           const context = { root, state, index, bb, owners, cutoff };
+          for (const { agent_id: id } of index.prepare('SELECT agent_id FROM agents UNION SELECT agent_id FROM runs').all()) {
+            knownAgents.add(id);
+          }
           for (const { agent_id: id } of index.prepare('SELECT agent_id FROM agents ORDER BY agent_id').all()) {
             output.examined++;
             let plan;
@@ -326,6 +476,7 @@ async function sweep(options, output) {
                 await erase(context, plan, currentRefs, cursor);
                 output.removed.push(publicItem(plan));
               }
+              expiringAgents.add(id);
             } catch (error) {
               if (error instanceof Keep) {
                 output.kept[error.message] = (output.kept[error.message] ?? 0) + 1;
@@ -342,6 +493,10 @@ async function sweep(options, output) {
         }
       }
     }
+    // An incomplete SDK inventory cannot prove that an archive is orphaned.
+    if (!output.errors.length) sweepArchives({ root: archiveRoot, currentRefs, refs, mountPaths,
+      owners, bb, cutoff, knownAgents, expiringAgents, reviewed, execute: options.execute,
+      sdkRoots, projects: root }, output);
   } finally {
     bb.close();
   }
@@ -358,7 +513,8 @@ if (options.help) {
 }
 const output = { schema_version: 1, mode: options.execute ? 'execute' : 'preview',
   ts: new Date().toISOString(), run_id: process.env.BB_AUTOMATION_RUN_ID ?? null,
-  examined: 0, candidates: [], removed: [], kept: {}, errors: [] };
+  examined: 0, candidates: [], removed: [], archive_examined: 0, archive_candidates: [],
+  archive_removed: [], kept: {}, errors: [] };
 function avail() {
   const st = statfsSync(options.root);
   return st.bavail * st.bsize;
@@ -378,8 +534,8 @@ try {
   output.errors.push({ error: error.message });
 }
 output.complete = output.errors.length === 0;
-output.candidate_bytes = output.candidates.reduce((sum, item) => sum + item.bytes, 0);
-output.removed_bytes = output.removed.reduce((sum, item) => sum + item.bytes, 0);
+output.candidate_bytes = [...output.candidates, ...output.archive_candidates].reduce((sum, item) => sum + item.bytes, 0);
+output.removed_bytes = [...output.removed, ...output.archive_removed].reduce((sum, item) => sum + item.bytes, 0);
 if (options.report) {
   const temporary = options.report + '.' + process.pid + '.tmp';
   writeFileSync(temporary, JSON.stringify(output, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
@@ -389,8 +545,9 @@ if (options.report) {
     unlinkSync(temporary);
     throw error;
   }
-  const { candidates, removed, ...summary } = output;
-  console.log(JSON.stringify({ ...summary, candidates: candidates.length, removed: removed.length, report: options.report }));
+  const { candidates, removed, archive_candidates, archive_removed, ...summary } = output;
+  console.log(JSON.stringify({ ...summary, candidates: candidates.length, removed: removed.length,
+    archive_candidates: archive_candidates.length, archive_removed: archive_removed.length, report: options.report }));
 } else {
   console.log(JSON.stringify(output));
 }

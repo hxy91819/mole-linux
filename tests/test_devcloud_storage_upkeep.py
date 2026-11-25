@@ -3105,12 +3105,12 @@ def cursor_sweep(tmp_path):
     entry = Path(__file__).resolve().parents[1] / (
         '.claude/skills/devcloud-storage-upkeep/scripts/cursor_session_sweep.mjs')
     root = tmp_path / 'projects'
-    state = root / 'project' / 'sdk-agent-store' / ('a' * 32)
+    workspace = str(tmp_path / 'worktree')
+    state = root / 'project' / 'sdk-agent-store' / hashlib.md5(workspace.encode()).hexdigest()
     index = state / 'index.db'
     acp = tmp_path / 'sessions'
     (acp / 'project').mkdir(parents=True)
     bb = tmp_path / 'bb.db'
-    workspace = str(tmp_path / 'worktree')
     old = time.time() - 20 * 86400
     date = '2000-01-01T00:00:00.000Z'
     (state / 'agents').mkdir(parents=True)
@@ -3195,12 +3195,8 @@ def test_cursor_sweep_requires_exact_old_inactive_ownership_and_no_process_refer
     assert report['removed'] == []
 
 
-def test_cursor_sweep_sdk_delete_and_owner_receipt_are_scoped_and_retryable(cursor_sweep, tmp_path):
-    import sqlite3
-
-    add, sweep, index, _ = cursor_sweep
-    agent, directory, owner, history = add(1)
-    unrelated, protected, _, _ = add(2, mapped=False)
+@pytest.fixture
+def cursor_sweep_sdk(tmp_path):
     sdk = tmp_path / 'sdk'
     code = sdk / 'dist' / 'cjs'
     code.mkdir(parents=True)
@@ -3238,24 +3234,103 @@ def test_cursor_sweep_sdk_delete_and_owner_receipt_are_scoped_and_retryable(curs
             await store.agents.delete({filter: {agentIds: [id]}});
         }};
     ''')
+    return sdk, code
+
+
+def cursor_checkpoint_archive(tmp_path, agent, history, *, misbound=False, recent=False):
+    import hashlib
+    import sqlite3
+
+    row = json.loads(history.read_text())
+    workspace = row['cwd']
+    checkpoint = f'checkpoint:{agent}:20000000-0000-4000-8000-000000000000'
+    row.update(sdkSessionId=checkpoint, checkpointId=checkpoint)
+    history.write_text(json.dumps(row) + '\n')
+    old = time.time() - 20 * 86400
+    os.utime(history, (old, old))
+    filename = hashlib.sha256(json.dumps([workspace, agent], separators=(',', ':')).encode()).hexdigest()
+    root = tmp_path / 'checkpoints'
+    root.mkdir(exist_ok=True)
+    archive = root / (filename + '.db')
+    with contextlib.closing(sqlite3.connect(archive)) as db, db:
+        db.execute('PRAGMA journal_mode=WAL')
+        db.execute('CREATE TABLE snapshots (id TEXT, agent TEXT)')
+        db.execute('INSERT INTO snapshots VALUES (?,?)',
+                   (checkpoint, json.dumps({'agentId': agent, 'cwd': '/elsewhere' if misbound else workspace})))
+    if not recent:
+        os.utime(archive, (old, old))
+    return archive
+
+
+def test_cursor_sweep_sdk_delete_and_owner_receipt_are_scoped_and_retryable(
+        cursor_sweep, cursor_sweep_sdk, tmp_path):
+    import sqlite3
+
+    add, sweep, index, _ = cursor_sweep
+    agent, directory, owner, history = add(1)
+    archive = cursor_checkpoint_archive(tmp_path, agent, history)
+    unrelated, protected, _, _ = add(2, mapped=False)
+    sdk, code = cursor_sweep_sdk
     plan = tmp_path / 'reviewed.json'
-    plan.write_text(json.dumps(sweep()))
+    preview = sweep()
+    assert [item['agent_id'] for item in preview['archive_candidates']] == [agent]
+    plan.write_text(json.dumps(preview))
     extra, added, _, _ = add(3)
     (code / 'fail-once').touch()
     options = ('--execute', '--sdk', str(sdk), '--reviewed-preview', str(plan))
     failure = sweep(*options, expected=1)
     assert not failure['complete'] and not failure['removed']
-    assert directory.exists() and owner.exists()
+    assert directory.exists() and owner.exists() and archive.exists()
     with contextlib.closing(sqlite3.connect(index)) as db, db:
         assert db.execute("SELECT 1 FROM run_events WHERE run_id='run-1'").fetchall() == []
     report = sweep(*options)
     assert [item['agent_id'] for item in report['removed']] == [agent], report
+    assert [item['agent_id'] for item in report['archive_removed']] == [agent], report
     assert report['kept']['outside reviewed preview'] == 1
     assert added.joinpath('store.db').is_file()
-    assert not directory.exists() and not owner.exists() and history.exists()
+    assert not directory.exists() and not owner.exists() and not archive.exists() and history.exists()
     assert protected.joinpath('store.db').is_file()
     with contextlib.closing(sqlite3.connect(index)) as db, db:
         assert db.execute('SELECT agent_id FROM agents').fetchall() == [(unrelated,), (extra,)]
         assert db.execute('SELECT run_id FROM runs').fetchall() == [('run-2',), ('run-3',)]
         assert db.execute('SELECT run_id FROM run_events').fetchall() == [('run-2',), ('run-3',)]
     assert sweep(*options)['removed'] == []
+
+
+def test_cursor_sweep_expires_orphan_archives_and_preserves_live_or_unproven_ones(
+        cursor_sweep, cursor_sweep_sdk, tmp_path):
+    import sqlite3
+
+    add, sweep, index, _ = cursor_sweep
+    sdk, _ = cursor_sweep_sdk
+
+    def add_archive(number, *, status='idle', recent=False, misbound=False, source_files=False):
+        agent, directory, owner, history = add(number, status=status, archived=1)
+        archive = cursor_checkpoint_archive(tmp_path, agent, history, recent=recent, misbound=misbound)
+        with contextlib.closing(sqlite3.connect(index)) as db, db:
+            db.execute('DELETE FROM agents WHERE agent_id=?', (agent,))
+            db.execute('DELETE FROM runs WHERE agent_id=?', (agent,))
+        if not source_files:
+            shutil.rmtree(directory)
+            shutil.rmtree(owner)
+        return agent, archive
+
+    expired, removable = add_archive(1)
+    _, live = add_archive(2)
+    _, recent = add_archive(3, recent=True)
+    _, misbound = add_archive(4, misbound=True)
+    _, busy = add_archive(5, status='active')
+    _, remaining_source = add_archive(6, source_files=True)
+    unrelated = tmp_path / 'checkpoints' / ('b' * 64 + '.db')
+    unrelated.write_bytes(b'unattributed archive')
+    with live.open('rb'):
+        report = sweep('--execute', '--sdk', str(sdk))
+    assert report['archive_examined'] == 7
+    assert [item['agent_id'] for item in report['archive_removed']] == [expired], report
+    assert report['removed_bytes'] == report['archive_removed'][0]['bytes'] > 0
+    assert report['kept']['live checkpoint archive or SDK source reference'] == 1
+    assert report['kept']['checkpoint archive source files retained'] == 1
+    assert report['kept']['checkpoint archive identity disagrees with ACP'] == 1
+    assert not removable.exists()
+    assert not list(removable.parent.glob(removable.name + '-*'))
+    assert all(path.exists() for path in [live, recent, misbound, busy, remaining_source, unrelated])
