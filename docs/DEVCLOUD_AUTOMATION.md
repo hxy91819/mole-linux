@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位刹车使用快照 `98fb64b672657560`，增长计量使用快照 `0334de342a53a11b`：
+水位刹车使用快照 `98fb64b672657560`，增长计量使用快照 `ce95111ca33667e5`：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -123,7 +123,7 @@ Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
 
 | 任务 | ID | 时间 | 执行 | 行为 |
 |---|---|---|---|---|
-| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对六个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源、Git 清理效果、prompt 同步和 BB CLI 版本；全部符合只回一句，不符合才发协调线程 |
+| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对六个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源、Git 清理效果、BB 归档策略、prompt 同步和 BB CLI 版本；全部符合只回一句，不符合才发协调线程 |
 
 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md) 是唯一来源。改完运行
 `python3 -I scripts/sync_daily_check_prompt.py --apply`，脚本更新 BB 并回读比对完整内容（含末尾换行）。

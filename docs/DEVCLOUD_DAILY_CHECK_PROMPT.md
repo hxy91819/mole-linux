@@ -29,8 +29,8 @@
    - 单列 `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` 和 `/data/root-storage-20260912/root/.local/share/pnpm/store` 的 bytes、日增、owner 与清理任务；迁移父根和中间节点只观察。两个已登记子项也适用下述三次持续增长规则。
    - 单列 `/data/code/mono2/.worktrees`（owner=mono2 agent worktrees，清理方=linked/clone sweep；`/data/code/mono2` 总量只观察）、
      `/data/root-migrated/agent-state/cursor/projects`（owner=BB Cursor provider sessions）和
-     `/data/root-migrated/agent-state/bb-deployment-checkpoints`（owner=BB deployment checkpoints）。后两项清理策略均为
-     “待 owner 决定”，不自动删除；root-migrated 父根及中间目录只观察，子项按三次持续增长规则。
+     `/data/root-migrated/agent-state/bb-deployment-checkpoints`（owner=BB deployment checkpoints）。Cursor 会话待 owner 决定；BB 检查点保留当前和上一次成功部署，旧检查点由部署维护方核对引用后清理。root-migrated 父根及中间目录只观察，子项按三次持续增长规则。
+   - 只读执行 `bb storage retention`，核对 `archiveAfterDays=21`、`deleteAfterDays=null`、`deleteStorageOnArchive=false`；偏离策略算不符合。
    - Docker四类必须有数值 bytes：`docker:images`、`docker:containers`、`docker:volumes`、`docker:build-cache`；来自Docker system df，不再用du /data/docker。分类缺失、失败、超时均不得当0。
    - `status=ok` 且带 `vanished` 的根表示du有本根合法总量、stderr全为条目消失（No such file or directory）；列诊断行数 `vanished` 与最多5条 `vanished_examples`，此情况不算不符合。分项扫描只在扫描父根附这些字段，避免重复计数；混有权限/I/O等错误、无本根合法总量或超时仍记unknown。
    - `data_top_unknown` 必须为空；非空时逐一列根、原因并算不符合。其余未测根列 `unknown_count`，按原因汇总，最多5个路径示例。`comparisons` 的真实比较要求前后都ok且有bytes；前次缺项的新指标允许0作合成基线进入Top5，但必须显示 `baseline=new`，不表示目录当天新建，且不参与告警。前次明确unknown仍不得当0。首次没有时间间隔时daily_bytes为null，不虚构日增。

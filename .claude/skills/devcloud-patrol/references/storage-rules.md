@@ -184,6 +184,7 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   软链实际指向的当前版本、紧邻的上一版及有活进程 exe、cwd 或 maps 引用的版本；仅处理
   `~/.local/share/cursor-agent/versions` 内的物理版本目录，其他数据不动。
 - **数据类不自动删**：会话（codex、bb-data）、凭据、在用数据库、命名卷、备份与迁移副本只列给 owner 决定。
+- **2026-11-25 owner 批准的 BB 保留策略**：部署检查点保留当前成功部署和上一次成功部署，以版本或部署记录确认身份；旧检查点须确认无进程、配置或软链引用才可清理。目录 `~/.bb/deployment-checkpoints` 的物理路径为 `/data/root-migrated/agent-state/bb-deployment-checkpoints`，核对时也要查部署流程记录的实际检查点位置。BB 线程闲置 21 天自动归档，`deleteAfterDays=null`、`deleteStorageOnArchive=false`，用 `bb storage retention` 核对线上策略和运行结果。
 
 执行入口：`$devcloud-storage-upkeep` 的 `scripts/git_tree_sweep.py`、`scripts/docker_leftovers.py`、
 `scripts/go_cache_trim.py`、`scripts/pnpm_store_prune.py`，默认预演；全盘 Git 按本轮子集条件核验后开启执行。全盘回归 `tests/test_git_tree_sweep.py`；旧 helper 回归：`tests/test_devcloud_storage_upkeep.py`（已合并删除、仅本地提交归档、WIP 快照、
@@ -343,7 +344,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` | agent-cli-updates 更新器 |
 | `/data/code/mono2/.worktrees` | mono2 agent worktrees（linked/clone sweep） |
 | `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（待 owner 决定；不自动删） |
-| `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（待 owner 决定；不自动删） |
+| `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（保留最近两次成功部署的检查点） |
 | `/data/codex` | Codex sessions |
 | `/root/.cache/go-build` | shared Go build cache |
 | `/root/.cache/golangci-lint` | shared golangci-lint cache |
