@@ -9,7 +9,7 @@
 
 ## 1. 现行任务
 
-水位刹车使用快照 `98fb64b672657560`，增长计量使用快照 `ce95111ca33667e5`：
+水位刹车使用快照 `98fb64b672657560`，增长计量使用快照 `a2a7554c334dc601`：
 
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
@@ -112,9 +112,22 @@ Docker 自管存储不纳入。逐格式 owner 命令从中立目录运行，
 JSONL 写到 `~/.local/state/devcloud-storage-upkeep/pnpm-store-prune-*`。盘可用空间差
 与目录分项的已分配字节差分列，前者含后台写入。
 
-Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
+Cursor CLI 版本更新使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
 `python3 /root/.local/share/agent-cli-updates/update.py --tool cursor`。更新器目录独立于此仓；
 每轮校验成功后的保留和删除记录写入 `~/.local/state/agent-cli-updates/cursor.json`。
+
+Cursor SDK 会话清理使用 `auto_uj15re2dgsw`，每天 06:10（Asia/Shanghai），超时 600 秒，
+工作目录 `/var/tmp`。BB 保存的脚本用 `flock` 互斥，从只读快照 `7f830a7b78aaaa6f`
+调用 `/usr/local/bin/node` 执行 `cursor_session_sweep.mjs --execute`。部署参数指定物理 projects 根、
+ACP sessions 目录、BB 本地数据库及已验证的 `@cursor/sdk` 1.0.32 安装目录。
+SDK 升级时先用隔离 SQLite 副本核对删除边界，再更新运行时依赖路径。
+
+规则见 [storage-rules](../.claude/skills/devcloud-patrol/references/storage-rules.md)。
+人工预演去掉 `--execute` 和 `--sdk`，把 `--report` 指到独立文件。首轮执行可再加
+`--reviewed-preview <报告>`。定时任务的完整 JSON 写到
+`/var/lib/devcloud-storage-upkeep/cursor-sessions/latest.json`，BB 运行输出保存摘要；
+日检按 `run_id` 对应定时记录。候选占用、实际删除字节和文件系统可用空间变化分别记录。
+首轮人工预演与执行使用同一目录下的 `initial-preview.json`、`initial-execution.json`。
 
 脚本任务超时：Docker/Go 600 秒，pnpm 900 秒（宿主清单有独立 650 秒预算）。Git 的 BB launcher 超时120秒（仅启动/检查 worker）；宿主机 worker 先给BB环境回收5分钟，再给 linked 15分钟，再给独立 clone 预演/执行各30分钟，systemd 整体硬限均53分钟。预算按两条路径实测分别设置，不缩小发现范围。`--quiet` 只表示“没有实际
 清理且命令没有失败时保持安静”，BB 把它记为 `skipped`；`skipped` 不是失败。
@@ -123,7 +136,7 @@ Cursor 使用 Personal 既有 `auto_bgngb9bbyqk`（04:22）原入口
 
 | 任务 | ID | 时间 | 执行 | 行为 |
 |---|---|---|---|---|
-| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对六个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源、Git 清理效果、BB 归档策略、prompt 同步和 BB CLI 版本；全部符合只回一句，不符合才发协调线程 |
+| 每日 DSH 检查 | `auto_5gacevqssoe` | 每天 07:30 | `acp-dsh`，只读，复用环境 `env_enxy84wqn2` | 核对七个启用脚本任务的 schedule 运行及旧 tmp 任务停用、Go 缓存、03:30 的 /tmp 与 /var/tmp、tmpfiles、两盘可用、日增 Top5 与未知来源、Git 与 Cursor SDK 清理效果、BB 归档策略、prompt 同步和 BB CLI 版本；全部符合只回一句，不符合才发协调线程 |
 
 [DEVCLOUD_DAILY_CHECK_PROMPT](DEVCLOUD_DAILY_CHECK_PROMPT.md) 是唯一来源。改完运行
 `python3 -I scripts/sync_daily_check_prompt.py --apply`，脚本更新 BB 并回读比对完整内容（含末尾换行）。
@@ -224,7 +237,7 @@ linked 删除恢复时从报告 urls/object/归档 ref `git fetch <url> <ref>` �
 恢复原始 SHA 的证据必须在删除前落账，不能仅记录成功的 installer/命令输出。
 
 水位快照包含 `storage_watermark_brake.py` 和 `clean_tmp_runner.py`，计量快照包含
-`storage_growth_measure.py` 与 `storage_growth_fingerprints.md`，Go 修剪快照包含 `go_cache_trim.py`。
+`storage_growth_measure.py` 与 `storage_growth_fingerprints.md`，Go 修剪快照包含 `go_cache_trim.py`，Cursor SDK 会话清理快照包含 `cursor_session_sweep.mjs`。
 各快照附 manifest（每文件 sha256/mode），目录名为 **manifest 文件实际字节** sha256 前 16 位。
 文件 `0444`、目录 `0555`；Python 入口都以 `python3 -I` 跑 `--help`，复算哈希并确认无 pycache，
 发布前从 storage-rules 的 `growth-fingerprints` 标记段生成同目录指纹副本，测试核对两份表一致；

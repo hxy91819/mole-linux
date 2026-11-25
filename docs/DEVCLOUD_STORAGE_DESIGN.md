@@ -74,7 +74,7 @@ BB 数据与自动化形态。它不覆盖 Mole 产品自身的清理逻辑，�
 | `/root/.bb` | BB 主库 `bb.db`、artifacts、插件状态 | 系统盘上的 BB 自有数据 | 不自动删；升级备份按 3.6 处理 |
 | `/data/artifacts`、`/data/backups`、`/data/bb-backups`、`/data/bb-archives` | 产物与备份 | 数据类，可能含唯一副本 | 不自动删；owner 决策 |
 | `/data/root-storage-20260912` | 2026-09-12 迁到数据盘的 13 个目录的剩余部分 | 早期系统盘只有 100 GiB 时的迁移目标 | 现存 `.acpx/sessions`、`.cursor`、`.local` 等会话/状态；不按日期清 |
-| `/data/root-migrated` | Cursor/BB 部署检查点等 | 同上 | 数据/状态，不自动删；增长计量拆为 Cursor provider sessions 与 deployment checkpoints |
+| `/data/root-migrated` | Cursor/BB 部署检查点等 | 同上 | 增长计量拆为 Cursor provider sessions 与 deployment checkpoints；Cursor SDK 会话按 14 天策略清理，BB 部署检查点按部署保留策略处理 |
 | `/data/system-tmp` | `/tmp` 的物理目录 | 数据盘承接临时写入 | 每天 03:30 整树 3 天清理；见 3.2 |
 | `/data/ops`、`/data/output`、`/data/metrics`、`/data/tools` | 运维产物、任务输出、账本、不可变快照 | 运行证据与部署物 | 各自保留策略；不是通用缓存 |
 | `/data/itfs` | ITFS FUSE 缓存与运行数据 | 长期服务，承载 Codex CLI 与凭据 | 全部保留；见 storage-rules「已知来源指纹」 |

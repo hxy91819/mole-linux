@@ -183,6 +183,16 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   `~/.local/share/agent-cli-updates/update.py --tool cursor`。版本校验成功后，保留 `agent`
   软链实际指向的当前版本、紧邻的上一版及有活进程 exe、cwd 或 maps 引用的版本；仅处理
   `~/.local/share/cursor-agent/versions` 内的物理版本目录，其他数据不动。
+- **2026-11-25 owner 批准 Cursor SDK 会话保留 14 天**：每天北京时间 06:10，由 `cursor_session_sweep.mjs`
+  扫描物理 projects 根下的 SDK SQLite store。以 index 的 agent ID、ACP JSONL 中的 `session_meta` /
+  `session_checkpoint` 和 BB 的 `thread/identity` 对齐归属；所有对应 BB 线程都必须已归档或 idle/error
+  超过 14 天，且没有排队消息、未解决交互。逐会话取 store.db 及其伴随文件、ACP 历史和 run owner，
+  以及 SQLite 对应 agent/run/event 记录的最新活动时间；共享 index.db 的文件 mtime 不作单会话活动。
+  满 14 天、无运行中的 SDK run 且无进程 cwd/fd 引用才进候选，归属不明的会话保留。
+  执行逐项复核活引用、BB 状态和文件身份，有 ACP SQLite owner 锁则持锁执行。
+  仅使用本地 Cursor SDK 删除对应 checkpoint、run、event 和索引条目，同步移除该会话的 ACP 锁和 run receipt。
+  ACP JSONL 与 BB 历史保留；已过期的原生会话和 checkpoint 无法再恢复。默认预演，执行使用 `--execute`；
+  首批额外绑定预演清单，定时任务按同一规则重新发现。
 - **数据类不自动删**：会话（codex、bb-data）、凭据、在用数据库、命名卷、备份与迁移副本只列给 owner 决定。
 - **2026-11-25 owner 批准的 BB 保留策略**：部署检查点保留当前成功部署和上一次成功部署，以版本或部署记录确认身份；旧检查点须确认无进程、配置或软链引用才可清理。目录 `~/.bb/deployment-checkpoints` 的物理路径为 `/data/root-migrated/agent-state/bb-deployment-checkpoints`，核对时也要查部署流程记录的实际检查点位置。BB 线程闲置 21 天自动归档，`deleteAfterDays=null`、`deleteStorageOnArchive=false`，用 `bb storage retention` 核对线上策略和运行结果。
 
@@ -343,7 +353,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | `/data/root-storage-20260912/root/.local/share/pnpm/store` | pnpm store (pnpm_store_prune.py) |
 | `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` | agent-cli-updates 更新器 |
 | `/data/code/mono2/.worktrees` | mono2 agent worktrees（linked/clone sweep） |
-| `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（待 owner 决定；不自动删） |
+| `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（cursor_session_sweep.mjs 每日） |
 | `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（保留最近两次成功部署的检查点） |
 | `/data/codex` | Codex sessions |
 | `/root/.cache/go-build` | shared Go build cache |

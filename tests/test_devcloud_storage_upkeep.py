@@ -3087,3 +3087,175 @@ def test_growth_fingerprint_coverage_distinguishes_missing_paths_and_globs():
     rules = [('/a/*', 'broad'), ('/a/child', 'shadowed'), ('/typo', 'missing'), ('/tmp/job-*', 'optional')]
     assert g.fingerprint_coverage([{'root': '/a/child'}], rules) == {
         'missing_exact': ['/a/child', '/typo'], 'unmatched_globs': ['/tmp/job-*']}
+
+
+@pytest.fixture
+def cursor_sweep(tmp_path):
+    """A local ACP history, a BB identity mapping, and Cursor's SQLite catalog."""
+    import hashlib
+    import sqlite3
+
+    if os.geteuid() != 0 or not Path('/proc/self/mountinfo').is_file():
+        pytest.skip('Cursor process probes require root on Linux')
+    node = shutil.which('node')
+    if not node or subprocess.run(
+            [node, '--disable-warning=ExperimentalWarning', '-e', 'require("node:sqlite")'],
+            capture_output=True).returncode:
+        pytest.skip('Cursor SDK requires Node with node:sqlite')
+    entry = Path(__file__).resolve().parents[1] / (
+        '.claude/skills/devcloud-storage-upkeep/scripts/cursor_session_sweep.mjs')
+    root = tmp_path / 'projects'
+    state = root / 'project' / 'sdk-agent-store' / ('a' * 32)
+    index = state / 'index.db'
+    acp = tmp_path / 'sessions'
+    (acp / 'project').mkdir(parents=True)
+    bb = tmp_path / 'bb.db'
+    workspace = str(tmp_path / 'worktree')
+    old = time.time() - 20 * 86400
+    date = '2000-01-01T00:00:00.000Z'
+    (state / 'agents').mkdir(parents=True)
+    with contextlib.closing(sqlite3.connect(index)) as db, db:
+        db.executescript('''
+            CREATE TABLE agents (agent_id TEXT PRIMARY KEY, workspace_ref TEXT, status TEXT,
+                active_run_id TEXT, created_at TEXT, updated_at TEXT);
+            CREATE TABLE runs (run_id TEXT PRIMARY KEY, agent_id TEXT, status TEXT,
+                created_at TEXT, updated_at TEXT);
+            CREATE TABLE run_events (run_id TEXT, created_at TEXT);
+        ''')
+    with contextlib.closing(sqlite3.connect(bb)) as db, db:
+        db.executescript('''
+            CREATE TABLE threads (id TEXT, provider_id TEXT, status TEXT, archived_at INTEGER,
+                updated_at INTEGER, status_changed_at INTEGER, deleted_at INTEGER);
+            CREATE TABLE events (thread_id TEXT, type TEXT, scope_kind TEXT, provider_thread_id TEXT);
+            CREATE TABLE queued_thread_messages (thread_id TEXT);
+            CREATE TABLE pending_interactions (thread_id TEXT, resolved_at INTEGER);
+        ''')
+
+    def add(number, status='idle', archived=None, updated=None, mapped=True, run_status='FINISHED'):
+        agent = f'agent-00000000-0000-4000-8000-{number:012d}'
+        session = f'10000000-0000-4000-8000-{number:012d}'
+        run = f'run-{number}'
+        token = hashlib.sha256(agent.encode()).hexdigest()
+        directory = state / 'agents' / ('agent-' + token)
+        directory.mkdir()
+        (directory / 'store.db').write_bytes(b'checkpoint')
+        owner = state / 'acp-run-owners' / token
+        owner.mkdir(parents=True)
+        (owner / 'lock.db').touch()
+        (owner / 'run.json').write_text(json.dumps({'agentId': agent, 'runId': run}))
+        history = acp / 'project' / (session + '.jsonl')
+        history.write_text(json.dumps({'type': 'session_checkpoint', 'cwd': workspace,
+            'sdkSessionId': agent, 'sessionId': session, 'checkpointId': agent}) + '\n')
+        for item in [directory, owner, history, *directory.iterdir(), *owner.iterdir()]:
+            os.utime(item, (old, old))
+        with contextlib.closing(sqlite3.connect(index)) as db, db:
+            db.execute('INSERT INTO agents VALUES (?,?,?,?,?,?)', (agent, workspace, 'IDLE', None, date, date))
+            db.execute('INSERT INTO runs VALUES (?,?,?,?,?)', (run, agent, run_status, date, date))
+            db.execute('INSERT INTO run_events VALUES (?,?)', (run, date))
+        if mapped:
+            updated = int(old * 1000) if updated is None else updated
+            with contextlib.closing(sqlite3.connect(bb)) as db, db:
+                db.execute('INSERT INTO threads VALUES (?,?,?,?,?,?,?)',
+                           ('thr_' + str(number), 'acp-cursor-sdk', status, archived, updated, updated, None))
+                db.execute('INSERT INTO events VALUES (?,?,?,?)',
+                           ('thr_' + str(number), 'thread/identity', 'thread', session))
+        return agent, directory, owner, history
+
+    def sweep(*args, expected=0):
+        result = subprocess.run([node, '--disable-warning=ExperimentalWarning', str(entry), '--root',
+            str(root), '--acp', str(acp), '--bb-db', str(bb), *args], text=True, capture_output=True, timeout=30)
+        assert result.returncode == expected, result.stdout + result.stderr
+        return json.loads(result.stdout)
+
+    return add, sweep, index, bb
+
+
+def test_cursor_sweep_requires_exact_old_inactive_ownership_and_no_process_reference(cursor_sweep):
+    add, sweep, _, _ = cursor_sweep
+    eligible, directory, _, _ = add(1)
+    archived, _, _, _ = add(2, archived=1, updated=int(time.time() * 1000))
+    add(3, mapped=False)
+    add(4, status='active')
+    add(5, updated=int(time.time() * 1000))
+    add(6, run_status='RUNNING')
+    _, _, recent_owner, _ = add(7)
+    os.utime(recent_owner / 'run.json', None)
+    _, _, _, recent_history = add(8)
+    os.utime(recent_history, None)
+    _, checked, _, _ = add(9)
+    with checked.joinpath('store.db').open('rb'):
+        report = sweep()
+    assert {item['agent_id'] for item in report['candidates']} == {eligible, archived}, report
+    assert report['kept'] == {
+        'BB identity unknown': 1, 'BB thread busy': 1, 'recent BB thread': 1,
+        'SDK run busy': 1, 'recent session files': 1, 'recent ACP history': 1,
+        'live cwd or file descriptor': 1,
+    }
+    assert directory.joinpath('store.db').read_bytes() == b'checkpoint'
+    assert report['removed'] == []
+
+
+def test_cursor_sweep_sdk_delete_and_owner_receipt_are_scoped_and_retryable(cursor_sweep, tmp_path):
+    import sqlite3
+
+    add, sweep, index, _ = cursor_sweep
+    agent, directory, owner, history = add(1)
+    unrelated, protected, _, _ = add(2, mapped=False)
+    sdk = tmp_path / 'sdk'
+    code = sdk / 'dist' / 'cjs'
+    code.mkdir(parents=True)
+    (sdk / 'package.json').write_text('{"name":"@cursor/sdk","version":"fake"}')
+    (code / 'sqlite.js').write_text('''
+        const { DatabaseSync } = require('node:sqlite');
+        const { join } = require('node:path');
+        exports.SqliteLocalAgentStore = {async open({stateRoot}) {
+            const db = new DatabaseSync(join(stateRoot, 'index.db'));
+            return {dispose: () => db.close(), agents: {delete({filter}) {
+                db.prepare('DELETE FROM agents WHERE agent_id=?').run(filter.agentIds[0]);
+            }}, checkpoints: {db, stateRoot}, runEvents: {delete({filter}) {
+                for (const id of filter.runIds) db.prepare('DELETE FROM run_events WHERE run_id=?').run(id);
+            }}};
+        }};
+    ''')
+    (code / 'index.js').write_text('''
+        const { createHash } = require('node:crypto');
+        const { existsSync, rmSync, unlinkSync } = require('node:fs');
+        const { join } = require('node:path');
+        exports.Agent = {async delete(id, {store}) {
+            const {db, stateRoot} = store.checkpoints;
+            const run = db.prepare('SELECT run_id FROM runs WHERE agent_id=?').get(id);
+            if (run && db.prepare('SELECT 1 FROM run_events WHERE run_id=?').get(run.run_id)) {
+                throw new Error('run events must be removed before the run');
+            }
+            db.prepare('DELETE FROM runs WHERE agent_id=?').run(id);
+            const fault = join(__dirname, 'fail-once');
+            if (existsSync(fault)) {
+                unlinkSync(fault);
+                throw new Error('interrupted after run index deletion');
+            }
+            const hash = createHash('sha256').update(id).digest('hex');
+            rmSync(join(stateRoot, 'agents', 'agent-' + hash), {recursive: true});
+            await store.agents.delete({filter: {agentIds: [id]}});
+        }};
+    ''')
+    plan = tmp_path / 'reviewed.json'
+    plan.write_text(json.dumps(sweep()))
+    extra, added, _, _ = add(3)
+    (code / 'fail-once').touch()
+    options = ('--execute', '--sdk', str(sdk), '--reviewed-preview', str(plan))
+    failure = sweep(*options, expected=1)
+    assert not failure['complete'] and not failure['removed']
+    assert directory.exists() and owner.exists()
+    with contextlib.closing(sqlite3.connect(index)) as db, db:
+        assert db.execute("SELECT 1 FROM run_events WHERE run_id='run-1'").fetchall() == []
+    report = sweep(*options)
+    assert [item['agent_id'] for item in report['removed']] == [agent], report
+    assert report['kept']['outside reviewed preview'] == 1
+    assert added.joinpath('store.db').is_file()
+    assert not directory.exists() and not owner.exists() and history.exists()
+    assert protected.joinpath('store.db').is_file()
+    with contextlib.closing(sqlite3.connect(index)) as db, db:
+        assert db.execute('SELECT agent_id FROM agents').fetchall() == [(unrelated,), (extra,)]
+        assert db.execute('SELECT run_id FROM runs').fetchall() == [('run-2',), ('run-3',)]
+        assert db.execute('SELECT run_id FROM run_events').fetchall() == [('run-2',), ('run-3',)]
+    assert sweep(*options)['removed'] == []
