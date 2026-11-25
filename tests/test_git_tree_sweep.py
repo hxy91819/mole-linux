@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import time
 from types import SimpleNamespace
@@ -56,7 +57,8 @@ def case(tmp_path, monkeypatch):
     calls = []
     def transport(args, **kw):
         calls.append(list(args))
-        args = [str(bare) if a == 'https://git.example.invalid/group/repo.git' else a for a in args]
+        if any(operation in args for operation in ('fetch', 'ls-remote', 'push')):
+            args = [str(bare) if a == 'https://git.example.invalid/group/repo.git' else a for a in args]
         return raw(args, **kw)
     monkeypatch.setattr(m, '_run', transport)
     shell('git', 'push', '-q', str(bare), 'main', cwd=repo)
@@ -2439,6 +2441,25 @@ def test_linked_checks_only_its_branch_not_unrelated_heads_tags_or_stash(case):
     assert row['action']=='remove' and set(row['objects'].values())=={head},row
 
 
+def test_clean_linked_removes_without_force_and_keeps_shared_stash(case, monkeypatch):
+    c = case
+    target = linked(c)
+    head = shell('git', 'rev-parse', 'HEAD', cwd=c.repo)
+    tree = shell('git', 'rev-parse', 'HEAD^{tree}', cwd=c.repo)
+    index = shell('git', 'commit-tree', tree, '-p', head, '-m', 'stash index', cwd=c.repo)
+    stash = shell('git', 'commit-tree', tree, '-p', head, '-p', index, '-m', 'owner work', cwd=c.repo)
+    shell('git', 'update-ref', '--create-reflog', '-m', 'owner work', 'refs/stash', stash, cwd=c.repo)
+    assert shell('git', 'stash', 'list', '--format=%H', cwd=c.repo) == stash
+    context = linked_empty_context(c)
+    monkeypatch.setattr(c.m, 'linked_context', lambda: context)
+    row = c.m.linked_plan(linked_row(c, target), context)
+    assert row['action'] == 'remove'
+    c.m.linked_execute([row], c.root / 'events', '20261125T123456Z')
+    assert row['result'] == 'removed' and not target.exists()
+    assert shell('git', 'stash', 'list', '--format=%H', cwd=c.repo) == stash
+    assert any('remove' in call and '--force' not in call for call in c.calls)
+
+
 def test_linked_ignores_generic_usage_and_foreign_nesting(case,monkeypatch):
     c=case;other=c.root/'other-main';shell('git','clone','-q',str(c.bare),str(other))
     target=c.repo/'.local/evidence/foreign-linked';shell('git','worktree','add','-q','-b','other',str(target),cwd=other);age(c.root)
@@ -3567,3 +3588,188 @@ def test_clone_recheck_timeout_is_kept_and_reported_separately(case, monkeypatch
     assert c.m.DEADLINE == round_seconds
     assert c.m.summarize([row])['recheck_timeouts'] == [
         {'path': str(c.repo), 'bytes': 4096, 'limit': limit, 'reason': row['reason']}]
+
+
+@pytest.mark.parametrize('kind', ['clone', 'linked'])
+@pytest.mark.parametrize('scenario', ['success', 'push-fails', 'wrong-sha', 'credentials', 'too-recent',
+                                      'changed-after-push', 'credentials-before-add'])
+def test_dirty_archive_preserves_snapshot_stash_and_fails_closed(case, monkeypatch, kind, scenario):
+    c = case
+    # Git may reject an explicit add -A for a tracked child of an ignored
+    # directory. The archive must capture the tracked edit, not ignored siblings.
+    (c.repo / 'ignored-dir').mkdir()
+    (c.repo / 'ignored-dir/tracked.txt').write_text('original')
+    (c.repo / '.gitignore').write_text((c.repo / '.gitignore').read_text() + 'ignored-dir\n')
+    shell('git', 'add', '.gitignore', cwd=c.repo)
+    shell('git', 'add', '-f', 'ignored-dir/tracked.txt', cwd=c.repo)
+    shell('git', 'commit', '-qm', 'track a file in an ignored directory', cwd=c.repo)
+    shell('git', 'push', '-q', str(c.bare), 'main', cwd=c.repo)
+    target = linked(c) if kind == 'linked' else c.repo
+    path = str(target)
+    head = shell('git', 'rev-parse', 'HEAD', cwd=target)
+    tree = shell('git', 'rev-parse', 'HEAD^{tree}', cwd=target)
+    index = shell('git', 'commit-tree', tree, '-p', head, '-m', 'index', cwd=target)
+    for name in ('first', 'second'):
+        stash = shell('git', 'commit-tree', tree, '-p', head, '-p', index, '-m', name, cwd=target)
+        shell('git', 'update-ref', '--create-reflog', '-m', name, 'refs/stash', stash, cwd=target)
+    stashes = shell('git', 'stash', 'list', '--format=%H', cwd=target).splitlines()
+    (target / 'a').write_text('staged')
+    shell('git', 'add', 'a', cwd=target)
+    (target / 'a').write_text('working')
+    (target / 'untracked.txt').write_text('untracked content')
+    (target / ':(glob)\r*.txt').write_text('literal name')
+    (target / 'ignored-dir/tracked.txt').write_text('changed tracked file')
+    (target / 'ignored-dir/ignored.txt').write_text('ignore this sibling')
+    (target / 'node_modules').mkdir()
+    (target / 'node_modules/rebuildable.js').write_text('ignored')
+    if scenario == 'credentials':
+        (target / '.env').write_text('secret fixture')
+    if scenario != 'too-recent':
+        monkeypatch.setattr(sys.modules[__name__], 'OLD', time.time() - 31 * 86400)
+    age(c.repo)
+    gitdir = Path(shell('git', 'rev-parse', '--absolute-git-dir', cwd=target))
+    if scenario == 'success':
+        # An old fetch record does not reset the dirty archive's 30-day clock.
+        fetch_head = gitdir / 'FETCH_HEAD'
+        fetch_head.write_text('')
+        intermediate = time.time() - 10 * 86400
+        os.utime(fetch_head, (intermediate, intermediate))
+        os.utime(gitdir, (OLD, OLD))
+    original_index = (gitdir / 'index').read_bytes()
+    monkeypatch.setattr(c.m, 'dirty_live_guard', lambda _: None)
+    monkeypatch.setattr(c.m, 'clone_environment_anchors', lambda: {})
+    monkeypatch.setattr(c.m.ws, 'site_setting', lambda _: 'git.example.invalid')
+    context = linked_empty_context(c)
+    monkeypatch.setattr(c.m, 'linked_context', lambda: context)
+    raw = c.m._run
+
+    def run(cmd, **kw):
+        archive_push = 'push' in cmd and any(':refs/archive/devcloud/' in arg for arg in cmd)
+        verification = 'ls-remote' in cmd and any(arg.startswith('refs/archive/devcloud/') for arg in cmd)
+        if 'add' in cmd and '-A' in cmd and '--pathspec-file-nul' in cmd and scenario == 'credentials-before-add':
+            (target / 'new-private.key').write_text('late credential')
+            age(c.repo)
+        if archive_push and scenario == 'push-fails':
+            raise subprocess.CalledProcessError(1, cmd, stderr='remote rejected snapshot')
+        if archive_push or verification:
+            cmd = [str(c.bare) if part == 'origin' else part for part in cmd]
+        result = raw(cmd, **kw)
+        if verification and scenario == 'wrong-sha':
+            result.stdout = '0' * 40 + '\t' + cmd[-1] + '\n'
+        if archive_push and scenario == 'changed-after-push':
+            (target / 'untracked.txt').write_text('different bytes')
+            age(c.repo)
+        return result
+
+    monkeypatch.setattr(c.m, '_run', run)
+    inventory = inv(c)
+    row = c.m.linked_plan(linked_row(c, target), context) if kind == 'linked' else c.m.plan(path, kind, inventory, {}, {})
+    assert (gitdir / 'index').read_bytes() == original_index
+    if scenario in ('credentials', 'too-recent'):
+        assert row['action'] == 'keep' and target.exists()
+        assert ('credential' if scenario == 'credentials' else '30 days') in row['reason']
+        return
+    assert row['action'] == 'archive+remove', row.get('reason')
+    row['bytes'] = 4096
+    log = c.root / 'archive.jsonl'
+    if kind == 'linked':
+        c.m.linked_execute([row], log, '20261125T123456Z')
+    else:
+        c.m.execute([row], inventory, {}, {}, [], set(), '20261125T123456Z', log)
+    if scenario != 'success':
+        assert row['result'] == 'kept' and target.exists(), row
+        assert (gitdir / 'index').read_bytes() == original_index
+        assert {'push-fails': 'remote rejected', 'wrong-sha': 'SHA verification failed',
+                'changed-after-push': 'changed after archive',
+                'credentials-before-add': 'credential'}[scenario] in row['reason'], row
+        if scenario == 'credentials-before-add':
+            [archive] = row['archives']
+            assert 'new-private.key' not in shell('git', 'ls-tree', '-r', '--name-only', archive['ref'], cwd=c.bare)
+        return
+    assert row['result'] == 'removed' and not target.exists(), row
+    [archive] = row['archives']
+    ref = archive['ref']
+    prefix, date, path_hash = ref.rsplit('/', 2)
+    assert prefix.startswith('refs/archive/devcloud/') and date == '20261125'
+    assert path_hash == c.m.hashlib.sha256(path.encode()).hexdigest()
+    assert shell('git', 'show', ref + ':untracked.txt', cwd=c.bare) == 'untracked content'
+    assert shell('git', 'show', ref + '::(glob)\r*.txt', cwd=c.bare) == 'literal name'
+    assert shell('git', 'show', ref + ':a', cwd=c.bare) == 'working'
+    assert shell('git', 'show', ref + ':ignored-dir/tracked.txt', cwd=c.bare) == 'changed tracked file'
+    assert 'ignored-dir/ignored.txt' not in shell('git', 'ls-tree', '-r', '--name-only', ref, cwd=c.bare)
+    assert shell('git', 'show', archive['index_commit'] + ':a', cwd=c.bare) == 'staged'
+    assert 'node_modules' not in shell('git', 'ls-tree', '-r', '--name-only', ref, cwd=c.bare)
+    parents = shell('git', 'rev-list', '--parents', '-n1', ref, cwd=c.bare).split()
+    assert parents[3:] == stashes
+    assert 'git fetch' in archive['restore'] and 'git checkout' in archive['restore']
+    restored = c.root / 'restored'
+    shell('git', 'init', '-q', str(restored))
+    subprocess.run(['sh', '-ec', archive['restore_dirty'].replace(archive['url'], str(c.bare))],
+                   cwd=restored, capture_output=True, check=True)
+    assert shell('git', 'rev-parse', 'HEAD', cwd=restored) == head
+    assert shell('git', 'show', ':a', cwd=restored) == 'staged'
+    assert (restored / 'a').read_text() == 'working'
+    assert shell('git', 'ls-files', '--others', '--exclude-standard', 'untracked.txt',
+                 cwd=restored) == 'untracked.txt'
+
+
+def test_dirty_archive_refuses_pushurl_for_different_repository(case, monkeypatch):
+    c = case
+    monkeypatch.setattr(c.m.ws, 'site_setting', lambda _: 'git.example.invalid')
+    shell('git', 'remote', 'set-url', '--push', 'origin',
+          'https://git.example.invalid/another/repository.git', cwd=c.repo)
+    with pytest.raises(c.m.ws.Keep, match='same private fetch/push repository'):
+        c.m.dirty_origin(str(c.repo))
+    assert not any('push' in call for call in c.calls)
+
+
+def test_dirty_archive_keeps_unpublished_objects_of_removed_submodule(case, monkeypatch):
+    c = case
+    shell('git', '-c', 'protocol.file.allow=always', 'submodule', 'add', str(c.bare), 'sub', cwd=c.repo)
+    shell('git', 'commit', '-qm', 'add submodule', cwd=c.repo)
+    (c.repo / 'sub/a').write_text('only in this submodule checkout')
+    shell('git', '-c', 'user.name=Test', '-c', 'user.email=test@example.com',
+          'commit', '-qam', 'unpublished submodule content', cwd=c.repo / 'sub')
+    sha = shell('git', 'rev-parse', 'HEAD', cwd=c.repo / 'sub')
+    shell('git', 'rm', '-f', 'sub', cwd=c.repo)
+    module = c.repo / '.git/modules/sub'
+    assert not (c.repo / 'sub').exists()
+    cat = ('git', '--git-dir', str(module), '--work-tree', str(c.repo), 'cat-file', '-t', sha)
+    assert shell(*cat) == 'commit'
+    monkeypatch.setattr(sys.modules[__name__], 'OLD', time.time() - 31 * 86400)
+    age(c.repo)
+    row = plan(c)
+    assert row['action'] == 'keep' and 'submodule storage' in row['reason']
+    assert shell(*cat) == 'commit'
+
+
+def test_dirty_archive_keeps_linked_checkout_below_writable_ancestor(case, monkeypatch):
+    c = case
+    target = linked(c)
+    (target / 'a').write_text('local work')
+    target.parent.chmod(0o777)
+    monkeypatch.setattr(sys.modules[__name__], 'OLD', time.time() - 31 * 86400)
+    age(c.repo)
+    row = c.m.linked_plan(linked_row(c, target), linked_empty_context(c))
+    assert row['action'] == 'keep' and 'writable ancestor' in row['reason']
+    assert (target / 'a').read_text() == 'local work'
+
+
+@pytest.mark.parametrize('boundary', ['project-source', 'undestroyed-environment', 'process', 'mount'])
+def test_dirty_guard_never_releases_live_owner_evidence(case, monkeypatch, boundary):
+    c = case
+    path = str(c.repo)
+    projects = [{'sources': [{'path': path}]}] if boundary == 'project-source' else []
+    environments = [{'status': 'ready', 'path': path}] if boundary == 'undestroyed-environment' else []
+    monkeypatch.setattr(c.m, 'command', lambda args: SimpleNamespace(
+        stdout=json.dumps(projects if args[1] == 'project' else environments)))
+    def processes(anchors):
+        if boundary == 'process':
+            c.m.anchor(anchors, path, 'process 123 cwd')
+        return {}
+    monkeypatch.setattr(c.m, 'process_anchors', processes)
+    monkeypatch.setattr(c.m, 'process_mounts', lambda: [path + '/child'] if boundary == 'mount' else [])
+    with pytest.raises(c.m.ws.Keep, match={
+            'project-source': 'BB project source', 'undestroyed-environment': 'undestroyed',
+            'process': 'process 123 cwd', 'mount': 'mounted path'}[boundary]):
+        c.m.dirty_live_guard(path)

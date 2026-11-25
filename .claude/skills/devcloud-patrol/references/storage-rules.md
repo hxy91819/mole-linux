@@ -91,6 +91,17 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
     24小时活动证据只含工作树文件、它自己的gitdir及所在分支的ref/reflog；主仓库fetch或其他worktree的共同元数据活动不重置本树年龄。只证明当前分支/HEAD，不要求其他共享分支、tag或stash满足clone规则。归档仍使用允许的同主机个人/内部origin、`archive/git-tree/*`原SHA并远端核验，拒绝不改写历史；mono2不归档到GitHub。
     BB环境/cwd/登记/HEAD/24h活动在每项网络IO后、Git remove前复核，未知保留。名称引用、项目兜底、嵌套、alternates、HOME/XDG、配置/容器等全盘clone保护不用于linked；Git对ignored条目和子模块按自身remove语义处理。理由：linked的所有权和状态由主仓库登记及上述实时证据决定，不让clone的通用范围保护阻止Git管理自己的副本。
     每个主仓库随后执行 `git worktree prune --verbose`（预演加 `--dry-run`），仅由Git清理失效的登记；不直接删除残缺gitfile目录。无法解析的Git路径列为unresolved_mains/保留，主仓库自身仍走下面原clone保护。首次人工执行绑定专用完整预演 `--reviewed-preview`，报告schema_version=3、policy=linked。
+  - **2026-11-25 owner 批准的脏副本归档（linked/clone）**：有未提交改动、未跟踪文件或 stash，
+    且工作区、HEAD、index、reflog 的最新 mtime 距今至少 30 天，才可走本例外；原有活跃保护照常适用。
+    锁、进行中的 Git 操作、凭据、嵌套仓库、
+    子模块（含残留的独立对象存储）、挂载、活进程、未销毁 BB 环境及 BB 项目源仍保留。原 index 不改；临时 index 保存暂存树
+    和当前工作树（含未跟踪、排除 ignored），所有 stash 保留原 SHA；不能无损归档时保留。
+    只推仓库自己的同一私有 origin（现场配置声明的内部 Git 主机，fetch/push 必须是同一仓库），
+    mono2 不推 GitHub。推 `refs/archive/devcloud/<host>/<日期>/<路径哈希>` 下的唯一 ref，
+    独立 `ls-remote` 核 SHA，报告写恢复命令。归档后复核树内容、登记、身份和活引用；
+    只有已核验的脏 linked 副本走 Git 的 `worktree remove --force`，且路径祖先须受信任。
+    干净 linked 仍不加 force；主仓共享的 stash 不会随干净 linked 副本删除。
+    首批先分别完整预演，再绑定各阶段预演清单；缺目的地、推送失败、校验失败或状态变化一律保留。
   - **以下规则仅适用于独立clone，保持原严格策略不变**：全盘入口仍发现所有Git标记并把linked作为引用来源/已知主仓索引，但只把独立clone送入通用计划与删除路径；不套用旧131项路径白名单，自然闲置到期按原规则处理。
   - **发现**：物理遍历 `/` 和 `/data`，每根 `-xdev`，按 device/inode 去重，不跟随软链，
     跳过 `/proc /sys /dev /run`；没有深度、隐藏目录、项目路径或 BB thread-storage 排除。

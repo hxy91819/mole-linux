@@ -61,8 +61,10 @@ class ScanIncomplete(Exception):
     """Process or docker evidence is incomplete; delete nothing this round."""
 
 
-def run(cmd, cwd=None, timeout=300, check=True, env=None):
-    r = subprocess.run(cmd, cwd=cwd, env=env or ENV, capture_output=True, text=True, timeout=timeout)
+def run(cmd, cwd=None, timeout=300, check=True, env=None, *, raw_stdout=False):
+    r = subprocess.run(cmd, cwd=cwd, env=env or ENV, capture_output=True, text=not raw_stdout, timeout=timeout)
+    if raw_stdout:
+        r.stderr = r.stderr.decode(errors='replace')
     if check and r.returncode != 0:
         raise subprocess.CalledProcessError(r.returncode, cmd, r.stdout, r.stderr)
     return r

@@ -39,9 +39,13 @@ if [[ "$git_sweep_state" != *ActiveState=inactive* && "$git_sweep_state" != *Act
 fi
 BB_CLI="$(/usr/bin/python3 -I "$git_sweep_dir/git_tree_sweep_bb_cli.py")"
 export BB_CLI
+git_sweep_site=()
+if [[ -n "${MOLE_DEVCLOUD_SITE:-}" ]]; then
+    git_sweep_site+=(--setenv="MOLE_DEVCLOUD_SITE=${MOLE_DEVCLOUD_SITE}")
+fi
 systemd-run --unit="$git_sweep_unit" --collect --service-type=exec \
     --property=User=root --property=WorkingDirectory=/ --property="RuntimeMaxSec=$git_sweep_hard_seconds" \
     --setenv="PATH=${PATH}" \
-    --setenv="BB_CLI=${BB_CLI}" \
+    --setenv="BB_CLI=${BB_CLI}" "${git_sweep_site[@]}" \
     /bin/bash "$git_sweep_dir/git_tree_sweep_worker.sh" /root/.pyenv/versions/3.12.12/bin/python3 "$@"
 echo "Git tree $git_sweep_mode launched; reports: /root/.local/state/devcloud-storage-upkeep/git-tree-sweep-*.json"

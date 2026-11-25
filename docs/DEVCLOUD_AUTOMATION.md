@@ -162,21 +162,28 @@ BB owner 盘点任务 `auto_ziaxnfa6kx4` 每天 05:45（Asia/Shanghai），调�
 | retry-worktree-cleanup | `leftoverWorktrees` 可列已测残留 | 无 dry-run；执行实时选退休环境，可能包含扫描未测的对象，不以列表当完整计划 |
 | remove-external-worktrees | `externalWorktrees` | 现有 BB 判断无活进程 cwd、24 小时或实时远端恢复证明，扫描只覆盖 BB 项目源；不替换 linked |
 
+脏 Git 副本归档适用 storage-rules 的 30 天例外。线上 launcher 的脚本设置
+`MOLE_DEVCLOUD_SITE` 为本机私有站点配置文件的绝对路径；未配置私有 origin 的脏副本保留。
+部署前分别用 `--dirty-only` 预演 linked 和 clone，报告中的 `dirty_archive`、`archive_url`、`idle_hours`、
+`bytes` 给出候选证据。执行加 `--execute --dirty-only --reviewed-preview <报告>`，只处理这批脏副本。推送核验后从
+报告 `archives` 取 `restore`，或在空闲恢复副本里运行 `restore_dirty`，恢复原 HEAD、暂存内容
+与未跟踪文件；如需恢复 stash，按报告 `stash_restore` 顺序执行。
+
 ## 2. 不可变快照与发布
 
-仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `38207e78f8527087`），包含
+仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `ae2dd976543a1a6a`），包含
 `git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、
 `git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py`、
 `daily_git_cleanup_check.py`、`bb_storage_maintenance.py` 九个脚本和 `manifest.json`。上一版七脚本性能快照为 `3c35f7ad513b5140`。
 旧 `9217bf8ab4fc6204` 是六脚本历史快照，缺少 CLI binder；上一正式版为 `b70f81e79242476d`（clone预算150m）。线上切换以本轮验证与 `bb automation show` 回读为准。
 launcher创建同一个有时限的systemd unit，worker先回收遗弃BB环境，再运行linked登记路径和独立clone全盘路径；cwd=/，BB只负责120秒内启动。其他维护任务继续使用各自已有快照。
 
-1. 7脚本各记sha256，manifest稳定JSON+换行，目录名取manifest哈希前16位，文件0444/目录0555。两个Python入口与launcher的help均验证成功且无pycache。
+1. 九个脚本各记sha256，manifest稳定JSON+换行，目录名取manifest哈希前16位，文件0444/目录0555。两个Python入口与launcher的help均验证成功且无pycache。
 2. 手动每次调用先检查绑定成功：`BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/bb_environment_sweep.py --json` 核对遗弃环境，再运行linked： `BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/worktree_sweep.py --json`；完整后用其专用预演文件执行 `--execute --reviewed-preview <linked-preview.json>`。只读Git登记定位不重扫磁盘；主仓来自实时BB source/环境和最近一次完整两盘发现库存。无缓存的初次安装先用clone全盘预演建立库存。
 3. clone入口 `BB_CLI="$(/usr/bin/python3 -I <snap>/git_tree_sweep_bb_cli.py)" && export BB_CLI && python3 -I <snap>/git_tree_sweep.py --json` 保持7天、全部原引用/凭据/恢复证明规则；只送独立clone进通用计划，linked仅作为引用来源/下次主仓索引。其人工执行只绑定自己的clone预演，不混用linked预演。
 4. 部署保存脚本 `bash <snap>/git_tree_sweep_run.sh --execute`，读回enabled、cron=30 6 * * *、Asia/Shanghai、timeout=120000及命令快照。launcher只接受无参数或--execute；手动绑定预演使用上面各自Python入口。
 5. 旧tmp任务auto_3jiqtmzreq8保持disabled+noop，不恢复或手动触发；每日检查prompt同步读回。其余维护任务不跟随更换快照。
-6. linked只按最新Git登记五条件、24h和Git remove/no-force判断，网络后立即复核BB/cwd/登记/HEAD/age/clean；实际Git状态文件计活动，不让管理目录的临时锁mtime刷活。Git prune按显式命令清失效登记，锁定登记仍保留。单主仓无法读登记只保留并报告该主仓，不扩大成全局阻断；BB/cwd整体读取未知则该阶段不执行。
+6. linked 按最新 Git 登记与实时证据判断。干净副本闲置 24h 后用普通 Git remove；脏副本适用 30 天和归档核验规则。网络后立即复核 BB、进程、登记、HEAD、闲置时间和工作树内容；实际Git状态文件计活动，不让管理目录的临时锁mtime刷活。Git prune按显式命令清失效登记，锁定登记仍保留。单主仓无法读登记只保留并报告该主仓，不扩大成全局阻断；BB/cwd整体读取未知则该阶段不执行。
 7. BB环境回收预算5m；linked预算15m；clone预算预演/执行各30m；同一worker整体硬限均53m。一阶段失败仍尝试另一阶段并最终非零。06:30执行最迟07:23，07:30应已结束，linked必须已有完整结果；同时检查上一轮已结束结果。
 8. 环境阶段另写bb-environment-sweep-<UTC>.json(l)（schema1/policy=bb-environments）；两条Git路径分别写linked-worktree-sweep-<UTC>.json(l)（schema3/policy=linked）和git-tree-sweep-<UTC>.json(l)（schema2/policy=clones）。逐路径删除/保留/原SHA归档与Git拒绝原因、prune输出、目录原du及两盘可用容量变化分列。人工单独linked验证不算首次完整schedule。
 

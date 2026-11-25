@@ -12,6 +12,7 @@ import concurrent.futures as cf
 import contextlib
 import fcntl
 import glob
+import hashlib
 import importlib.util
 import itertools
 import json
@@ -149,7 +150,7 @@ def checkpoint():
         raise ws.ScanIncomplete('time budget reached')
 
 
-def command(args, cwd=None, timeout=120, check=True, env=None):
+def command(args, cwd=None, timeout=120, check=True, env=None, *, raw_stdout=False):
     global _bb_cli_helper
     checkpoint()
     category = ('bb' if args[0] == 'bb' else 'du' if args[0] == 'du' else
@@ -166,7 +167,8 @@ def command(args, cwd=None, timeout=120, check=True, env=None):
         env = dict(ws.ENV if env is None else env, BB_CLI=cli)
     started = time.monotonic()
     try:
-        return _run(args, cwd=cwd, timeout=max(.01, min(timeout, DEADLINE - time.monotonic())), check=check, env=env)
+        options = {'raw_stdout': True} if raw_stdout else {}
+        return _run(args, cwd=cwd, timeout=max(.01, min(timeout, DEADLINE - time.monotonic())), check=check, env=env, **options)
     finally:
         row = getattr(EXECUTION, 'row', None)
         if row is not None:
@@ -2307,6 +2309,263 @@ def clone_worktree_status(path):
     return evidence
 
 
+DIRTY_IDLE = 30 * 86400
+
+
+def dirty_git(path, *args, **env):
+    if '-z' in args:
+        return command(['git', '-C', path, *args], env=dict(source_environment(), **env),
+                       raw_stdout=True).stdout.decode()
+    return command(['git', '-C', path, *args], env=dict(source_environment(), **env)).stdout
+
+
+def credential_path(rel):
+    return ws.SECRET_NAME.search(rel) and not ws.SECRET_TEMPLATE.search(rel)
+
+
+def dirty_tree_paths(path, before, after, *, include_deletions=False):
+    paths = dirty_git(path, 'diff-tree', '--no-commit-id',
+                      '--diff-filter=ACDMRT' if include_deletions else '--diff-filter=ACMRT',
+                      '--no-renames', '--name-only', '-r', '-z', before, after)
+    return set(paths.rstrip('\0').split('\0')) if paths else set()
+
+
+def dirty_activity(workspace_latest, gitdir, shared_logs=()):
+    latest = workspace_latest
+    def accumulate(path):
+        nonlocal latest
+        try:
+            latest = max(latest, os.lstat(path).st_mtime, os.stat(path).st_mtime)
+        except FileNotFoundError:
+            if os.path.lexists(path):
+                raise
+    for path in (os.path.join(gitdir, 'HEAD'), os.path.join(gitdir, 'index'), *shared_logs):
+        accumulate(path)
+    def failed(exc):
+        if not isinstance(exc, FileNotFoundError) or exc.filename != os.path.join(gitdir, 'logs'):
+            raise exc
+    for parent, dirs, files in os.walk(os.path.join(gitdir, 'logs'), followlinks=False, onerror=failed):
+        checkpoint()
+        if any(os.path.islink(os.path.join(parent, name)) for name in dirs):
+            raise ws.Keep('Git reflog directory is not physical')
+        for name in files:
+            accumulate(os.path.join(parent, name))
+    return latest
+
+
+def dirty_state(path, gitdir, latest, changes, stashes):
+    if time.time() - latest < DIRTY_IDLE:
+        raise ws.Keep('stash exists; dirty archive requires 30 days idle' if stashes
+                      else 'dirty working tree (including untracked); archive requires 30 days idle')
+    modules = os.path.join(gitdir, 'modules')
+    if os.path.lexists(modules):
+        if not stat.S_ISDIR(os.lstat(modules).st_mode):
+            raise ws.Keep('dirty archive cannot preserve Git submodule storage')
+        with os.scandir(modules) as entries:
+            if next(entries, None):
+                raise ws.Keep('dirty archive cannot preserve Git submodule storage')
+    staged_paths = dirty_git(path, 'ls-files', '--stage', '-z')
+    if any(entry.startswith('160000 ') for entry in staged_paths.split('\0')):
+        raise ws.Keep('dirty archive cannot preserve Git submodule history')
+    ignored = dirty_git(path, 'ls-files', '-z', '--others', '--ignored', '--exclude-standard')
+    if any(credential_path(rel) and not ignored_dependency_file(rel) for rel in ignored.split('\0') if rel):
+        raise ws.Keep('ignored credential; dirty tree retained')
+    paths = [row[3:] for row in changes.split('\0') if row]
+    # Inspect staged/worktree paths and all stash trees, including stash -u's
+    # separate untracked parent. A deletion of a credential alone is harmless.
+    changed = set(paths)
+    for stash in stashes:
+        parts = dirty_git(path, 'rev-list', '--parents', '-n1', stash).split()
+        if len(parts) not in (3, 4):
+            raise ws.Keep('stash structure unknown')
+        for tree in (stash, parts[2]):
+            changed.update(dirty_tree_paths(path, parts[1], tree))
+        if len(parts) == 4:
+            changed.update(dirty_git(path, 'ls-tree', '-r', '--name-only', '-z', parts[3]).split('\0'))
+    if any(credential_path(rel) for rel in changed if rel):
+        raise ws.Keep('credential in dirty or stashed paths; tree retained')
+    for rel in paths:
+        if any(part in ('', '.', '..') for part in rel.split('/')):
+            raise ws.Keep('invalid dirty path')
+        try:
+            info = os.lstat(os.path.join(path, rel))
+        except FileNotFoundError:
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ws.Keep('dirty path is not an independent regular file')
+    return {'status_sha256': hashlib.sha256(changes.encode()).hexdigest(), 'stashes': stashes}
+
+
+def dirty_origin(path):
+    # Existing site configuration identifies the private internal Git service.
+    # Never infer that a GitHub or arbitrary network origin is private.
+    host = ws.site_setting('devcloud.internalGitHost')
+    fetch = dirty_git(path, 'remote', 'get-url', '--all', 'origin').splitlines()
+    push = dirty_git(path, 'remote', 'get-url', '--push', '--all', 'origin').splitlines()
+    if len(fetch) != 1 or len(push) != 1 or not host or host in {'github.com', 'www.github.com'}:
+        raise ws.Keep('dirty archive has no single verified private origin')
+    def private_url(url):
+        if '://' in url:
+            parsed = urlsplit(url)
+            return (parsed.scheme in ('ssh', 'https') and parsed.hostname == host
+                    and parsed.password is None and (parsed.scheme != 'https' or parsed.username is None)
+                    and not parsed.query and not parsed.fragment and bool(parsed.path.strip('/')))
+        return bool(re.fullmatch(r'(?:[a-zA-Z0-9_.-]+@)?' + re.escape(host) + r':[^:\s]+', url))
+    if not all(private_url(url) for url in fetch + push) or remote_identity(fetch[0], path) != remote_identity(push[0], path):
+        raise ws.Keep('dirty archive origin is not the same private fetch/push repository')
+    live_query(path, push[0])
+    return push[0]
+
+
+def dirty_live_guard(path):
+    projects = json.loads(command(['bb', 'project', 'list', '--json']).stdout)
+    environments = json.loads(command(['bb', 'environment', 'list', '--json']).stdout)
+    if not isinstance(projects, list) or not isinstance(environments, list):
+        raise ws.Keep('dirty archive BB inventory unknown')
+    for project in projects:
+        for item in project['sources']:
+            if item.get('path') and inside(canonical(item['path']), path):
+                raise ws.Keep('BB project source; dirty tree retained')
+    for env in environments:
+        if env['status'] == 'destroyed' or (env.get('lifecycle') or {}).get('phase') == 'destroyed':
+            continue
+        point = env.get('path') or ((env.get('environmentProviderSelection') or {}).get('inputs') or {}).get('path')
+        if not point:
+            if env['status'] == 'error' and not env.get('environmentProviderInstanceKey'):
+                continue
+            raise ws.Keep('BB environment path unknown')
+        if inside(canonical(point), path):
+            raise ws.Keep('undestroyed BB environment; dirty tree retained')
+    processes = {}
+    environments = process_anchors(processes)
+    scope_directories(processes, getattr(environments, 'scopes', {}), {'trees': {path: 'clone'}})
+    if ws.anchored(processes, path):
+        raise ws.Keep(ws.anchored(processes, path))
+    if any(inside(mount, path) for mount in process_mounts()):
+        raise ws.Keep('mounted path inside dirty candidate')
+
+
+def dirty_trees(row):
+    path = row['path']
+    flags = dirty_git(path, 'ls-files', '-v', '-z')
+    if any(entry and (entry[0] == 'S' or entry[0].islower()) for entry in flags.split('\0')):
+        raise ws.Keep('dirty snapshot cannot verify sparse or assume-unchanged files')
+    with tempfile.TemporaryDirectory(prefix='devcloud-archive-', dir='/var/tmp') as scratch:
+        index = Path(scratch, 'index')
+        # Copy the real index to preserve staged content even when it differs
+        # from both HEAD and the worktree; all writes use the scratch index.
+        shutil.copyfile(Path(row['gitdir'], 'index'), index)
+        env = {'GIT_INDEX_FILE': str(index)}
+        staged = dirty_git(path, 'write-tree', **env).strip()
+        changes = dirty_git(path, 'status', '--porcelain=v1', '-z', '--no-renames',
+                            '--untracked-files=all', '--ignore-submodules=none')
+        if hashlib.sha256(changes.encode()).hexdigest() != row['dirty_archive']['status_sha256']:
+            raise ws.Keep('dirty status changed before building snapshot')
+        records = [record for record in changes.split('\0') if record]
+        paths = [record[3:] for record in records]
+        # Reject clean filters, EOL transforms, and encoding transforms on
+        # changed files rather than silently archiving different bytes.
+        for offset in range(0, len(paths), 128):
+            attrs = dirty_git(path, 'check-attr', '-z', 'filter', 'text', 'eol',
+                              'working-tree-encoding', 'ident', '--', *paths[offset:offset+128])
+            if any(value not in ('unspecified', 'unset') for value in attrs.split('\0')[2::3]):
+                raise ws.Keep('dirty snapshot would transform files via Git attributes')
+        # The scratch index already includes staged changes. Limit add to
+        # the observed worktree changes so a new file cannot race into a push.
+        tracked = [record[3:] for record in records if record[:2] != '??' and record[1] != ' ']
+        untracked = [record[3:] for record in records if record[:2] == '??']
+        for mode, selected in (('-u', tracked), ('-A', untracked)):
+            if not selected:
+                continue
+            # Tracked descendants of an ignored directory remain tracked.
+            # Explicit add -A pathspecs would reject that ignored ancestor.
+            pathspec = Path(scratch, 'paths')
+            pathspec.write_bytes(('\0'.join(selected) + '\0').encode())
+            dirty_git(path, '--literal-pathspecs', '-c', 'core.autocrlf=false', 'add', mode,
+                      '--pathspec-file-nul', '--pathspec-from-file=' + str(pathspec), **env)
+        working = dirty_git(path, 'write-tree', **env).strip()
+        if dirty_tree_paths(path, staged, working, include_deletions=True) - set(tracked + untracked):
+            raise ws.Keep('unexpected paths in dirty snapshot')
+        for tree in (staged, working):
+            if any(credential_path(rel) for rel in dirty_tree_paths(path, row['head'], tree) if rel):
+                raise ws.Keep('credential in snapshot tree; dirty tree retained')
+        return staged, working
+
+
+def push_dirty_refspecs(path, url, refspecs, *, timeout=120, verify=()):
+    # Freeze the validated destination. The source clone's mutable config
+    # cannot redirect the push or add refs; only its object store is shared.
+    if dirty_origin(path) != url:
+        raise ws.Keep('dirty archive origin changed')
+    objects = dirty_git(path, 'rev-parse', '--path-format=absolute', '--git-path', 'objects').rstrip('\n')
+    if not os.path.isabs(objects) or any(mark in objects for mark in '\r\n'):
+        raise ws.Keep('dirty archive has unsupported Git object directory')
+    object_format = dirty_git(path, 'rev-parse', '--show-object-format').strip()
+    with tempfile.TemporaryDirectory(prefix='devcloud-push-', dir='/var/tmp') as scratch:
+        env = source_environment()
+        command(['git', 'init', '--bare', '--template=', '--object-format=' + object_format, scratch], env=env)
+        Path(scratch, 'objects/info/alternates').write_text(objects + '\n')
+        for key in ('remote.origin.url', 'remote.origin.pushurl'):
+            command(['git', '-C', scratch, 'config', '--local', key, url], env=env)
+        transport = ['git', '-C', scratch, '-c', 'remote.origin.mirror=false',
+                     '-c', 'http.followRedirects=false']
+        for flags in ([], ['--push']):
+            if command([*transport, 'remote', 'get-url', *flags, '--all', 'origin'],
+                       env=env).stdout.splitlines() != [url]:
+                raise ws.Keep('dirty archive origin rewritten in archive transport')
+        result = command([*transport, 'push', '--no-follow-tags', '--no-verify', '--recurse-submodules=no',
+                          '--', 'origin', *refspecs], env=env, timeout=timeout)
+        if verify:
+            # Query the same frozen origin using a new Git process.
+            output = command([*transport, 'ls-remote', '--refs', '--', 'origin',
+                              *(a['ref'] for a in verify)], env=env).stdout
+            observed = {ref: sha for sha, ref in (line.split() for line in output.splitlines())}
+            if any(observed.get(a['ref']) != a['sha'] for a in verify):
+                raise ws.Keep('archive SHA verification failed')
+        return result
+
+
+def archive_dirty(row, stamp, log):
+    path, url = row['path'], row['archive_url']
+    dirty_live_guard(path)
+    if dirty_origin(path) != url:
+        raise ws.Keep('dirty archive origin changed')
+    staged, working = dirty_trees(row)
+    stashes = row['dirty_archive']['stashes']
+    # Preserve the real staged tree separately and keep every stash reachable
+    # through the snapshot, in addition to preserving the original HEAD.
+    message = 'DevCloud dirty worktree archive'
+    author = dict(GIT_AUTHOR_NAME='DevCloud Storage Upkeep', GIT_COMMITTER_NAME='DevCloud Storage Upkeep',
+                  GIT_AUTHOR_EMAIL='devcloud-storage@localhost', GIT_COMMITTER_EMAIL='devcloud-storage@localhost')
+    index_commit = dirty_git(path, 'commit-tree', '--no-gpg-sign', staged, '-p', row['head'],
+                             '-m', message + ' (index)', **author).strip()
+    parents = list(dict.fromkeys([row['head'], index_commit, *stashes]))
+    sha = dirty_git(path, 'commit-tree', '--no-gpg-sign', working,
+                    *[arg for parent in parents for arg in ('-p', parent)],
+                    '-m', message + '\nStashes newest first: ' + ' '.join(stashes), **author).strip()
+    host = re.sub(r'[^a-zA-Z0-9.-]', '-', os.uname().nodename)
+    path_hash = hashlib.sha256(path.encode()).hexdigest()
+    ref = f'refs/archive/devcloud/{host}/{stamp[:8]}/{path_hash}'
+    restore = (shlex.join(['git', 'fetch', '--', url, ref]) + ' && ' +
+               shlex.join(['git', 'checkout', '--detach', sha]))
+    restore_dirty = (restore + ' && ' + shlex.join(['git', 'reset', '--soft', row['head']]) +
+                     ' && ' + shlex.join(['git', 'read-tree', index_commit]))
+    arc = dict(source='dirty worktree', url=url, ref=ref, sha=sha, restore=restore,
+               restore_dirty=restore_dirty, index_commit=index_commit, stashes=stashes,
+               stash_restore=[shlex.join(['git', 'stash', 'store', sha]) for sha in reversed(stashes)])
+    persist(log, dict(row, event='archive_intent', requested_archives=[arc]))
+    push_dirty_refspecs(path, url, [f'{sha}:{ref}'], verify=[arc])
+    row['archives'].append(arc)
+    persist(log, dict(row, event='archive_verified'))
+    return staged, working
+
+
+def confirm_dirty(row, current, trees):
+    if current.get('dirty_archive') != row['dirty_archive'] or dirty_trees(row) != trees:
+        raise ws.Keep('dirty worktree content or stash changed after archive')
+    dirty_live_guard(row['path'])
+
+
 def local_state(path, kind, inventory, anchors, refs, live_parents=False):
     checkpoint()
     if path != canonical(path) or not stat.S_ISDIR(os.lstat(path).st_mode):
@@ -2363,6 +2622,7 @@ def local_state(path, kind, inventory, anchors, refs, live_parents=False):
             if index % 128 == 0:
                 checkpoint()
             latest = max(latest, os.lstat(os.path.join(parent, name)).st_mtime)
+    workspace_latest = latest
     for directory in dict.fromkeys([common, gitdir]):
         # Borrowers may be removed. The lender is protected by references();
         # changing the borrowing configuration is still recent Git activity.
@@ -2383,15 +2643,16 @@ def local_state(path, kind, inventory, anchors, refs, live_parents=False):
                 latest = max(latest, os.lstat(target).st_mtime)
     if time.time() - latest < IDLE:
         raise ws.Keep('active within 7d (168h)')
-    status = None
-    if kind == 'clone':
-        status = clone_worktree_status(path)
-        if status['work_count']:
+    status = clone_worktree_status(path) if kind == 'clone' else None
+    stashes = dirty_git(path, 'stash', 'list', '--format=%H').splitlines()
+    changes = dirty_git(path, 'status', '--porcelain=v1', '-z', '--no-renames',
+                        '--untracked-files=all', '--ignore-submodules=none') if not status or status['work_count'] or stashes else ''
+    dirty = None
+    if changes or stashes:
+        latest = dirty_activity(workspace_latest, gitdir)
+        if status and status['work_count'] and time.time() - latest < DIRTY_IDLE and not stashes:
             raise DirtyClone(status)
-    elif git(path, 'status', '--porcelain', '--untracked-files=all', '--ignore-submodules=none', timeout=600).stdout:
-        raise ws.Keep('dirty working tree (including untracked)')
-    if git(path, 'stash', 'list').stdout:
-        raise ws.Keep('stash exists')
+        dirty = dirty_state(path, gitdir, latest, changes, stashes)
     if ws.populated_submodule(path):
         raise ws.Keep('populated submodule')
     # Owner-rebuildable installed dependency files are not repository secrets.
@@ -2407,10 +2668,11 @@ def local_state(path, kind, inventory, anchors, refs, live_parents=False):
     info = os.lstat(path)
     return {'head': head, 'objects': objects, 'main': primary, 'gitdir': gitdir,
             'identity': [info.st_dev, info.st_ino], 'idle_hours': (time.time() - latest) / 3600,
-            **({'worktree_status': status} if status and status['class'] != 'clean' else {})}
+            **({'worktree_status': status} if status and status['class'] != 'clean' else {}),
+            **({'dirty_archive': dirty} if dirty else {})}
 
 
-def recovery_state(path, objects):
+def recovery_state(path, objects, archive_url=None):
     item = {'objects': objects}
     repo = LiveRepo(path, set(ws.DEFAULT_LOGINS))
     # A remote inside this tree vanishes with it. External local remotes
@@ -2451,12 +2713,12 @@ def recovery_state(path, objects):
     item['urls'] = [pair[0] for pair in repo.remotes.values()]
     item['missing_local_remotes'] = missing_local
     if missing:
-        if not repo.dest:
+        if not repo.dest and not archive_url:
             if missing_local:
                 lost = ', '.join(f'{name} ({target})' for name, target in sorted(missing_local.items()))
                 raise ws.Keep(f'unpushed refs; local remote missing and no archive destination: {lost}')
             raise ws.Keep('unpushed refs and no personal or internal remote')
-        url = ws.transport_url(repo.remotes[repo.dest][1])
+        url = archive_url or ws.transport_url(repo.remotes[repo.dest][1])
         if any('mono2' in s.lower() for s in [path, *item['urls']]) and ws.parse_remote(url)[0] == 'github.com':
             raise ws.Keep('mono2 must never be archived to GitHub')
         item['archive_url'] = url
@@ -2472,8 +2734,13 @@ def plan(path, kind, inventory, anchors, refs, error=None, *, live_parents=False
         if error:
             raise ws.Keep(error)
         with execution_step('remote_proof'):
-            item.update(recovery_state(path, item['objects']))
-        item['action'] = 'archive+remove' if item['archive_objects'] else 'remove'
+            url = dirty_origin(path) if item.get('dirty_archive') else None
+            if url:
+                dirty_live_guard(path)
+            item.update(recovery_state(path, item['objects'], url) if url else recovery_state(path, item['objects']))
+            if url:
+                item['archive_url'] = url
+        item['action'] = 'archive+remove' if item['archive_objects'] or item.get('dirty_archive') else 'remove'
     except Exception as exc:
         item['reason'] = str(exc) if isinstance(exc, ws.Keep) else 'check unknown: ' + ws.failure_text(exc)
         if isinstance(exc, DirtyClone):
@@ -2482,14 +2749,25 @@ def plan(path, kind, inventory, anchors, refs, error=None, *, live_parents=False
 
 
 @contextlib.contextmanager
-def physical_parent(path):
+def physical_parent(path, *, trusted=False):
     """Bind every ancestor by fd with O_NOFOLLOW, then operate on one basename."""
     if path == '/' or not os.path.basename(path):
         raise ws.Keep('not a removable directory entry')
     parts = Path(path).parts
     fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in parts[1:-1]:
+        trusted_owners = {0, os.geteuid()}
+        for index, part in enumerate(parts[1:], start=1):
+            if trusted:
+                parent = os.fstat(fd)
+                child_info = os.stat(part, dir_fd=fd, follow_symlinks=False)
+                if (parent.st_uid not in trusted_owners or
+                        (parent.st_mode & 0o022 and not
+                         (parent.st_mode & stat.S_ISVTX and child_info.st_uid in trusted_owners))):
+                    raise ws.Keep('untrusted writable ancestor for forced Git worktree removal')
+            if index == len(parts) - 1:
+                # The last path component is handled by the caller.
+                break
             child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = child
@@ -2513,7 +2791,8 @@ def clone_environment_anchors():
 def verify_clone_recovery(item):
     """A fresh server generation for this sink, including prior exact archives."""
     LIVE.clear()
-    current = recovery_state(item['path'], item['objects'])
+    current = (recovery_state(item['path'], item['objects'], item['archive_url']) if item.get('dirty_archive')
+               else recovery_state(item['path'], item['objects']))
     missing = current['archive_objects']
     if missing:
         expected = [a for a in item['archives'] if missing.get(a['source']) == a['sha']]
@@ -2539,6 +2818,10 @@ def remove(item, inventory, anchors, refs, *, live=False):
     for key in ('identity', 'objects', 'gitdir', 'main'):
         if local[key] != item[key]:
             raise ws.Keep(f'{key} changed after plan')
+    if local.get('dirty_archive') or item.get('dirty_archive'):
+        if not live or 'verified_dirty_trees' not in item:
+            raise ws.Keep('dirty worktree has no verified archive')
+        confirm_dirty(item, local, item['verified_dirty_trees'])
     if live:
         with execution_step('process_scan'):
             processes = {}
@@ -2614,6 +2897,11 @@ def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
                 raise ws.Keep(fresh['reason'])
             if fresh['objects'] != row['objects'] or fresh['identity'] != row['identity']:
                 raise ws.Keep('local evidence changed')
+            if fresh.get('dirty_archive') != row.get('dirty_archive') or (
+                    fresh.get('dirty_archive') and fresh['archive_url'] != row.get('archive_url')):
+                raise ws.Keep('dirty worktree or archive destination changed after preview')
+            if fresh.get('dirty_archive'):
+                row['verified_dirty_trees'] = archive_dirty(row, stamp, log)
             archives = []
             for source, sha in fresh['archive_objects'].items():
                 prefix = 'refs/tags' if source.startswith('refs/tags/') else 'refs/heads'
@@ -2626,7 +2914,13 @@ def execute(rows, inventory, anchors, refs, roots, excluded, stamp, log):
                     # One push preserves all original objects; no squash or force.
                     push_error = None
                     try:
-                        pushed = git(row['path'], 'push', fresh['archive_url'], *(f'{a["sha"]}:{a["ref"]}' for a in archives), timeout=900, check=False)
+                        refspecs = [f'{a["sha"]}:{a["ref"]}' for a in archives]
+                        if fresh.get('dirty_archive'):
+                            if dirty_origin(row['path']) != fresh['archive_url']:
+                                raise ws.Keep('dirty archive origin changed')
+                            pushed = push_dirty_refspecs(row['path'], url, refspecs, timeout=900)
+                        else:
+                            pushed = git(row['path'], 'push', fresh['archive_url'], *refspecs, timeout=900, check=False)
                         if pushed.returncode:
                             push_error = ws.failure_text(pushed.stderr or pushed.stdout)
                     except Exception as exc:
@@ -2760,10 +3054,28 @@ def reviewed_comparison(rows, preview_path):
     preview = json.loads(Path(preview_path).read_text())
     if preview.get('mode') != 'dry-run' or preview.get('complete') is not True or preview.get('error'):
         raise ws.Keep('reviewed preview is not a complete dry-run')
-    allowed = {(item['path'], item['type']) for item in preview['items'] if item['action'] in ('remove', 'archive+remove')}
+    def key(item):
+        base = (item['path'], item['type'])
+        if not item.get('dirty_archive'):
+            return base
+        state = item['dirty_archive']
+        return (*base, item['archive_url'], tuple(item['identity']), item['head'],
+                state['status_sha256'], tuple(state['stashes']))
+    allowed = {key(item) for item in preview['items'] if item['action'] in ('remove', 'archive+remove')}
     added = [{'path': item['path'], 'type': item['type']} for item in rows
-             if item['action'] != 'keep' and (item['path'], item['type']) not in allowed]
+             if item['action'] != 'keep' and key(item) not in allowed]
     return {'preview': str(preview_path), 'allowed': len(allowed), 'added': added}
+
+
+def scope_dirty_batch(rows, dirty_only):
+    for row in rows:
+        if row['action'] == 'keep':
+            continue
+        if row.get('dirty_archive'):
+            if row['bytes'] is None:
+                row.update(action='keep', reason='dirty archive size unavailable')
+        elif dirty_only:
+            row.update(action='keep', reason='outside reviewed dirty archive batch')
 
 
 def bb_environment_classify(env, threads, now=None):
@@ -3122,14 +3434,19 @@ def linked_state(registration, context):
     if head != live.get('HEAD'):
         raise ws.Keep('registered HEAD changed')
     latest = before.st_mtime
+    workspace_latest = latest
     def failed(exc):
         raise exc
+    nested_git = False
     # Shared common-dir fetches/other worktrees do not refresh this worktree.
     for root in (path, gitdir):
         for parent, dirs, files in os.walk(root, followlinks=False, onerror=failed):
             checkpoint()
             if parent == path:
                 dirs[:] = [d for d in dirs if d != '.git']
+            elif root == path and ('.git' in dirs or '.git' in files or
+                                   {'HEAD', 'objects', 'refs'} <= set(dirs + files)):
+                nested_git = True
             # Git's read probes and transient lockfiles can refresh an admin
             # directory without changing HEAD/index/reflog or source files.
             names = ([*files, *(name for name in dirs if os.path.islink(os.path.join(parent, name)))]
@@ -3142,6 +3459,8 @@ def linked_state(registration, context):
                     if reason:
                         raise ws.Keep(reason)
                 latest = max(latest, info.st_mtime)
+                if root == path:
+                    workspace_latest = max(workspace_latest, info.st_mtime)
                 if time.time() - latest < 86400:
                     raise ws.Keep('active within 24h')
     branch = live.get('branch')
@@ -3152,22 +3471,46 @@ def linked_state(registration, context):
                 latest = max(latest, os.lstat(target).st_mtime)
     if time.time() - latest < 86400:
         raise ws.Keep('active within 24h')
-    # Preview the same clean state Git requires. Git remove is still the final
-    # judge, including submodules and ignored entries; never pass --force.
-    if source_git(path, 'status', '--porcelain', '--untracked-files=all').stdout:
-        raise ws.Keep('Git working tree is dirty (including untracked)')
+    changes = dirty_git(path, 'status', '--porcelain=v1', '-z', '--no-renames',
+                        '--untracked-files=all', '--ignore-submodules=none')
+    dirty = None
+    if changes:
+        # A clean linked checkout never needs force: its stashes live in the
+        # common repository and ordinary Git removal leaves them intact.
+        stashes = dirty_git(path, 'stash', 'list', '--format=%H').splitlines()
+        shared_logs = ([os.path.join(common, 'logs', branch)] if branch else [])
+        if stashes:
+            shared_logs.append(os.path.join(common, 'logs/refs/stash'))
+        latest = dirty_activity(workspace_latest, gitdir, shared_logs)
+        if nested_git:
+            raise ws.Keep('contains nested Git repository')
+        for directory in (common, gitdir):
+            for name in (*ws.IN_PROGRESS, 'index.lock', 'HEAD.lock', 'packed-refs.lock', 'config.lock'):
+                if os.path.lexists(os.path.join(directory, name)):
+                    raise ws.Keep('git operation in progress: ' + name)
+        with physical_parent(path, trusted=True):
+            dirty = dirty_state(path, gitdir, latest, changes, stashes)
+
     after = os.lstat(path)
     if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
         raise ws.Keep('worktree directory changed')
     objects = {branch or 'HEAD': head}
     return dict(live, identity=[after.st_dev, after.st_ino], gitdir=gitdir, head=head, objects=objects,
-                idle_hours=(time.time() - latest) / 3600)
+                idle_hours=(time.time() - latest) / 3600,
+                **({'dirty_archive': dirty} if dirty else {}))
 
 
 def linked_plan(registration, context):
     row = dict(registration, action='keep', archives=[])
+    row.pop('dirty_archive', None)
     try:
         row.update(linked_state(registration, context))
+        if row.get('dirty_archive'):
+            url = dirty_origin(row['path'])
+            dirty_live_guard(row['path'])
+            row.update(action='archive+remove', archive_url=url,
+                       remote_proofs={}, archive_objects={}, urls=[], rejected_local_remotes={}, remote_errors={})
+            return row
         repo = LiveRepo(row['main'], set(ws.DEFAULT_LOGINS))
         rejected = {}
         for name, (url, _) in list(repo.remotes.items()):
@@ -3231,6 +3574,10 @@ def linked_execute(rows, log, stamp):
                     raise ws.Keep(key + ' changed after preview')
             for key in ('remote_proofs', 'archive_objects', 'urls', 'rejected_local_remotes', 'remote_errors'):
                 row[key] = fresh[key]
+            if fresh.get('dirty_archive') != row.get('dirty_archive') or (
+                    fresh.get('dirty_archive') and fresh['archive_url'] != row.get('archive_url')):
+                raise ws.Keep('dirty worktree or archive destination changed after preview')
+            trees = archive_dirty(row, stamp, log) if row.get('dirty_archive') else None
             for source, sha in fresh['archive_objects'].items():
                 ref = f'refs/heads/archive/git-tree/{ws.archive_slug(row["path"])}-{stamp}/' + re.sub(r'[^A-Za-z0-9-]', '-', source)
                 url = fresh['archive_url']
@@ -3246,12 +3593,18 @@ def linked_execute(rows, log, stamp):
             for key in ('identity', 'head', 'gitdir', 'main', 'objects'):
                 if current[key] != row[key]:
                     raise ws.Keep(key + ' changed before Git remove')
+            if trees or current.get('dirty_archive'):
+                if not trees:
+                    raise ws.Keep('dirty worktree has no verified archive')
+                confirm_dirty(row, current, trees)
             persist(log, dict(row, event='remove_intent'))
-            with physical_parent(row['path']) as (fd, basename):
+            with physical_parent(row['path'], trusted=bool(trees)) as (fd, basename):
                 actual = os.stat(basename, dir_fd=fd, follow_symlinks=False)
                 if [actual.st_dev, actual.st_ino] != row['identity']:
                     raise ws.Keep('directory identity changed')
-                source_git(row['main'], 'worktree', 'remove', '--', current['registered_path'])
+                checkpoint()
+                source_git(row['main'], 'worktree', 'remove', *(['--force'] if trees else []),
+                           '--', current['registered_path'])
             row['result'] = 'removed'
         except Exception as exc:
             row.update(result='kept', reason=ws.failure_text(exc))
@@ -3263,10 +3616,13 @@ def linked_main(argv=None):
     parser = argparse.ArgumentParser(description='Registered linked worktrees: Git remove, 24h idle; independent clones use git_tree_sweep.py.')
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--reviewed-preview')
+    parser.add_argument('--dirty-only', action='store_true', help='Limit this run to dirty archives; skip clean removals and prune.')
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--budget-minutes', type=float, default=15)
     parser.add_argument('--state-dir', default=os.path.expanduser('~/.local/state/devcloud-storage-upkeep'))
     args = parser.parse_args(argv)
+    if args.dirty_only and args.execute and not args.reviewed_preview:
+        parser.error('--dirty-only --execute requires --reviewed-preview')
     started = time.monotonic(); DEADLINE = started + args.budget_minutes * 60; LIVE.clear()
     # The linked entry is a separate process; retain host config but discard
     # inherited repository/config injection, just like source_git.
@@ -3295,6 +3651,7 @@ def linked_main(argv=None):
                     row['bytes'] = int(out.stdout.split()[0]) if out.returncode == 0 else None
                 except Exception: row['bytes'] = None
             with cf.ThreadPoolExecutor(8) as pool: list(pool.map(measure, rows))
+            scope_dirty_batch(rows, args.dirty_only)
             persist(log, {'event':'planned','seconds':time.monotonic()-started,'summary':summarize(rows)})
             if args.reviewed_preview:
                 prior = json.loads(Path(args.reviewed_preview).read_text())
@@ -3302,7 +3659,7 @@ def linked_main(argv=None):
                 comparison = reviewed_comparison(rows,args.reviewed_preview)
                 if comparison['added']: raise ws.Keep('new linked candidates outside reviewed preview; no actions performed')
             if args.execute: linked_execute(rows,log,stamp)
-            for main in mains:
+            for main in (() if args.dirty_only else mains):
                 try:
                     flags = [] if args.execute else ['--dry-run']
                     out = source_git(main,'worktree','prune','--verbose',*flags)
@@ -3327,10 +3684,13 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--reviewed-preview', help='First execution batch: stop before archive/removal if new candidates appear.')
+    parser.add_argument('--dirty-only', action='store_true', help='Limit this run to dirty archives.')
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--budget-minutes', type=float, default=30)
     parser.add_argument('--state-dir', default=os.path.expanduser('~/.local/state/devcloud-storage-upkeep'))
     args = parser.parse_args(argv)
+    if args.dirty_only and args.execute and not args.reviewed_preview:
+        parser.error('--dirty-only --execute requires --reviewed-preview')
     started = time.monotonic()
     started_at = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
     LIVE.clear()
@@ -3429,6 +3789,7 @@ def main(argv=None):
             timings['measurement_wait_seconds'] = round(time.monotonic() - wait_started, 3)
             timings['measurement_seconds'] = round(max((finished for _, finished in measured.values()), default=measurement_started) - measurement_started, 3)
         comparison = None
+        scope_dirty_batch(rows, args.dirty_only)
         if args.reviewed_preview:
             try:
                 comparison = reviewed_comparison(rows, args.reviewed_preview)
