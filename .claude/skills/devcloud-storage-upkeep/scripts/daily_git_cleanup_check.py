@@ -106,11 +106,19 @@ EVIDENCE_GAP = re.compile(
     r'name collision|name reference|exceeded .*s|timed out|timeout|budget exhausted|'
     r'archive (?:push failed|sha verification failed)', re.I,
 )
+TIME_WINDOW = re.compile(
+    r'(?:(?:provider workspace )?active|BB activity) within \d+(?:\.\d+)?[hdw]'
+    r'(?: \(\d+h\))?|'
+    r'(?:dirty working tree \(including untracked\); archive|stash exists; dirty archive)'
+    r' requires \d+ days idle'
+)
 
 
 def retention_class(reason):
     if reason.startswith(('unpushed refs', 'unpushed branch')):
         return 'protection'
+    if TIME_WINDOW.fullmatch(reason):
+        return 'time-window'
     return 'evidence-gap' if EVIDENCE_GAP.search(reason) else 'protection'
 
 
@@ -143,9 +151,11 @@ def retention_alerts(stage, ranking, history, usable):
     alerts, emitted = [], set()
     for bucket in ranking['by_bytes']:
         reason = bucket['reason']
-        if retention_class(reason) == 'evidence-gap':
+        category = retention_class(reason)
+        if category == 'evidence-gap':
             if bucket['bytes'] is not None and bucket['bytes'] > THRESHOLD:
                 alerts.append(dict(stage=stage, kind='retention_over_20_gib', **bucket))
+        if category != 'protection':
             continue
         key = stable_reason(reason)
         if key in emitted:

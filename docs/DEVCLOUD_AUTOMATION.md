@@ -171,7 +171,7 @@ BB owner 盘点任务 `auto_ziaxnfa6kx4` 每天 05:45（Asia/Shanghai），调�
 
 ## 2. 不可变快照与发布
 
-仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `ae2dd976543a1a6a`），包含
+仓库改动不会自动进入任务。Git 使用独立快照 `<git-snap>`（本轮 `81cc8ec05a845e29`），包含
 `git_tree_sweep_bb_cli.py`、`bb_environment_sweep.py`、`git_tree_sweep.py`、`git_tree_sweep_run.sh`、
 `git_tree_sweep_worker.sh`、`worktree_sweep.py`、`tmp_clone_sweep.py`、
 `daily_git_cleanup_check.py`、`bb_storage_maintenance.py` 九个脚本和 `manifest.json`。上一版七脚本性能快照为 `3c35f7ad513b5140`。
@@ -209,6 +209,7 @@ bb automation runs auto_hukidoavox0 --project proj_8d3wrcajxn --limit 3 --json
 最多五个路径，`by_count` 列出按数量排序的原因及计数。同原因内嵌套的已测目录不重复计量；
 不同原因/阶段的字节不可相加，也不能视为可释放空间。证据缺口超过 20 GiB 告警；正常保护仅当同阶段、
 同原因最近三个完整定时样本严格递增且累计 ≥3 GiB 告警，进程类别跨日忽略 PID。
+近期活跃和等待闲置期届满等时间窗口类原因仍列排名，不参加保留原因趋势告警。
 缺桶、未测或不完整报告不作趋势样本。
 linked/clone 以 BB 定时 launcher 的 systemd invocation ID 对应报告；连续三个自然日的执行
 均完整且零删除、同日 07:00–07:30 的三个有效样本显示保留路径对应的最具体计量根持续增长，

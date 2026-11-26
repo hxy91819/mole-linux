@@ -221,7 +221,6 @@ print(json.dumps(dict(id=args[2], projectId=args[4], execution=dict(mode="agent"
     ['BB environment'] * 3,
     ['unarchived threads'] * 3,
     ['dirty working tree (including untracked)'] * 3,
-    ['active within 7d (168h)'] * 3,
     ['unpushed refs and no personal or internal remote'] * 3,
     ['process 10 cwd', 'process 11 cwd', 'process 12 cwd'],
 ])
@@ -250,6 +249,29 @@ def test_normal_protection_only_alerts_on_valid_three_day_growth(reasons, scenar
         assert alert['largest_paths'][0]['path'] == '/data/big'
     else:
         assert result['alerts'] == []
+
+
+@pytest.mark.parametrize(('stage', 'reason'), [
+    ('linked', 'active within 24h'),
+    ('clones', 'active within 7d (168h)'),
+    ('linked', 'active within 12h'),
+    ('bb-environments', 'BB activity within 24h'),
+    ('bb-environments', 'provider workspace active within 24h'),
+    ('linked', 'dirty working tree (including untracked); archive requires 30 days idle'),
+    ('clones', 'stash exists; dirty archive requires 30 days idle'),
+])
+def test_time_window_growth_stays_in_retention_rankings_without_alert(stage, reason):
+    reports = {}
+    for day, gib in zip(DAYS, [30, 32, 35]):
+        rows = [kept('/data/recent', gib * GIB, reason=reason)]
+        reports[(stage, day)] = dict(complete=True, items=rows, summary=sweep.summarize(rows))
+    result = daily.assess(DAYS, {day: day for day in DAYS}, reports, [{}, {}, {}])
+    assert result['alerts'] == []
+    ranking = result['stages'][stage]['retention']
+    assert ranking['by_bytes'][0]['reason'] == reason
+    assert ranking['by_bytes'][0]['bytes'] == 35 * GIB
+    assert ranking['by_count'][0]['reason'] == reason
+    assert ranking['by_count'][0]['count'] == 1
 
 
 @pytest.mark.parametrize('reason', ['Git registration unavailable', 'gitdir missing',
