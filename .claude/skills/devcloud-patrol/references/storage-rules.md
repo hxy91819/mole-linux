@@ -363,6 +363,7 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | `/data/.pnpm-store` | pnpm store (pnpm_store_prune.py) |
 | `/data/root-storage-20260912/root/.local/share/pnpm/store` | pnpm store (pnpm_store_prune.py) |
 | `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` | agent-cli-updates 更新器 |
+| `/data/code/opencraft` | opencraft（owner maintenance:local-runtime；mole-linux 每日调度） |
 | `/data/code/mono2/.worktrees` | mono2 agent worktrees（linked/clone sweep） |
 | `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（cursor_session_sweep.mjs 每日） |
 | `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（保留最近两次成功部署的检查点） |
@@ -384,6 +385,14 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 | `/data/system-tmp/fast-feedback-rules-followup_*` | SaiensCreditSystemRails |
 | `/data/system-tmp/scan-preview-drag-experiment_*` | SaiensCreditSystemRails |
 <!-- /growth-fingerprints -->
+
+## OpenCraft checkout 本地运行目录
+
+- owner 是 opencraft，清理方是其 `npm run maintenance:local-runtime -- --apply`；mole-linux 只负责每日调度，不新增递归删除逻辑。工作目录固定 `/data/code/opencraft`，包装入口为 upkeep 的 `scripts/opencraft_local_runtime.py`（默认预演，`--apply` 执行）。
+- 扫描根显式固定为 checkout 的 `.local` 与 `.runtime`，进程根固定为宿主 `/proc`，不能继承测试 proc/root 覆盖。owner 工具逐项保留凭据、`team-credentials`/`credentials`/`private`、`.local/steward`、活进程 cwd/root/exe/maps/fd 引用与读取未知项；显式保护根同时保护其祖先候选。无引用历史运行目录不按年龄等待。
+- 按 11-18 恢复契约，显式保护 `.runtime`、`.local/personal-relay`、`.local/execution-separation`，不能因服务停止就清掉当前包、数据库、凭据和 nginx 恢复配置。personal-relay 中还有活跃 Compose bind mount，宿主 `/proc` 不一定暴露容器内路径；外部传入的额外保护根只追加。
+- 每天 06:20 执行 owner apply，900 秒任务超时、内部 840 秒；先人工预演并核对清单后首次执行，后续按上述规则自动执行。结果由 BB 保存 stdout/stderr/exit，owner 删除记录在 `.local/maintenance/local-runtime-retention.jsonl`。
+- PR #286 后新出现的 checkout 写入路径只记录并交 owner 决定，不在本任务修改 opencraft。当前 `personal-relay/compose/releases` 的部署包和 `steward` 的镜像归档/验收副本属于此类；每日 prune 只能约束符合 owner 规则的历史产物，不能承诺受保护部署与工作簿的总量上限。
 
 ## 包缓存
 

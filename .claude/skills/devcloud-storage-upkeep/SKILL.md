@@ -68,6 +68,10 @@ python3 -I <本技能根>/scripts/pnpm_store_prune.py             # 发现的各
 
 完成条件：执行前后的 `df`、按项目统计的删除和归档数量、每一类保留原因都已记录；失败项给出原因和下一步。
 
+### OpenCraft owner 本地运行目录
+
+每天 06:20 调用本技能 `scripts/opencraft_local_runtime.py --apply`，在 `/data/code/opencraft` 执行 owner 的 `npm run maintenance:local-runtime -- --apply`。人工先运行不带 `--apply` 的预演。保护根与恢复契约见 storage-rules 的「OpenCraft checkout 本地运行目录」；新增写入路径只记录交 owner，不直接改 opencraft。
+
 ## 4. 记账
 
 向本仓 `storage-audit.log` 追加一节：时间、前后容量、增长源证据、本轮动作和数量、保留原因、转给生产端的修复。规则有变化时同步改 storage-rules、相关文档与每日检查，并补 `tests/test_devcloud_storage_upkeep.py` 的回归。

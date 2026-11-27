@@ -14,9 +14,10 @@
 | 任务 | ID | cron（Asia/Shanghai） | 命令 | 超时 |
 |---|---|---|---|---|
 | 水位刹车 | `auto_idedelow-3g` | `0,15,30,45 * * * *` | `/usr/bin/python3 -I <snap>/storage_watermark_brake.py` | 120 秒 |
+| OpenCraft owner prune | `auto_-vwoibpctju` | `20 6 * * *` | `/usr/bin/python3 -I <owner-snap>/opencraft_local_runtime.py --apply`；cwd=/data/code/opencraft | 900 秒 |
 | 增长计量 | `auto_u4kos3to-di` | `0 7 * * *` | `/usr/bin/python3 -I <snap>/storage_growth_measure.py` | 900 秒 |
 
-均用 bash 启动脚本 exec 上述命令，工作目录 `/var/tmp`。水位只调用既有任务：/data 对应
+均用 bash 启动脚本 exec 上述命令；OpenCraft 工作目录为 `/data/code/opencraft`，其余为 `/var/tmp`。水位只调用既有任务：/data 对应
 Docker、全盘 Git 清理、pnpm 与 clean-tmp `/data/system-tmp`，/ 对应 Go 缓存修剪与 clean-tmp `/var/tmp`；旧 tmp clone ID 已停用、保存为空操作，从现行水位派发移除。
 首次越线、级别升高或两小时冷却结束才触发并打印一行简报；正常/冷却完全静默（skipped）。
 运行查询 unknown 跳过并在简报注明。`--dry-run` 只打印计划，不查 BB、不写状态、不启动清理。
@@ -454,3 +455,17 @@ clone预演/执行预算均30分钟，worker仍先环境5分钟、linked15分钟
 2026-11-19性能最终实测：943项回归通过，两轮只读审查的6项发现均修复。完整两盘预演604.474秒，执行556.413秒（9分16秒），均complete=true/error=null；执行循环106.365秒，32棵任务自有基准clone全部删除，平均3.319秒/棵、最慢4.164秒，归档/失败0，业务新增候选0，reviewed_comparison.added=[]。基准每棵100个tracked文件，8棵另有2500个ignored文件；此批与旧32棵业务仓库的文件量不同，不将两批总时间直接当作同负载加速比。同条件两样本旧218.858/530.170秒→新3.808/3.743秒，瓶颈为重复全盘发现和全局usage；本轮32棵的实时进程合计57.551秒、BB环境41.543秒、远端1.287秒、实际删除1.231秒。全局库存UTC开始06:57:06、发现07:00:08、引用完成07:01:07；轮内复用，逐树实时核查照常。
 
 正式任务auto_hukidoavox0已回读：3c35快照、enabled、06:30/AsiaShanghai、--execute、120秒launcher；worker5/15/30分钟、硬限53分钟，每日prompt一致，旧tmp任务disabled+noop。人工本轮仅验证完整clone阶段，不冒充三阶段schedule；下一次定时验证为11月20日06:30。任务自有基准根及测试夹具已清理；未部署的8197/9947准备快照删除，补丁与审查日志保留。完整逐树耗时、容量净变与复现证据：`/root/.bb/thread-storage/thr_e7qrqpgykc/worktree-sweep/clone-performance-20261119/REPORT.md`。改动留工作区，由owner提交。
+
+### OpenCraft owner prune（2026-11-28）
+
+`auto_-vwoibpctju` 每日 06:20（Asia/Shanghai），工作目录 `/data/code/opencraft`，保存脚本执行
+`/usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/71da92b4c143dfba/opencraft_local_runtime.py --apply`。
+内部预算 840 秒，BB 超时 900 秒。包装器调用 checkout 当前的 `npm run maintenance:local-runtime -- --apply`，
+不冻结或重写 opencraft owner 工具；其保留契约见 `docs/operations/local-runtime-retention.md`。
+凭据、活进程、读取未知、显式保护根仍由 owner 工具判断；固定恢复保护见 storage-rules 的 OpenCraft 节。
+
+增长计量 `auto_u4kos3to-di` 切换为快照 `6d42fe369b4f58ca`，登记 `/data/code/opencraft` 的 owner 和清理方。
+更新每日 prompt 后执行 `python3 -I scripts/sync_daily_check_prompt.py --apply` 和 `--check`。
+任务保存命令、enabled、cron、时区、timeout、工作目录须读回一致；人工执行不替代首次 schedule 验收。
+逐项首次清理清单、df/du、PR #286 后新增路径的生产证据只保存在本机账本及
+`.local/devcloud/opencraft-runtime-20261128/`，不把私有运行记录提交到公开仓库。

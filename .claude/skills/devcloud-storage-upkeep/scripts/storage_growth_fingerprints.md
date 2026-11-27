@@ -5,6 +5,7 @@
 | `/data/.pnpm-store` | pnpm store (pnpm_store_prune.py) |
 | `/data/root-storage-20260912/root/.local/share/pnpm/store` | pnpm store (pnpm_store_prune.py) |
 | `/data/root-storage-20260912/root/.local/share/cursor-agent/versions` | agent-cli-updates 更新器 |
+| `/data/code/opencraft` | opencraft（owner maintenance:local-runtime；mole-linux 每日调度） |
 | `/data/code/mono2/.worktrees` | mono2 agent worktrees（linked/clone sweep） |
 | `/data/root-migrated/agent-state/cursor/projects` | BB Cursor provider sessions（cursor_session_sweep.mjs 每日） |
 | `/data/root-migrated/agent-state/bb-deployment-checkpoints` | BB deployment checkpoints（保留最近两次成功部署的检查点） |

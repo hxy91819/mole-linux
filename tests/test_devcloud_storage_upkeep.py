@@ -3053,7 +3053,7 @@ def test_growth_every_fingerprint_matches_an_owned_latest_metric(tmp_path, monke
     monkeypatch.setattr(g.Path, 'iterdir', lambda p: [p / n for n in listings[str(p)]])
     monkeypatch.setattr(g, 'OUT', tmp_path)
     direct = {
-        '/data/code': ['mono2', 'mono2/.worktrees', 'mono2/unrelated'],
+        '/data/code': ['mono2', 'mono2/.worktrees', 'mono2/unrelated', 'opencraft'],
         '/data/root-storage-20260912': ['root/.local/share/pnpm/store', 'root/.local/share/cursor-agent/versions'],
         '/data/root-migrated': ['agent-state/cursor/projects/mono2/sdk-agent-store/a/agents',
                                 'agent-state/bb-deployment-checkpoints'],
@@ -3334,3 +3334,58 @@ def test_cursor_sweep_expires_orphan_archives_and_preserves_live_or_unproven_one
     assert not removable.exists()
     assert not list(removable.parent.glob(removable.name + '-*'))
     assert all(path.exists() for path in [live, recent, misbound, busy, remaining_source, unrelated])
+
+
+def test_opencraft_growth_owner_names_the_owner_tool():
+    g = load_upkeep('storage_growth_measure')
+    assert g.owner('/data/code/opencraft', g.fingerprints()) == (
+        'opencraft（owner maintenance:local-runtime；mole-linux 每日调度）')
+    assert g.owner('/data/code/opencraft-other', g.fingerprints()) == 'unknown'
+
+
+def test_opencraft_owner_runner_preview_apply_and_failure(tmp_path, monkeypatch):
+    runner = load_upkeep('opencraft_local_runtime')
+    repo = tmp_path / 'opencraft'
+    repo.mkdir()
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    receipt = tmp_path / 'receipt.json'
+    npm = bin_dir / 'npm'
+    npm.write_text('#!' + shutil.which('python3') + '\n' +
+                   'import json, os, pathlib, sys\n' +
+                   'pathlib.Path(os.environ["RECEIPT"]).write_text(json.dumps(' +
+                   '{"cwd": os.getcwd(), "argv": sys.argv[1:], "env": dict(os.environ)}))\n' +
+                   'sys.exit(int(os.environ.get("NPM_EXIT", "0")))\n')
+    npm.chmod(0o755)
+    monkeypatch.setattr(runner, 'REPO', repo)
+    monkeypatch.setattr(runner, 'NODE_BIN', str(bin_dir))
+    monkeypatch.setenv('RECEIPT', str(receipt))
+    monkeypatch.setenv('OPENCRAFT_LOCAL_RUNTIME_ROOTS', '/wrong')
+    monkeypatch.setenv('OPENCRAFT_LOCAL_RUNTIME_PROC_ROOT', '/fake-proc')
+    monkeypatch.setenv('OPENCRAFT_LOCAL_RUNTIME_PROTECTED_ROOTS', '/extra-protection')
+    for args, suffix in [([], []), (['--apply'], ['--', '--apply'])]:
+        assert runner.main(args) == 0
+        row = json.loads(receipt.read_text())
+        assert row['cwd'] == str(repo)
+        assert row['argv'] == ['run', 'maintenance:local-runtime'] + suffix
+        assert row['env']['OPENCRAFT_LOCAL_RUNTIME_ROOTS'] == f'{repo}/.local,{repo}/.runtime'
+        assert row['env']['OPENCRAFT_LOCAL_RUNTIME_PROC_ROOT'] == '/proc'
+        assert row['env']['OPENCRAFT_LOCAL_RUNTIME_PROTECTED_ROOTS'].split(',') == [
+            str(repo / '.runtime'), str(repo / '.local/personal-relay'),
+            str(repo / '.local/execution-separation'), '/extra-protection']
+    monkeypatch.setenv('NPM_EXIT', '7')
+    assert runner.main(['--apply']) == 7
+
+
+def test_opencraft_owner_runner_reports_missing_checkout_and_timeout(tmp_path, monkeypatch, capsys):
+    runner = load_upkeep('opencraft_local_runtime')
+    monkeypatch.setattr(runner, 'REPO', tmp_path / 'absent')
+    assert runner.main([]) == 1
+    assert 'Cannot run' in capsys.readouterr().err
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+
+    monkeypatch.setattr(runner.subprocess, 'run', timeout)
+    assert runner.main(['--apply']) == 124
+    assert '840 seconds' in capsys.readouterr().err
