@@ -70,7 +70,7 @@ python3 -I <本技能根>/scripts/pnpm_store_prune.py             # 发现的各
 
 ### OpenCraft owner 本地运行目录
 
-每天 06:20 调用本技能 `scripts/opencraft_local_runtime.py --apply`，在 `/data/code/opencraft` 执行 owner 的 `npm run maintenance:local-runtime -- --apply`。人工先运行不带 `--apply` 的预演。保护根与恢复契约见 storage-rules 的「OpenCraft checkout 本地运行目录」；新增写入路径只记录交 owner，不直接改 opencraft。
+每天 06:20 调用本技能 `scripts/opencraft_local_runtime.py --apply`，在 `/data/code/opencraft` 执行 owner 的 `npm run maintenance:local-runtime -- --apply`。人工先运行不带 `--apply` 的预演。PR #670 后允许 owner 按 current/previous 和已登记验收产物细粒度回收；19 个精确保护路径与恢复契约见 storage-rules 的「OpenCraft checkout 本地运行目录」，不恢复 personal-relay 整棵保护。定时入口为仓库 `scripts/opencraft_local_runtime_run.sh`，发布后读回与源文件逐字比较；只修改本仓调度，不直接改 opencraft。
 
 ## 4. 记账
 

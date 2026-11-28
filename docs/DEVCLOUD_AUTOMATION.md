@@ -467,13 +467,18 @@ clone预演/执行预算均30分钟，worker仍先环境5分钟、linked15分钟
 ### OpenCraft owner prune（2026-11-28）
 
 `auto_-vwoibpctju` 每日 06:20（Asia/Shanghai），工作目录 `/data/code/opencraft`，保存脚本执行
-`/usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/71da92b4c143dfba/opencraft_local_runtime.py --apply`。
-内部预算 840 秒，BB 超时 900 秒。包装器调用 checkout 当前的 `npm run maintenance:local-runtime -- --apply`，
+`/usr/bin/python3 -I /data/tools/devcloud-storage-upkeep/releases/7ec41b4155854883/opencraft_local_runtime.py --apply`。
+命令使用 `/usr/bin/timeout --signal=TERM 840`，BB 超时 900 秒。包装器调用 checkout 当前的 `npm run maintenance:local-runtime -- --apply`，
 不冻结或重写 opencraft owner 工具；其保留契约见 `docs/operations/local-runtime-retention.md`。
-凭据、活进程、读取未知、显式保护根仍由 owner 工具判断；固定恢复保护见 storage-rules 的 OpenCraft 节。
+PR #670 合并后与线上 owner handoff 同步：Node 26.7.0，保留 `.runtime`、`.local/execution-separation` 和 personal-relay 下的恢复配置等 19 个精确路径（完整清单见包装器 `PROTECTED_PATHS` 与 storage-rules）。不再整棵保护 personal-relay；owner 按 current/previous 回收更旧 releases，按 `.opencraft-disposable.json` 回收已登记验收产物。凭据、工作簿/Git、审计、恢复状态、进程、容器 bind mount（含 stopped/created）及检查未知继续保留。
 
 增长计量 `auto_u4kos3to-di` 切换为快照 `6d42fe369b4f58ca`，登记 `/data/code/opencraft` 的 owner 和清理方。
 更新每日 prompt 后执行 `python3 -I scripts/sync_daily_check_prompt.py --apply` 和 `--check`。
 任务保存命令、enabled、cron、时区、timeout、工作目录须读回一致；人工执行不替代首次 schedule 验收。
 逐项首次清理清单、df/du、PR #286 后新增路径的生产证据只保存在本机账本及
 `.local/devcloud/opencraft-runtime-20261128/`，不把私有运行记录提交到公开仓库。
+
+此次 #670 同步将任务的 inline owner 命令替换为仓库 `scripts/opencraft_local_runtime_run.sh` 的精确副本，
+其中仅有不可变快照入口，不执行维护记录中的可变脚本路径。发布后须比较 BB 读回 `execution.script`
+与该源文件逐字一致、快照包装器与仓库逐字一致，并核 manifest 哈希、0444/0555、19 个精确保护路径、
+Node 26.7.0、06:20/Asia/Shanghai、cwd 和 timeout。只更新此任务，不修改增长计量快照。

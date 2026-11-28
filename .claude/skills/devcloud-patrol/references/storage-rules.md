@@ -395,11 +395,11 @@ BB/Codex 会话根与 pnpm 根按本机布局登记；混合根（如 `/data/cod
 
 ## OpenCraft checkout 本地运行目录
 
-- owner 是 opencraft，清理方是其 `npm run maintenance:local-runtime -- --apply`；mole-linux 只负责每日调度，不新增递归删除逻辑。工作目录固定 `/data/code/opencraft`，包装入口为 upkeep 的 `scripts/opencraft_local_runtime.py`（默认预演，`--apply` 执行）。
-- 扫描根显式固定为 checkout 的 `.local` 与 `.runtime`，进程根固定为宿主 `/proc`，不能继承测试 proc/root 覆盖。owner 工具逐项保留凭据、`team-credentials`/`credentials`/`private`、`.local/steward`、活进程 cwd/root/exe/maps/fd 引用与读取未知项；显式保护根同时保护其祖先候选。无引用历史运行目录不按年龄等待。
-- 按 11-18 恢复契约，显式保护 `.runtime`、`.local/personal-relay`、`.local/execution-separation`，不能因服务停止就清掉当前包、数据库、凭据和 nginx 恢复配置。personal-relay 中还有活跃 Compose bind mount，宿主 `/proc` 不一定暴露容器内路径；外部传入的额外保护根只追加。
-- 每天 06:20 执行 owner apply，900 秒任务超时、内部 840 秒；先人工预演并核对清单后首次执行，后续按上述规则自动执行。结果由 BB 保存 stdout/stderr/exit，owner 删除记录在 `.local/maintenance/local-runtime-retention.jsonl`。
-- PR #286 后新出现的 checkout 写入路径只记录并交 owner 决定，不在本任务修改 opencraft。当前 `personal-relay/compose/releases` 的部署包和 `steward` 的镜像归档/验收副本属于此类；每日 prune 只能约束符合 owner 规则的历史产物，不能承诺受保护部署与工作簿的总量上限。
+- owner 是 opencraft，清理方是其 `npm run maintenance:local-runtime -- --apply`；mole-linux 只负责每日调度，不新增递归删除逻辑。工作目录固定 `/data/code/opencraft`，包装入口为 upkeep 的 `scripts/opencraft_local_runtime.py`（默认预演，`--apply` 执行），Node 26.7.0。保存任务脚本逐字使用仓库的 `opencraft_local_runtime_run.sh`，该脚本只调用不可变快照中的包装器；发布时核对快照字节与仓库一致。
+- 扫描根显式固定为 checkout 的 `.local` 与 `.runtime`，进程根固定为宿主 `/proc`，不能继承测试 proc/root 覆盖。凭据、`team-credentials`/`credentials`/`private`、工作簿/Git 历史、审计记录、活进程 cwd/root/exe/maps/fd、Docker bind mount（含 stopped/created 容器）和显式保护根保留；无法完整检查进程、Docker、声明或指针时保留。删除前由 owner 重新检查声明、指针、引用与保护条件，无引用历史目录不按年龄等待。
+- PR #670 已修复显式下载/暂存的生产端。`record-core-official`/`record-core-669-official` 使用临时 artifact workspace，结束或失败即收尾；验收凭据与小型 receipt 保留。维护工具单独检查 `.local/<owner>/compose/releases`，保留 `current` 和 `previous`，旧部署无 previous 时保留最新其他 release；缺失/无效/断链指针保留全部。过期 release 仍受凭据、其他链接、进程、容器和显式根保护。工作簿只回收 direct stage 中 `.opencraft-disposable.json` 明确登记且已完成验收的可重建产物，不删除工作簿本身、Git 历史、receipt 或恢复状态。
+- 11-18 恢复契约沿用，11-28 owner 将旧 `.local/personal-relay` 整棵保护收窄为 19 个精确路径（以包装器 `PROTECTED_PATHS` 为执行清单）：`.runtime`、`.local/execution-separation`；`.local/personal-relay/` 下的 `__pycache__`、`deployment`、`releases`、`reports`、`private`、`current`、`artifacts`、`backups`；其 `compose/` 下的 `known_hosts`、`mason-env-new.json`、`site.env`、`compose.sh`、`migration-receipt.json`、`mason-smoke-expected.json`、`sync-codex-auth.py`、`compose.mason.yaml`、`migrate-mason-state.py`。外部额外保护根只追加。不得重新保护整个 personal-relay、compose 或 compose/releases，否则会阻止 owner 的细粒度回收。
+- 每天 06:20 执行 owner apply，900 秒 BB 任务超时、命令边界 `/usr/bin/timeout --signal=TERM 840`。结果由 BB 保存 stdout/stderr/exit，owner 删除记录在 `.local/maintenance/local-runtime-retention.jsonl`。首次预演和执行已在 owner #670 维护记录中完成；后续按上述规则自动执行，不修改 opencraft 源码或绕过 owner 工具递归删除。
 
 ## 包缓存
 

@@ -3433,6 +3433,7 @@ def test_opencraft_growth_owner_names_the_owner_tool():
 
 def test_opencraft_owner_runner_preview_apply_and_failure(tmp_path, monkeypatch):
     runner = load_upkeep('opencraft_local_runtime')
+    assert runner.NODE_BIN == '/root/.nvm/versions/node/v26.7.0/bin'
     repo = tmp_path / 'opencraft'
     repo.mkdir()
     bin_dir = tmp_path / 'bin'
@@ -3459,8 +3460,19 @@ def test_opencraft_owner_runner_preview_apply_and_failure(tmp_path, monkeypatch)
         assert row['env']['OPENCRAFT_LOCAL_RUNTIME_ROOTS'] == f'{repo}/.local,{repo}/.runtime'
         assert row['env']['OPENCRAFT_LOCAL_RUNTIME_PROC_ROOT'] == '/proc'
         assert row['env']['OPENCRAFT_LOCAL_RUNTIME_PROTECTED_ROOTS'].split(',') == [
-            str(repo / '.runtime'), str(repo / '.local/personal-relay'),
-            str(repo / '.local/execution-separation'), '/extra-protection']
+            str(repo / '.runtime'), str(repo / '.local/execution-separation'),
+            *[str(repo / '.local/personal-relay' / name) for name in [
+                '__pycache__', 'deployment', 'releases', 'reports', 'private', 'current', 'artifacts', 'backups',
+                'compose/known_hosts', 'compose/mason-env-new.json', 'compose/site.env', 'compose/compose.sh',
+                'compose/migration-receipt.json', 'compose/mason-smoke-expected.json', 'compose/sync-codex-auth.py',
+                'compose/compose.mason.yaml', 'compose/migrate-mason-state.py']], '/extra-protection']
+        protected = row['env']['OPENCRAFT_LOCAL_RUNTIME_PROTECTED_ROOTS'].split(',')
+        # Owner checks both ancestor and descendant relations. A blanket owner
+        # or compose root would suppress every future release candidate.
+        release = str(repo / '.local/personal-relay/compose/releases/obsolete')
+        assert not any(release == root or release.startswith(root + '/') or root.startswith(release + '/')
+                       for root in protected)
+        assert str(repo / '.local/personal-relay/compose/site.env') in protected
     monkeypatch.setenv('NPM_EXIT', '7')
     assert runner.main(['--apply']) == 7
 
@@ -3471,9 +3483,27 @@ def test_opencraft_owner_runner_reports_missing_checkout_and_timeout(tmp_path, m
     assert runner.main([]) == 1
     assert 'Cannot run' in capsys.readouterr().err
 
+    commands = []
+
     def timeout(command, **kwargs):
-        raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 124)
 
     monkeypatch.setattr(runner.subprocess, 'run', timeout)
     assert runner.main(['--apply']) == 124
     assert '840 seconds' in capsys.readouterr().err
+    assert commands == [['/usr/bin/timeout', '--signal=TERM', '840', 'npm', 'run',
+                         'maintenance:local-runtime', '--', '--apply']]
+
+
+def test_opencraft_launcher_references_snapshot_of_current_wrapper():
+    import hashlib
+    import shlex
+    scripts = Path(__file__).resolve().parents[1] / '.claude/skills/devcloud-storage-upkeep/scripts'
+    wrapper = scripts / 'opencraft_local_runtime.py'
+    manifest = {'files': [{'mode': '0444', 'name': wrapper.name,
+                           'sha256': hashlib.sha256(wrapper.read_bytes()).hexdigest()}]}
+    digest = hashlib.sha256((json.dumps(manifest, indent=2) + '\n').encode()).hexdigest()[:16]
+    command = shlex.split((scripts / 'opencraft_local_runtime_run.sh').read_text().splitlines()[-1])
+    assert command == ['exec', '/usr/bin/python3', '-I',
+                       f'/data/tools/devcloud-storage-upkeep/releases/{digest}/{wrapper.name}', '--apply']
