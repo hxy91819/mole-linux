@@ -188,11 +188,11 @@ BB 数据与自动化形态。它不覆盖 Mole 产品自身的清理逻辑，�
   - 满 1 小时的匿名测试 DB 卷：无任何容器引用、64 位十六进制名称、仅
     `com.docker.volume.anonymous` 标签、内容是 MySQL/PostgreSQL 数据目录或空；
   - 满 24 小时的悬空镜像；
-  - 满 30 天、无任何容器引用、同一 repository 有更新镜像的旧标签；
-  - BuildKit：既有 `until=72h`，再用 `--max-used-space 10GB`（旧 BuildKit 不支持时改用
-    `--keep-storage 10GB`）限总量；
+  - 旧提交/版本批次 Created >24h 且无任何容器引用的标签；保留同仓库最新整批和固定别名；
+  - BuildKit：既有 `until=72h`，再用 `--max-used-space 10000000000`（旧 BuildKit 不支持时改用
+    `--keep-storage 10000000000`）限总量，执行后复测，超限或未测报警；
   - `mole.protect=true` / `devcloud.protect=true` 一律保留；`retained_volumes` 优先于一切；
-  - 在 fork-maintenance 的 `run.lock` 上非阻塞 flock，拿不到锁就跳过，不绕锁。
+  - 在 fork-maintenance 的 `run.lock` 上最多重试 60 秒；拿不到锁明确报告未执行，不绕锁。
 - `docker system df` 在本机约 29 秒，每轮最多取一次并复用，不在循环里重复调用。
 - 镜像不记录 last-used，`Created` 不是“最后使用”。报告只写实际取得的年龄/引用证据；
   镜像大小含共享层，不能逐个相加当可回收字节。回收量以 `df` 为准。
@@ -379,8 +379,9 @@ BB script 的 timeout 最大 900 秒，不能因为更新失败而继续运行�
 | 构建中 `go clean -cache` 返回 rc=1，42.5 GiB 被重置 | 清缓存与活跃构建竞争 | 不做整库 reset；只删冷条目，构建中不执行 | ledger 2026-11-04；`go_cache_trim.py` |
 | 匿名 MySQL 卷每天新增上百个 | `docker rm -f` 不带 `-v`，显式 rm 不清匿名卷 | 生产端改 `-v` 或 `--tmpfs`；本仓按 1h/无引用/内容特征清 | storage-rules「匿名测试 DB 卷满 1 小时即清」；`docker_leftovers.py` |
 | 镜像/卷大小相加远大于实际释放 | 共享层、硬链接、overlay 重复计数 | 只报非独占口径；回收量看 `df` | storage-rules「Docker」；`docker_leftovers.py` |
+| Docker 每小时均 skipped，缓存超过10GB | 与 repair-queue 同时抢锁，非阻塞立即跳过且 quiet 无输出，实际没有跑 prune | 等锁最多60秒；超时明确输出；execute 后复测10GB，超限/未测报警；不能把正常退出当成清理有效 | `docker_leftovers.py`；每日检查 |
 | BuildKit 14 天规则只回收 130 B | `until` 按 last-used，条目都在窗口内 | 这是正常结论；不为凑数放宽门槛或改用创建时间 | storage-rules「Docker」；`docker_leftovers.py` |
-| 旧标签镜像被误当“很久没用” | 镜像不记录 last-used，`Created` 不是使用时间 | 30 天 + 无引用 + 同仓库有更新镜像；保留仓库最新/保护标签 | storage-rules「2026-11-14 owner 批准：带标签镜像」；`docker_leftovers.py` |
+| 旧标签镜像被误当“很久没用” | 镜像不记录 last-used，`Created` 不是使用时间 | 2026-11-28 改为旧提交/版本批次 >24h + 无引用；保留最新整批/固定别名/保护标签 | storage-rules「2026-11-28 owner 修订：带提交/版本标签的镜像按构建批次保留」；`docker_leftovers.py` |
 | 删 worktree 可能丢唯一 `.env` | `git status` 不显示 ignored 文件 | ignored 凭据整棵保留，不因主 checkout 有同内容豁免 | `worktree_sweep.py`；`test_ignored_env_missing_from_main_keeps_the_worktree` |
 | 删 worktree 后 BB 子线程无法继续对话 | BB 子线程绑定 worktree 目录；目录删除后 resume 请求全部失败 | 这是 BB 限制，不尝试重绑；清理前把 `.local` 诊断产物归档到主检出 `.local/worktree-archive/`，从归档开新线程 | `worktree-cleanup` SKILL.md「BB child threads bound to a worktree」；`cleanup_worktrees.py` |
 | 同名 worktree 归档 ref 互相覆盖 | 只用目录名做 ref | ref 带路径哈希 | `worktree_sweep.py`；`test_same_named_worktrees_get_distinct_archive_branches` |

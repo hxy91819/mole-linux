@@ -784,7 +784,7 @@ class DockerLeftoversTests(unittest.TestCase):
         self.lock.touch()
         self.retained = root / 'modes.json'
         self.retained.write_text('{"retained_volumes": []}\n')
-        for name, value in (('MAINTENANCE_LOCK', str(self.lock)), ('RETAINED_VOLUMES_PATH', str(self.retained))):
+        for name, value in (('MAINTENANCE_LOCK_WAIT_SECONDS', 0), ('MAINTENANCE_LOCK', str(self.lock)), ('RETAINED_VOLUMES_PATH', str(self.retained))):
             patch = mock.patch.object(leftovers, name, value, create=True)
             patch.start()
             self.addCleanup(patch.stop)
@@ -835,6 +835,8 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'system', 'df']:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({'Type': 'Build Cache', 'Size': '9GB'}), '')
             if cmd[:3] == ['docker', 'image', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, '', '')
             if cmd == ['docker', 'builder', 'prune', '--help']:
@@ -859,6 +861,8 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'system', 'df']:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({'Type': 'Build Cache', 'Size': '9GB'}), '')
             if cmd[:3] == ['docker', 'image', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, '', '')
             if cmd == ['docker', 'builder', 'prune', '--help']:
@@ -891,6 +895,8 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'system', 'df']:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({'Type': 'Build Cache', 'Size': '9GB'}), '')
             if cmd[:3] == ['docker', 'image', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, '', '')
             if cmd == ['docker', 'builder', 'prune', '--help']:
@@ -921,6 +927,8 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'system', 'df']:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({'Type': 'Build Cache', 'Size': '9GB'}), '')
             if cmd[:3] == ['docker', 'image', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, '', '')
             if cmd == ['docker', 'builder', 'prune', '--help']:
@@ -930,7 +938,8 @@ class DockerLeftoversTests(unittest.TestCase):
         rc, out, err = self.invoke(
             ['--execute', '--quiet'], run=run, which=lambda name: '/usr/bin/docker' if name == 'docker' else None)
         self.assertEqual(rc, 0, out + err)
-        self.assertEqual(out, '')
+        self.assertIn('maintenance lock busy', out)
+        self.assertIn('cache limit not checked', out)
         self.assertEqual(err, '')
         self.assertEqual(commands, [])
 
@@ -939,6 +948,8 @@ class DockerLeftoversTests(unittest.TestCase):
 
         def run(cmd, timeout=1800, check=False):
             commands.append(cmd)
+            if cmd[:3] == ['docker', 'system', 'df']:
+                return subprocess.CompletedProcess(cmd, 0, json.dumps({'Type': 'Build Cache', 'Size': '9GB'}), '')
             if cmd[:3] == ['docker', 'image', 'ls']:
                 return subprocess.CompletedProcess(cmd, 0, '', '')
             if cmd == ['docker', 'builder', 'prune', '--help']:
@@ -968,34 +979,43 @@ class TaggedImagePolicyTests(unittest.TestCase):
                query_failure=False, final_reference=False, retag=False, protect_final=False,
                execute=True, help_text='--max-used-space bytes', rm_failure=False, old_buildkit=False,
                prune_failure=False, final_query_failure=False, fallback_failure=False,
-               multiple=False, final_inspect_failure=False):
+               multiple=False, final_inspect_failure=False, images_override=None, quiet=False,
+               cache_size="9GB", cache_error=False, older_witness=False):
         from datetime import datetime, timezone
-        old = {'Id': 'sha256:old', 'RepoTags': ['registry:5000/team/app:old'],
+        old = {'Id': 'sha256:old', 'RepoTags': ['registry:5000/team/app:v1.0.0'],
                'Created': '2020-01-01T00:00:00Z', 'Size': 1234, 'Config': {'Labels': labels or {}}}
-        newer = {'Id': 'sha256:new', 'RepoTags': ['registry:5000/team/app:new'],
+        newer = {'Id': 'sha256:new', 'RepoTags': ['registry:5000/team/app:v2.0.0'],
                  'Created': '2026-10-01T00:00:00Z', 'Size': 5678, 'Config': {'Labels': {}}}
         if recent:
             old['Created'] = datetime.now(timezone.utc).isoformat()
             newer['Created'] = '2099-01-01T00:00:00Z'
-        middle = {'Id': 'sha256:middle', 'RepoTags': ['registry:5000/team/app:middle'],
+        middle = {'Id': 'sha256:middle', 'RepoTags': ['registry:5000/team/app:v1.1.0'],
                   'Created': '2021-01-01T00:00:00Z', 'Size': 2345, 'Config': {'Labels': {}}}
         images = [middle, old, newer] if multiple else ([old] if latest else [old, newer])
+        if images_override is not None:
+            images = images_override
         commands = []
         queries = 0
+        image_lists = 0
 
         def run(cmd, timeout=1800, check=False):
-            nonlocal queries
+            nonlocal queries, image_lists
             commands.append(cmd)
             data, rc = '', 0
+            if cmd[:3] == ['docker', 'system', 'df']:
+                return subprocess.CompletedProcess(cmd, int(cache_error), json.dumps({'Type': 'Build Cache', 'Size': cache_size}), 'measure denied' if cache_error else '')
             if cmd[:3] == ['docker', 'volume', 'ls']:
                 pass
             elif cmd[:3] == ['docker', 'image', 'ls']:
+                image_lists += 1
+                if older_witness and image_lists > 1:
+                    newer['Created'] = '2019-01-01T00:00:00Z'
                 data = '\n'.join(i['Id'] for i in images)
             elif cmd[:3] == ['docker', 'image', 'inspect']:
-                if final_inspect_failure and 'registry:5000/team/app:old' in cmd:
+                if final_inspect_failure and 'registry:5000/team/app:v1.0.0' in cmd:
                     return subprocess.CompletedProcess(cmd, 1, '', 'inspect denied')
                 found = [dict(i) for i in images if i['Id'] in cmd[3:] or set(i['RepoTags']) & set(cmd[3:])]
-                if 'registry:5000/team/app:old' in cmd:
+                if 'registry:5000/team/app:v1.0.0' in cmd:
                     if retag:
                         found[0]['Id'] = 'sha256:replacement'
                     if protect_final:
@@ -1028,7 +1048,7 @@ class TaggedImagePolicyTests(unittest.TestCase):
                 raise AssertionError(cmd)
             return subprocess.CompletedProcess(cmd, rc, data, 'denied' if rc else '')
 
-        rc, out, err = self.invoke(['--execute'] if execute else [], run=run,
+        rc, out, err = self.invoke((['--execute'] if execute else []) + (['--quiet'] if quiet else []), run=run,
                                    which=lambda name: '/usr/bin/docker' if name == 'docker' else None)
         return rc, out, [c for c in commands if c[:3] == ['docker', 'image', 'rm']], commands
 
@@ -1042,10 +1062,10 @@ class TaggedImagePolicyTests(unittest.TestCase):
         self.assert_kept('container reference', referenced=True)
 
     def test_tagged_repository_latest_kept(self):
-        self.assert_kept('repository latest', latest=True)
+        self.assert_kept('latest batch', latest=True)
 
-    def test_tagged_under_30_days_kept(self):
-        self.assert_kept('not older than 30 days', recent=True)
+    def test_tagged_under_24_hours_kept(self):
+        self.assert_kept('not older than 24 hours', recent=True)
 
     def test_tagged_owner_protection_kept(self):
         for key in ('mole.protect', 'devcloud.protect'):
@@ -1060,7 +1080,7 @@ class TaggedImagePolicyTests(unittest.TestCase):
     def test_tagged_only_eligible_tag_removed_without_force(self):
         rc, out, removed, _ = self.policy()
         self.assertEqual(rc, 0, out)
-        self.assertEqual(removed, [['docker', 'image', 'rm', 'registry:5000/team/app:old']])
+        self.assertEqual(removed, [['docker', 'image', 'rm', 'registry:5000/team/app:v1.0.0']])
         self.assertTrue(all('-aq' in c for c in _ if c[:3] == ['docker', 'container', 'ls']))
 
     def test_tagged_final_reference_rechecked(self):
@@ -1087,31 +1107,31 @@ class TaggedImagePolicyTests(unittest.TestCase):
                 rc, out, _, commands = self.policy(help_text=flag + ' bytes')
                 self.assertEqual(rc, 0, out)
                 prunes = [c for c in commands if c[:3] == ['docker', 'builder', 'prune'] and '--help' not in c]
-                self.assertIn(['docker', 'builder', 'prune', '-f', flag, '10GB'], prunes)
+                self.assertIn(['docker', 'builder', 'prune', '-f', flag, '10000000000'], prunes)
                 self.assertIn(['docker', 'builder', 'prune', '-f', '--filter', 'until=72h'], prunes)
 
     def test_builder_old_server_uses_supported_keep_storage(self):
         rc, out, _, commands = self.policy(old_buildkit=True)
         self.assertEqual(rc, 0, out)
-        self.assertIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB'], commands)
+        self.assertIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10000000000'], commands)
 
     def test_builder_real_failure_does_not_fall_back_and_exits_1(self):
         rc, out, _, commands = self.policy(prune_failure=True)
         self.assertEqual(rc, 1, out)
         self.assertIn('permission denied', out)
-        self.assertNotIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB'], commands)
+        self.assertNotIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10000000000'], commands)
 
     def test_tagged_multiple_old_tags_use_newest_witness_in_any_order(self):
         rc, out, removed, _ = self.policy(multiple=True)
         self.assertEqual(rc, 0, out)
-        self.assertEqual([c[3] for c in removed], ['registry:5000/team/app:middle', 'registry:5000/team/app:old'])
+        self.assertEqual([c[3] for c in removed], ['registry:5000/team/app:v1.1.0', 'registry:5000/team/app:v1.0.0'])
 
     def test_tagged_final_image_query_failure_is_reported_per_tag(self):
         rc, out, removed, _ = self.policy(final_inspect_failure=True)
         self.assertEqual(rc, 1, out)
         self.assertEqual(removed, [])
         self.assertIn('keep: final image query failed', out)
-        self.assertIn('keep: repository latest', out)
+        self.assertIn('keep: latest batch', out)
 
     def test_tagged_final_reference_query_failure_keeps_and_exits_1(self):
         self.assertEqual(self.assert_kept('reference query failed', final_query_failure=True), 1)
@@ -1120,10 +1140,78 @@ class TaggedImagePolicyTests(unittest.TestCase):
         rc, out, _, commands = self.policy(old_buildkit=True, fallback_failure=True)
         self.assertEqual(rc, 1, out)
         self.assertIn('fallback denied', out)
-        self.assertIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB'], commands)
+        self.assertIn(['docker', 'builder', 'prune', '-f', '--keep-storage', '10000000000'], commands)
 
     def test_builder_unsupported_cap_exits_1(self):
         self.assertEqual(self.policy(help_text='unknown')[0], 1)
+
+
+    def test_builder_prune_uses_the_same_byte_limit_as_post_check(self):
+        rc, out, _, commands = self.policy(old_buildkit=True)
+        self.assertEqual(rc, 0, out)
+        caps = [c for c in commands if '--max-used-space' in c or '--keep-storage' in c]
+        self.assertEqual([c[-1] for c in caps], ['10000000000', '10000000000'])
+
+    def test_cache_over_limit_warns_even_if_prune_reclaims_zero(self):
+        rc, out, _, _ = self.policy(latest=True, quiet=True, cache_size='60.9GB')
+        self.assertEqual(rc, 1, out)
+        self.assertIn('WARNING', out)
+        self.assertIn('60900000000', out)
+
+    def test_cache_measure_failure_is_not_silent_or_zero(self):
+        rc, out, _, _ = self.policy(latest=True, quiet=True, cache_error=True)
+        self.assertEqual(rc, 1, out)
+        self.assertIn('measure failed', out)
+
+    def test_cache_under_limit_and_zero_reclaim_stays_quiet(self):
+        rc, out, _, _ = self.policy(latest=True, quiet=True)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(out, '')
+
+    def test_short_lock_contention_waits_then_runs(self):
+        import fcntl
+        held = open(self.lock, 'a')
+        self.addCleanup(held.close)
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with mock.patch.object(leftovers, 'MAINTENANCE_LOCK_WAIT_SECONDS', 120, create=True), \
+                mock.patch.object(leftovers.time, 'sleep', side_effect=lambda _: held.close()):
+            rc, out, _, commands = self.policy(latest=True, quiet=True)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(any(c[:3] == ['docker', 'builder', 'prune'] and '--help' not in c for c in commands))
+
+    def test_commit_batches_keep_all_latest_variants_and_fixed_aliases(self):
+        def image(tag, created, name):
+            return {'Id': 'sha256:' + name, 'RepoTags': ['batch/app:' + tag],
+                    'Created': created, 'Size': 100, 'Config': {'Labels': {}}}
+        images = [image('hands-aaaaaaa', '2026-11-01T00:00:00Z', 'a1'),
+                  image('brain-aaaaaaa', '2026-11-02T00:00:00Z', 'a2'),
+                  image('hands-bbbbbbb', '2026-11-26T00:00:00Z', 'b1'),
+                  image('brain-bbbbbbb', '2026-10-01T00:00:00Z', 'b2'),
+                  image('latest', '2020-01-01T00:00:00Z', 'fixed1'),
+                  image('local', '2020-01-01T00:00:00Z', 'fixed2')]
+        rc, out, removed, _ = self.policy(images_override=images)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual({c[3] for c in removed}, {'batch/app:hands-aaaaaaa', 'batch/app:brain-aaaaaaa'})
+        self.assertIn('latest batch', out)
+        self.assertIn('fixed tag', out)
+
+    def test_old_commit_over_24_hours_is_removed_before_30_days(self):
+        from datetime import datetime, timezone, timedelta
+        now = datetime.now(timezone.utc)
+        images = [{'Id': 'sha256:' + name, 'RepoTags': ['batch/app:' + tag],
+                   'Created': (now - timedelta(hours=hours)).isoformat(), 'Size': 100,
+                   'Config': {'Labels': {}}}
+                  for name, tag, hours in [('old', 'abcdef1', 25), ('new', 'abcdef2', 1)]]
+        rc, out, removed, _ = self.policy(images_override=images)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([c[3] for c in removed], ['batch/app:abcdef1'])
+
+
+    def test_latest_batch_is_recomputed_before_each_removal(self):
+        rc, out, removed, _ = self.policy(older_witness=True)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(removed, [])
+        self.assertIn('latest batch', out)
 
 
 def _load_go_cache_trim():

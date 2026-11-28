@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Remove Docker leftovers that nothing is using.
 
-Default is a dry run. ``--execute`` acts. Targets (owner policy 2026-11-04, extended 2026-11-14):
+Default is a dry run. ``--execute`` acts. Targets (owner policy 2026-11-04, extended 2026-11-28):
 anonymous test-database volumes older than one hour, dangling images older
-than 24 hours, unreferenced tagged images older than 30 days with a newer
-repository image, and BuildKit cache (72h age prune plus 10GB cap). Named
-volumes, repository newest images and owner-protected images stay.
+than 24 hours, unreferenced commit/version tags older than 24 hours outside the latest
+repository build batch, and BuildKit cache (72h age prune plus 10GB cap). Named
+volumes, repository newest batches and owner-protected images stay.
 Go, npm, and pnpm caches are not touched: those trees stay in use.
 """
 
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from decimal import Decimal
 import fcntl
 import json
 import os
@@ -23,6 +24,8 @@ import sys
 import time
 
 GIB = 2**30
+BUILD_CACHE_LIMIT_BYTES = 10_000_000_000
+MAINTENANCE_LOCK_WAIT_SECONDS = 60
 MAINTENANCE_LOCK = "/root/.local/share/fork-maintenance/state/run.lock"
 RETAINED_VOLUMES_PATH = "/data/metrics/ai-storage-maintenance/local-data-modes.json"
 FAILED_ACTIONS = {"measure failed", "retained volumes unreadable"}
@@ -133,26 +136,38 @@ def reclaimed_is_zero(amount):
     return bool(amount) and re.fullmatch(r"0+(?:\.0+)?B", amount.replace(" ", "")) is not None
 
 
-def hold_maintenance_lock():
-    """Non-blocking owner lock shared with fork-maintenance. None if it is unavailable."""
+def hold_maintenance_lock(wait_seconds=0):
+    """Wait through short competing maintenance jobs; never bypass their owner lock."""
+    handle = open(MAINTENANCE_LOCK, 'a')
+    deadline = time.monotonic() + wait_seconds
     try:
-        handle = open(MAINTENANCE_LOCK, "a")
-    except OSError:
-        return None
-    try:
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return handle
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    handle.close()
+                    return None
+                time.sleep(min(1, remaining))
+    except BaseException:
         handle.close()
-        return None
-    return handle
+        raise
 
 
 def docker_caps(args, report, quiet_notes):
     if not shutil.which("docker"):
         return
-    lock = hold_maintenance_lock()
+    try:
+        lock = hold_maintenance_lock(MAINTENANCE_LOCK_WAIT_SECONDS if args.execute else 0)
+    except OSError as exc:
+        report.append({'target': 'docker', 'action': 'maintenance lock unavailable', 'failed': True})
+        quiet_notes.append(f'docker: maintenance lock unavailable: {exc}; cache limit not checked')
+        return
     if lock is None:
         report.append({"target": "docker", "action": "skipped: maintenance lock busy"})
+        quiet_notes.append('docker: skipped: maintenance lock busy; no Docker cleanup executed; cache limit not checked')
         return
     try:
         _docker_caps_locked(args, report, quiet_notes)
@@ -200,20 +215,50 @@ def owner_protected(image):
     return any(labels.get(key) == 'true' for key in ('mole.protect', 'devcloud.protect'))
 
 
+def image_batch(tag):
+    """Commit suffixes and dotted versions identify a build batch, independent of variant."""
+    value = tag.rsplit(':', 1)[1]
+    commit = re.search(r'(?:^|[-_])([0-9a-fA-F]{7,64})$', value)
+    if commit:
+        return 'commit:' + commit.group(1).lower()
+    version = re.search(r'(?:^|[-_])(v?\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?)$', value)
+    return 'version:' + version.group(1).removeprefix('v') if version else None
+
+
+def newest_batch_tags(tags, tag):
+    repo = tag.rsplit(':', 1)[0]
+    batches = {}
+    for name, image in tags.items():
+        batch = image_batch(name)
+        if name.rsplit(':', 1)[0] == repo and batch:
+            batches[batch] = max(batches.get(batch, float('-inf')), image_created(image))
+    if not batches:
+        return []
+    newest = max(batches.values())
+    latest = {key for key, created in batches.items() if created == newest}
+    return sorted((name for name in tags if name.rsplit(':', 1)[0] == repo and image_batch(name) in latest),
+                  key=lambda name: image_created(tags[name]), reverse=True)
+
+
+def tagged_inventory():
+    listed = run(['docker', 'image', 'ls', '-aq', '--no-trunc'], timeout=60)
+    if listed.returncode:
+        raise ValueError('image listing failed: ' + listed.stderr.strip())
+    images = docker_json('image', list(dict.fromkeys(listed.stdout.split())))
+    tags = {}
+    for image in images:
+        # Parse every creation time before any removal: unknown inventory stays intact.
+        image_created(image)
+        for tag in image.get('RepoTags') or []:
+            if ':' in tag.rsplit('/', 1)[-1] and not tag.startswith('<none>'):
+                tags[tag] = image
+    return tags
+
+
 def tagged_images(args, report, quiet_notes):
-    target = 'docker tagged images older than 30 days'
+    target = 'docker old commit/version image batches'
     try:
-        listed = run(['docker', 'image', 'ls', '-aq', '--no-trunc'], timeout=60)
-        if listed.returncode:
-            raise ValueError('image listing failed: ' + listed.stderr.strip())
-        images = docker_json('image', list(dict.fromkeys(listed.stdout.split())))
-        tags = {}
-        for image in images:
-            # Parse every creation time before any removal: unknown inventory stays intact.
-            image_created(image)
-            for tag in image.get('RepoTags') or []:
-                if ':' in tag.rsplit('/', 1)[-1] and not tag.startswith('<none>'):
-                    tags[tag] = image
+        tags = tagged_inventory()
         if not tags:
             return
         try:
@@ -226,24 +271,33 @@ def tagged_images(args, report, quiet_notes):
             return
         for tag, image in tags.items():
             entry = {'target': tag, 'image_id': image['Id'], 'image_size_bytes': image['Size']}
-            repo = tag.rsplit(':', 1)[0]
-            newer = [name for name, candidate in tags.items()
-                     if name.rsplit(':', 1)[0] == repo and image_created(candidate) > image_created(image)]
-            newer.sort(key=lambda name: image_created(tags[name]), reverse=True)
+            newest = newest_batch_tags(tags, tag)
             if owner_protected(image):
                 reason = 'owner protection'
             elif image['Id'] in references:
                 reason = 'container reference'
-            elif time.time() - image_created(image) <= 30 * 86400:
-                reason = 'not older than 30 days'
-            elif not newer:
-                reason = 'repository latest'
+            elif image_batch(tag) is None:
+                reason = 'fixed tag'
+            elif tag in newest:
+                reason = 'latest batch'
+            elif time.time() - image_created(image) <= 24 * 3600:
+                reason = 'not older than 24 hours'
             else:
                 reason = None
             if reason is None and args.execute:
                 # Rebind the exact tag and its strictly newer repository witness.
                 try:
-                    current, witness = docker_json('image', [tag, newer[0]])
+                    # Tags can be reassigned while a batch is being examined. Recompute
+                    # the repository's latest batch before removing each old member.
+                    fresh_tags = tagged_inventory()
+                    newest = newest_batch_tags(fresh_tags, tag)
+                    if tag not in fresh_tags or not newest:
+                        raise ValueError('tag or latest batch disappeared during recheck')
+                    if tag in newest:
+                        entry['action'] = 'keep: latest batch'
+                        report.append(entry)
+                        continue
+                    current, witness = docker_json('image', [tag, newest[0]])
                 except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as exc:
                     entry.update(action='keep: final image query failed', failed=True, error=str(exc))
                     report.append(entry)
@@ -253,9 +307,9 @@ def tagged_images(args, report, quiet_notes):
                     reason = 'tag changed'
                 elif owner_protected(current):
                     reason = 'owner protection'
-                elif time.time() - image_created(current) <= 30 * 86400:
-                    reason = 'not older than 30 days'
-                elif newer[0] not in (witness.get('RepoTags') or []) or image_created(witness) <= image_created(current):
+                elif time.time() - image_created(current) <= 24 * 3600:
+                    reason = 'not older than 24 hours'
+                elif newest[0] not in (witness.get('RepoTags') or []) or image_created(witness) <= image_created(current):
                     reason = 'repository newer image changed'
                 else:
                     try:
@@ -286,12 +340,39 @@ def builder_cap(report, quiet_notes):
             raise ValueError('builder prune help failed')
         for flag in ('--max-used-space', '--keep-storage'):
             if flag in help_result.stdout:
-                return ['docker', 'builder', 'prune', '-f', flag, '10GB']
+                return ['docker', 'builder', 'prune', '-f', flag, str(BUILD_CACHE_LIMIT_BYTES)]
         raise ValueError('builder prune has no supported storage limit')
     except (ValueError, OSError, subprocess.TimeoutExpired) as exc:
         report.append({'target': 'docker BuildKit 10GB cap', 'action': 'measure failed', 'error': str(exc)})
         quiet_notes.append(f'docker BuildKit 10GB cap: {exc}')
         return None
+
+
+def verify_builder_limit(report, quiet_notes):
+    """Check Docker's post-prune total even when prune reports successful zero reclaim."""
+    target = 'docker BuildKit cache limit verification'
+    try:
+        result = run(['docker', 'system', 'df', '--format', '{{json .}}'], timeout=120)
+        if result.returncode:
+            raise ValueError(result.stderr.strip() or 'docker system df failed')
+        rows = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+        sizes = [row['Size'] for row in rows if row.get('Type') == 'Build Cache']
+        if len(sizes) != 1:
+            raise ValueError('missing or duplicate Build Cache summary')
+        match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*(B|kB|KB|MB|GB|TB|KiB|MiB|GiB|TiB)', sizes[0])
+        if not match:
+            raise ValueError('invalid Build Cache size: ' + str(sizes[0]))
+        units = {'B': 1, 'kB': 1000, 'KB': 1000, 'MB': 10**6, 'GB': 10**9, 'TB': 10**12,
+                 'KiB': 2**10, 'MiB': 2**20, 'GiB': 2**30, 'TiB': 2**40}
+        size = int(Decimal(match.group(1)) * units[match.group(2)])
+        over = size > BUILD_CACHE_LIMIT_BYTES
+        report.append({'target': target, 'bytes': size, 'limit_bytes': BUILD_CACHE_LIMIT_BYTES,
+                       'action': 'WARNING: build cache still exceeds 10GB' if over else 'within limit', 'failed': over})
+        if over:
+            quiet_notes.append(f'WARNING: docker BuildKit cache still {size} bytes after prune, limit {BUILD_CACHE_LIMIT_BYTES}; inspect docker buildx du --verbose for shared/in-use records')
+    except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as exc:
+        report.append({'target': target, 'action': 'measure failed', 'error': str(exc)})
+        quiet_notes.append(f'{target}: measure failed: {exc}')
 
 
 def _docker_caps_locked(args, report, quiet_notes):
@@ -349,7 +430,7 @@ def _docker_caps_locked(args, report, quiet_notes):
                     and 'buildkit v0.17.0+ is required for max-used-space and min-free-space filters' in result.stderr):
                 entry['unsupported_attempt'] = {'action': ' '.join(cmd), 'rc': result.returncode,
                                                 'error': result.stderr.strip()}
-                cmd = ['docker', 'builder', 'prune', '-f', '--keep-storage', '10GB']
+                cmd = ['docker', 'builder', 'prune', '-f', '--keep-storage', str(BUILD_CACHE_LIMIT_BYTES)]
                 entry['action'] = ' '.join(cmd)
                 result = run(cmd, timeout=1800)
             entry.update(rc=result.returncode, result=(result.stdout.strip().splitlines() or [""])[-1][:200],
@@ -361,6 +442,9 @@ def _docker_caps_locked(args, report, quiet_notes):
                 quiet_notes.append(f"{target}: reclaimed {amount or 'unknown'} rc={result.returncode}"
                                    + (f" {result.stderr.strip()}" if result.returncode else ""))
         report.append(entry)
+
+    if args.execute:
+        verify_builder_limit(report, quiet_notes)
 
 
 def report_failed(report):
@@ -378,7 +462,7 @@ def main(argv=None):
     ap.add_argument("--volume-min-age-minutes", type=float, default=60)
     ap.add_argument("--execute", action="store_true", help="act; default is a dry run")
     ap.add_argument("--quiet", action="store_true",
-                    help="print nothing unless something was reclaimed or a command failed")
+                    help="print only reclaim, failures, or blocked/unchecked maintenance")
     args = ap.parse_args(argv)
 
     before = free_bytes()

@@ -58,26 +58,33 @@ fork或者我的个人项目，推送上去，以分支形式存在不就行了�
   `test_missing_go_cache_readme_deletes_nothing_and_exits_1`、`test_go_cache_dry_run_deletes_nothing`、
   `test_go_cache_quiet_is_silent_when_nothing_is_deleted`。
 - **Docker 残留由 `docker_leftovers.py` 清（每小时定时任务）**，清理满 1 小时的匿名测试 DB 卷、
-  满 24 小时的悬空镜像，以及下述带标签镜像和 BuildKit 缓存（2026-11-14 owner 批准扩展）。
-  执行时在 `/root/.local/share/fork-maintenance/state/run.lock` 上非阻塞 flock，
-  拿不到锁本轮跳过；删卷前先排除
-  `/data/metrics/ai-storage-maintenance/local-data-modes.json` 中 `retained_volumes` 列出的卷。
-  匿名测试 DB 卷的证据链见本节「匿名测试 DB 卷满 1 小时即清」。
-- **2026-11-14 owner 批准：带标签镜像**同时满足以下条件才删：没有任何容器（含 stopped、created）
-  引用 image ID、Created 严格超过 30×24h、同一 repository 有 Created 严格更新的镜像。
-  30 天窗口保留回滚副本；每个 repository 的最新镜像（含并列最新）始终保留，避免移除仓库唯一的本地构建或恢复入口。
-  `mole.protect=true` / `devcloud.protect=true`
-  一律保留，悬空镜像 prune 也排除这两个标签。删除前重新检查全部容器引用、标签指向、保护标签和更新镜像证据；
-  更新镜像证据明确选仓库最新，不依赖 Docker 列表顺序；单标签复查失败保留并报错，继续报告其余标签。
-  查询失败最终 exit 1。只用 `docker image rm <repo:tag>`，不加 force。报告的 image_size_bytes
-  是含共享层的镜像大小，不是独占可回收字节。
-- **2026-11-14 owner 批准：BuildKit 总量最多 10GB**：保留现有
-  `docker builder prune -f --filter until=72h`，另跑不带年龄过滤的总量 prune；先查询本机
-  `docker builder prune --help`，支持时用 `--max-used-space 10GB`，否则用 `--keep-storage 10GB`。
-  新 buildx 客户端可能列出 `--max-used-space`，但旧 BuildKit 服务端拒绝；仅当返回明确的
-  `buildkit v0.17.0+ is required for max-used-space and min-free-space filters`（执行前能力检查）时，
-  记录该诊断并改用兼容的 `--keep-storage 10GB`。两者都不支持、查询失败或真实 prune 失败则 exit 1，
-  不对其他错误重试。Docker 自身锁定、不可回收的缓存仍由 Docker 保留。
+  满 24 小时的悬空镜像，以及下述带标签镜像和 BuildKit 缓存。
+  执行时取得 `/root/.local/share/fork-maintenance/state/run.lock`；2026-11-28 修复小时任务与
+  repair-queue 同时启动导致的锁饥饿：每秒重试，最多等 60 秒，超时明确输出
+  `maintenance lock busy`、未执行 Docker 清理及未检查缓存上限，不绕锁；预演不等待。
+  删卷前先排除 `/data/metrics/ai-storage-maintenance/local-data-modes.json` 的 `retained_volumes`。
+- **2026-11-28 owner 修订：带提交/版本标签的镜像按构建批次保留**，替代原 30 天规则。
+  同 repository 内，纯 7–64 位十六进制提交 tag 或以 `-`/`_` 接提交哈希的变体 tag
+  （如 `hands-<sha>`、`full-<sha>`）按同一哈希分组；纯或变体前缀后的 `v?N.N[.N]`
+  （可带 prerelease/build 后缀）按同一版本分组。以每组最大的镜像 Created 判最近构建，
+  保留最新整组全部变体，Created 并列最新的组也都保留。镜像 Created 不能证明 tag 的赋值时间，
+  不将其称为 last-used。无法识别为提交/版本的 tag 按固定别名保留，包括 latest、local、stable。
+  旧组的镜像 Created 严格超过 24h、没有任何容器（含 stopped/created）引用 image ID 时才删。
+  `mole.protect=true` / `devcloud.protect=true` 一律保留，悬空 prune 同样排除这两个标签。
+  删除前复查精确 tag 指向、保护标签、24h、最新组证据和完整容器引用；未知即保留并 exit 1。
+  单 tag 复查失败继续报告其他项；只用 `docker image rm <repo:tag>`，不加 force。
+  `image_size_bytes` 含共享层，不作为独占可回收量。
+- **BuildKit 10GB 总量上限（2026-11-14 批准，2026-11-28 补成效检查）**：保留
+  `docker builder prune -f --filter until=72h`，另跑不带年龄过滤的总量 prune。
+  先查 `docker builder prune --help`，优先 `--max-used-space 10000000000`，其次 `--keep-storage 10000000000`。
+  新 buildx help 可能列出 max-used-space，但 Docker 27.3.1 内置旧 BuildKit 执行前返回
+  `buildkit v0.17.0+ is required for max-used-space and min-free-space filters`；仅此明确拒绝
+  可回退 `--keep-storage 10000000000`，不对权限/daemon 等真实错误重试，失败 exit 1。
+  参数传明确字节，避免 buildx 的 MemBytes/RAMInBytes 把 `10GB` 解释为10GiB，与十进制告警线不一致。
+  每次 execute 后读一次 `docker system df --format '{{json .}}'` 的 Build Cache Size（Docker 显示精度），
+  超过 10,000,000,000 bytes 时即使 prune rc=0/回收0B 也输出 WARNING 并 exit 1；缺类、无效数值、
+  查询失败或超时按未知报错，不当0。仍被 Docker 锁定/共享的记录交 `docker buildx du --verbose`
+  核实，不以超限为理由删容器、镜像或 Docker data-root。
 - **匿名测试 DB 卷满 1 小时即清**：无任何容器引用、名称为 64 位十六进制且只带
   `com.docker.volume.anonymous` 标签、内容是 MySQL/PostgreSQL 数据目录或为空，创建满 1 小时即
   `docker volume rm <id>`。容器已删的匿名卷没有任何程序还能挂回去；命名卷、compose 卷与 retained 登记照旧。
@@ -253,7 +260,7 @@ thread-storage由一次物理du遍历拆成共享go-build、共享golangci-lint�
 - **BuildKit**：现行规则见上文（72h prune + 总量 10GB）。`until` 按 last-used；
   121 条都落在 14 天窗口内、只回收 130B 是正常结论，不得为凑数放宽门槛或改用创建年龄。
   新客户端列出 `--max-used-space` 但旧服务端拒绝时，只在明确的 v0.17 诊断下改用
-  `--keep-storage 10GB`；其他错误不重试。owner 命令也要持锁、fresh 计划、末端证据，
+  `--keep-storage 10000000000`；其他错误不重试。owner 命令也要持锁、fresh 计划、末端证据，
   16:10 直调未持锁的回执不能计为收益；历史执行细节见设计文档。
 - **命名 Go 缓存卷**：旧 `auto_clean.py` 的 14 天规则随执行器退役，不再有定时执行器。
   若 owner 重新授权，判据必须是“树内最新文件 mtime”，不能用目录自身 mtime；命名卷和

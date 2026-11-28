@@ -80,7 +80,7 @@ python3 -m pytest tests/test_devcloud_storage_upkeep.py -q
 维护脚本任务都属于 project `proj_8d3wrcajxn`，时区 `Asia/Shanghai`。
 它们跑的是 `/data/tools/devcloud-storage-upkeep/releases/<sha16>/` 下的不可变副本，
 不是仓库工作区。`<sha16>` 是 `manifest.json` 规范化内容 sha256 的前 16 位；
-Docker 沿用原快照，Go 缓存修剪使用快照 `6117b7833a6f3773`；pnpm 使用 `8c2d819edb14ca13`。
+Docker 使用快照 `eb8e04dc868e51f1`，Go 缓存修剪使用快照 `6117b7833a6f3773`；pnpm 使用 `8c2d819edb14ca13`。
 
 | 任务 | ID | 时间 | 工作目录 | 命令 | 无动作时 |
 |---|---|---|---|---|---|
@@ -89,6 +89,14 @@ Docker 沿用原快照，Go 缓存修剪使用快照 `6117b7833a6f3773`；pnpm �
 | BB环境→linked→独立clone | `auto_hukidoavox0` | 每天 06:30 | `/var/tmp` | `bash <git-snap>/git_tree_sweep_run.sh --execute` | 输出异步报告位置；实际结果以完整JSON/JSONL为准 |
 | 旧 tmp 独立 clone | `auto_3jiqtmzreq8` | 已停用 | `/var/tmp` | 保留历史记录；新统一入口覆盖其范围 | enabled=false |
 | pnpm store prune | `auto_yfr5p14dvnc` | 周日 05:30 | `/data/code/mole-linux` | `${PY} -I <store-snap>/pnpm_store_prune.py --execute --quiet` | `skipped`，exit 0 |
+
+Docker 小时任务执行时最多等维护总锁 60 秒，锁忙超时明确输出未执行和缓存上限未检查，
+不再把锁饥饿伪装为零回收。prune 后读取 Docker Build Cache 总量，超过 10GB 或测量未知
+输出告警并 exit 1；无回收且确认未超限才静默。提交/版本镜像保留同仓库最新整批、固定别名、
+容器引用及 protect 标签，旧批 Created >24h 才删。具体匹配和兼容参数见 storage-rules。
+Docker 发布只替换其任务的不可变快照；manifest 含 docker_leftovers.py、go_cache_trim.py、
+worktree_sweep.py，各文件 sha256/mode，目录名取 manifest 字节哈希前16位，文件0444/目录0555。
+先预演，再 execute，查看 JSON 的删除/保留原因、cap 兼容尝试及 limit verification；不要只看 BB 状态。
 
 脚本任务共同的解释器与 PATH：
 

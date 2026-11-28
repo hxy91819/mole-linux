@@ -19,7 +19,7 @@ description: 本机（Linux DevCloud）数据盘的长期存储维护：查清�
 
 | 类别 | 例子 | 处置 |
 |---|---|---|
-| 可重建缓存 | go-build、golangci-lint、npm `_cacache`、pnpm 各版本 store、Docker 悬空/旧标签镜像和 BuildKit、无主匿名测试 DB 卷 | Go build 与 golangci-lint 每小时只删 24 小时以上没用过的哈希普通文件（2026-11-14 owner 批准由 2 小时改为 24 小时）；npm 不自动清；pnpm 每周日 05:30 仅在无 pnpm store 写入子命令且探针完整时用 `scripts/pnpm_store_prune.py` 对 v3/v10/v11 分别用实测匹配的 pnpm 9/10/12 调 owner 命令，显式指定同一根。Docker 残留由 `scripts/docker_leftovers.py` 每小时清：2026-11-14 owner 批准无容器引用、Created >30 天且仓库有更新镜像的旧标签；仓库最新及 owner 保护标签保留；BuildKit 在 72h prune 外限总量 10GB，完整判据见 storage-rules 的 owner 策略节 |
+| 可重建缓存 | go-build、golangci-lint、npm `_cacache`、pnpm 各版本 store、Docker 悬空/旧标签镜像和 BuildKit、无主匿名测试 DB 卷 | Go build 与 golangci-lint 每小时只删 24 小时以上没用过的哈希普通文件（2026-11-14 owner 批准由 2 小时改为 24 小时）；npm 不自动清；pnpm 每周日 05:30 仅在无 pnpm store 写入子命令且探针完整时用 `scripts/pnpm_store_prune.py` 对 v3/v10/v11 分别用实测匹配的 pnpm 9/10/12 调 owner 命令，显式指定同一根。Docker 残留由 `scripts/docker_leftovers.py` 每小时清：2026-11-28 owner 修订为提交/版本 tag 只保留仓库最新整批及固定别名，旧批 Created >24h 且无容器引用才删；owner 保护标签保留；BuildKit 在 72h prune 外限总量 10GB，执行后超限/未测必须报警，锁忙最多重试 60 秒后明确报告跳过，完整判据见 storage-rules 的 owner 策略节 |
 | Git 工作树 | 两盘所有 clone / linked worktree；含隐藏、嵌套与 thread-storage | 每天06:30先 `bb_environment_sweep.py` 回收遗弃环境，再 `worktree_sweep.py` 的Git登记linked路径，再 `git_tree_sweep.py` 的全盘clone路径；现行执行版本见部署记录；规则调整先全量预演核验，自然闲置到期按既有规则处理，完整授权见 storage-rules |
 | 数据 | 会话（`/data/codex`、`/data/bb-data`）、凭据、在用数据库、命名卷、备份与迁移副本 | 不自动删；列出大小和归属，交 owner 决定 |
 
